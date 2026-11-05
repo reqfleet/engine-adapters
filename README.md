@@ -64,7 +64,13 @@ Upload one bundled `.js` plus optional CSVs, choose per-agent VUs, duration in m
 
 ## Releases and compatibility
 
-PR CI runs race/unit tests, public dependency checks and Docker conformance. A version tag such as `v0.1.0` reruns conformance and publishes the Dockerfile's `runtime` target for Linux amd64 and arm64 to `ghcr.io/reqfleet/engine-adapters/k6:<adapter-release>`, with provenance and SBOM. Maintainers must configure GHCR permissions/public visibility and retain release evidence. Production operators select the resulting digest, not a floating tag.
+PR CI runs race/unit tests, public dependency checks and Docker conformance. Both CI workflows select Go from `go.mod`. Adapters use independent versions and adapter-prefixed Git tags. Pushing a tag matching `k6/v[0-9]*`, such as `k6/v0.2.0`, triggers the k6 publication workflow. Repository-wide tags such as `v0.2.0` and other adapter tags such as `gatling/v0.1.0` do not trigger it.
+
+For `k6/v0.2.0`, `github.ref_name` contains the full tag. After conformance succeeds, the workflow strips `k6/` and passes `v0.2.0` to the local [publish-k6 action](.github/actions/publish-k6/action.yml). The action publishes the Dockerfile's `runtime` target for Linux amd64 and arm64 as `ghcr.io/reqfleet/engine-adapters/k6:v0.2.0`, with provenance and SBOM, and returns the image digest for the job summary.
+
+When another adapter is added, give it its own tag-triggered release workflow and publishing action. Adapter-specific changes release only that adapter; shared dependency changes require testing affected adapters and releasing each affected image independently. Adapter release versions are independent of upstream engine versions. Existing tags remain historical: do not move Git tags or overwrite released image versions.
+
+The action retains QEMU because the Dockerfile's target-platform `base` stage runs `apt-get`; building arm64 on the amd64 runner requires emulation even though Go is cross-compiled. Maintainers must configure GHCR permissions/public visibility and retain release evidence. Production operators select the resulting digest, not a floating tag.
 
 Record this **manually tested** tuple for every rollout:
 
