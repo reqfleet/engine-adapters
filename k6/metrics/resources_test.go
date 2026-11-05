@@ -47,7 +47,7 @@ func TestCgroupVersionsProduceIdenticalCPUUnitsAndRates(t *testing.T) {
 			assert.Equal(t, uint64(2_000_000_000), sample.cpuNanos)
 			assert.Equal(t, uint64(123456), sample.memoryBytes)
 			e, run := fixture(t, 10)
-			putCSV(t, run, csvHeader+"vus,0,\n")
+			putCSV(t, run, csvHeader+"vus,0,,\n")
 			e.resources = reader
 			clock := time.Unix(100, 0)
 			e.now = func() time.Time { return clock }

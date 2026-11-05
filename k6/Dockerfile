@@ -10,7 +10,7 @@ COPY . .
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o /out/k6-adapter ./k6/cmd/agent && \
     GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance ./conformance
 # Keep SDK transitive license notices with the executable distribution.
-RUN cp /go/pkg/mod/github.com/reqfleet/engine-sdk@v0.3.0/THIRD_PARTY_NOTICES /out/SDK_THIRD_PARTY_NOTICES
+RUN cp "$(go list -m -f '{{.Dir}}' github.com/reqfleet/engine-sdk)/THIRD_PARTY_NOTICES" /out/SDK_THIRD_PARTY_NOTICES
 
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS engine
 ARG TARGETARCH
@@ -48,7 +48,7 @@ ENTRYPOINT ["/usr/local/bin/conformance", "-test.v", "-test.timeout=8m"]
 
 FROM base AS runtime
 LABEL org.opencontainers.image.source="https://github.com/reqfleet/engine-adapters" \
-      org.opencontainers.image.description="HTTP k6 adapter; SDK v0.3.0, k6 v2.3.0, metrics shibuya-v1" \
+      org.opencontainers.image.description="HTTP k6 adapter; SDK 0be3f54c6200, k6 v2.3.0, metrics shibuya-v1" \
       org.opencontainers.image.licenses="Apache-2.0 AND AGPL-3.0-only"
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/k6-adapter"]

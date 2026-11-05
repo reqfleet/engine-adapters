@@ -1,6 +1,6 @@
 # External engine adapters
 
-Independent, operator-managed engine adapters for Reqfleet Shibuya. The reference is an HTTP-only [k6 adapter](k6/README.md), using the public [engine-sdk v0.3.0](https://github.com/reqfleet/engine-sdk/tree/v0.3.0). Adapter, engine, SDK, and Shibuya versions are independent.
+Independent, operator-managed engine adapters for Reqfleet Shibuya. The reference is an HTTP-only [k6 adapter](k6/README.md), using the public [engine-sdk commit 0be3f54c6200](https://github.com/reqfleet/engine-sdk/tree/0be3f54c6200873999ea941ceef582b5812aa488). Adapter, engine, SDK, and Shibuya versions are independent.
 
 **Publication:** source is maintained at [reqfleet/engine-adapters](https://github.com/reqfleet/engine-adapters). Versioned OCI images use `ghcr.io/reqfleet/engine-adapters/k6`. Check [releases](https://github.com/reqfleet/engine-adapters/releases), successful publication workflow output, package visibility, and the immutable digest before deployment. A published adapter does not mean your Shibuya deployment admits or installs it.
 
@@ -26,7 +26,7 @@ Dependency proof used by CI:
 
 ```sh
 GOWORK=off go list -deps -test -json ./... | jq -e -s 'all(.[]; (.ImportPath | startswith("github.com/reqfleet/shibuya") | not))'
-GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.3.0") and all(.[]; .Replace == null)'
+GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.3.1-0.20261105101419-0be3f54c6200") and all(.[]; .Replace == null)'
 ```
 
 ## Responsibilities and manual onboarding
@@ -60,7 +60,7 @@ Run a real deployment smoke through API upload, collection creation, launch, tri
 
 ### Plan author
 
-Upload one bundled `.js` plus optional CSVs, choose per-agent VUs, duration in minutes, rampup seconds and engine count, then trigger and inspect aggregate `k6` results. Two engines with concurrency 2 produce four total VUs; the adapter never divides that assignment again. See [the detailed contract and examples](k6/README.md).
+Upload one bundled `.js` plus optional CSVs, choose per-agent VUs, duration in minutes, rampup seconds and engine count, then trigger and inspect URL-grouped request latency and status counts. Received bytes remain an agent/run aggregate because k6 does not attribute those samples to request URLs. Two engines with concurrency 2 produce four total VUs; the adapter never divides that assignment again. See [the detailed contract and examples](k6/README.md).
 
 ## Releases and compatibility
 
@@ -75,10 +75,10 @@ The action retains QEMU because the Dockerfile's target-platform `base` stage ru
 Record this **manually tested** tuple for every rollout:
 
 ```text
-(Shibuya release, adapter image digest, SDK v0.3.0, k6 v2.3.0, metrics shibuya-v1)
+(Shibuya release, adapter image digest, SDK 0be3f54c6200, k6 v2.3.0, metrics shibuya-v1)
 ```
 
-Do not fill unspecified Shibuya releases or digests with presumed compatibility. SDK v0.3.0 has no wire-protocol negotiation/version field. This relaxed issue #1155 item 4 supports maintainer-managed external onboarding; it does **not** satisfy the original no-source-rebuild or automatic unsupported-protocol-version rejection criteria. No dynamic catalog, hot reload or automatic registration is claimed.
+Do not fill unspecified Shibuya releases or digests with presumed compatibility. This relaxed issue #1155 item 4 supports maintainer-managed external onboarding; it does **not** satisfy the original no-source-rebuild or automatic unsupported-protocol-version rejection criteria. No dynamic catalog, hot reload or automatic registration is claimed.
 
 ## Licensing
 
