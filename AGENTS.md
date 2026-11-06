@@ -69,7 +69,7 @@ Dependency proof used by CI:
 
 ```sh
 GOWORK=off go list -deps -test -json ./... | jq -e -s 'all(.[]; (.ImportPath | startswith("github.com/reqfleet/shibuya") | not))'
-GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.3.1-0.20261106013417-bc85eb9551f9") and all(.[]; .Replace == null)'
+GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.4.0") and all(.[]; .Replace == null)'
 ```
 
 ### Configuring the k6 version
@@ -143,7 +143,7 @@ The action retains QEMU because the Dockerfile's target-platform `base` stage ru
 Record this **manually tested** tuple for every rollout:
 
 ```text
-(Shibuya release, adapter image digest, SDK bc85eb9551f9, selected k6 version, metrics shibuya-v1)
+(Shibuya release, adapter image digest, SDK v0.4.0, selected k6 version, metrics shibuya-v1)
 ```
 
 Do not fill unspecified Shibuya releases or digests with presumed compatibility. This relaxed issue #1155 item 4 supports maintainer-managed external onboarding; it does **not** satisfy the original no-source-rebuild or automatic unsupported-protocol-version rejection criteria. No dynamic catalog, hot reload or automatic registration is claimed.
