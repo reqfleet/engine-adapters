@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "3b6bd36f115e85e0f5dfb38986c99195ac22bca5",
+  "release-type": "go",
+  "bump-minor-pre-major": true,
+  "include-component-in-tag": true,
+  "include-v-in-tag": true,
+  "tag-separator": "/",
+  "separate-pull-requests": true,
+  "packages": {
+    "k6": {
+      "component": "k6"
+    }
+  }
+}

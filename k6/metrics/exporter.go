@@ -1,4 +1,15 @@
 // Package metrics translates independent k6 CSV points into shibuya-v1 metrics.
+//
+// Collection reads the result file written by k6's --out csv option. The HTTP
+// endpoint serves the normalized results; it is not the collection source.
+//
+// CSV rows are independent metric samples, not complete request events. The SDK's
+// MetricParser returns a ShibuyaMetric whose ToPrometheus method updates latency,
+// status, concurrency and bytes together. Sending a vus or data_received sample
+// through that path would fabricate a request and a latency observation.
+// Instead, the exporter parses CSV directly, updates only the relevant metric
+// family for each sample, and serves the SDK's authenticated metrics route as an
+// in-process handler. See ../README.md for the CSV format and sample mapping.
 package metrics
 
 import (
@@ -11,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,42 +36,44 @@ import (
 // Exporter owns one run's cumulative metrics and the persistent scrape endpoint.
 // No reader or goroutine survives a drain; Reset and scrapes share the same lock.
 type Exporter struct {
-	mu                                 sync.Mutex
-	label                              string
-	run                                agent.RunContext
-	active                             bool
-	offset                             int64
-	observedSize                       int64
-	fileInfo                           os.FileInfo
-	columns                            int
-	nameIndex, valueIndex, statusIndex int
-	ready                              bool
-	failure                            error
-	resources                          func() (resourceSample, error)
-	now                                func() time.Time
-	cpuBaseline                        resourceSample
-	cpuAt                              time.Time
-	cpuStarted                         bool
-	latency                            *prometheus.HistogramVec
-	status                             *prometheus.CounterVec
-	bytes                              *prometheus.CounterVec
-	threads                            *prometheus.GaugeVec
-	cpu                                *prometheus.GaugeVec
-	memory                             *prometheus.GaugeVec
-	handler                            http.Handler
+	mu                                           sync.Mutex
+	byteLabel                                    string
+	labelLimit                                   int
+	urlLabels                                    map[string]string
+	run                                          agent.RunContext
+	active                                       bool
+	offset                                       int64
+	observedSize                                 int64
+	fileInfo                                     os.FileInfo
+	columns                                      int
+	nameIndex, valueIndex, statusIndex, urlIndex int
+	ready                                        bool
+	failure                                      error
+	resources                                    func() (resourceSample, error)
+	now                                          func() time.Time
+	cpuBaseline                                  resourceSample
+	cpuAt                                        time.Time
+	cpuStarted                                   bool
+	latency                                      *prometheus.HistogramVec
+	status                                       *prometheus.CounterVec
+	bytes                                        *prometheus.CounterVec
+	threads                                      *prometheus.GaugeVec
+	cpu                                          *prometheus.GaugeVec
+	memory                                       *prometheus.GaugeVec
+	handler                                      http.Handler
 }
 
-// New validates the request-label budget. This aggregate adapter needs one label;
-// a zero budget uses the SDK's reserved overflow label instead.
+// New validates the per-run URL label budget. Additional URLs use the SDK's
+// reserved overflow label; received bytes retain a separate aggregate label.
 func New(labelLimit int) (*Exporter, error) {
 	if labelLimit < 0 {
 		return nil, errors.New("label_limit must be a nonnegative integer")
 	}
-	e := &Exporter{label: "k6", resources: cgroupReader("/sys/fs/cgroup"), now: time.Now}
+	e := &Exporter{byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]string), resources: cgroupReader("/sys/fs/cgroup"), now: time.Now}
 	if labelLimit == 0 {
-		e.label = "others"
+		e.byteLabel = "others"
 	}
-	// Ordinary SDK v0.3.0 bounds: 1, 2.5, then prometheus.DefBuckets in ms.
+	// SDK histogram bounds: 1, 2.5, then prometheus.DefBuckets in ms.
 	buckets := make([]float64, 2, len(prometheus.DefBuckets)+2)
 	buckets[0], buckets[1] = 1, 2.5
 	for _, bound := range prometheus.DefBuckets {
@@ -90,7 +104,8 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.active = true
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
-	e.nameIndex, e.valueIndex, e.statusIndex = 0, 0, 0
+	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
+	clear(e.urlLabels)
 	e.ready, e.failure = false, nil
 	e.cpuBaseline, e.cpuAt, e.cpuStarted = resourceSample{}, time.Time{}, false
 	e.latency.Reset()
@@ -134,7 +149,7 @@ func (e *Exporter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "waiting for a valid k6 sample", http.StatusServiceUnavailable)
 		return
 	}
-	if err := e.updateResources(); err != nil {
+	if err := e.reportEngineMetrics(); err != nil {
 		http.Error(w, "container resources: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -227,7 +242,7 @@ func (e *Exporter) drain(ctx context.Context) error {
 func (e *Exporter) header(record []string) error {
 	indexes := map[string]int{}
 	for index, name := range record {
-		if name != "metric_name" && name != "metric_value" && name != "status" {
+		if name != "metric_name" && name != "metric_value" && name != "status" && name != "url" {
 			continue
 		}
 		if _, exists := indexes[name]; exists {
@@ -235,13 +250,13 @@ func (e *Exporter) header(record []string) error {
 		}
 		indexes[name] = index
 	}
-	for _, name := range []string{"metric_name", "metric_value", "status"} {
+	for _, name := range []string{"metric_name", "metric_value", "status", "url"} {
 		if _, exists := indexes[name]; !exists {
 			return fmt.Errorf("missing k6 CSV column %q", name)
 		}
 	}
 	e.columns = len(record)
-	e.nameIndex, e.valueIndex, e.statusIndex = indexes["metric_name"], indexes["metric_value"], indexes["status"]
+	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = indexes["metric_name"], indexes["metric_value"], indexes["status"], indexes["url"]
 	return nil
 }
 
@@ -257,6 +272,10 @@ func (e *Exporter) point(record []string) error {
 	run := e.run
 	switch name {
 	case "http_req_duration":
+		url := record[e.urlIndex]
+		if url == "" {
+			return errors.New("missing HTTP request URL")
+		}
 		status := record[e.statusIndex]
 		// HTTP status tags are canonical decimal codes, or k6's transport
 		// failure sentinel 0. Reject blank, fractional, and non-HTTP tags.
@@ -264,21 +283,35 @@ func (e *Exporter) point(record []string) error {
 		if err != nil || strconv.Itoa(code) != status || (code != 0 && (code < 100 || code > 599)) {
 			return fmt.Errorf("invalid HTTP status %q", status)
 		}
-		e.latency.WithLabelValues(run.CollectionID, e.label, run.RunID, run.AgentID, run.PlanID, run.Zone).Observe(value)
-		e.status.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, e.label, run.Zone, status).Inc()
+		label := e.requestLabel(url)
+		e.latency.WithLabelValues(run.CollectionID, label, run.RunID, run.AgentID, run.PlanID, run.Zone).Observe(value)
+		e.status.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, label, run.Zone, status).Inc()
 	case "vus":
 		if math.Trunc(value) != value {
 			return fmt.Errorf("invalid fractional vus sample %q", record[e.valueIndex])
 		}
 		e.threads.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, run.Zone).Set(value)
 	case "data_received":
-		e.bytes.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, e.label, run.Zone).Add(value)
+		e.bytes.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, e.byteLabel, run.Zone).Add(value)
 	}
 	e.ready = true
 	return nil
 }
 
-func (e *Exporter) updateResources() error {
+func (e *Exporter) requestLabel(url string) string {
+	if label, admitted := e.urlLabels[url]; admitted {
+		return label
+	}
+	if len(e.urlLabels) >= e.labelLimit {
+		return "others"
+	}
+	// CSV fields share the record's storage; retain only the admitted URL.
+	url = strings.Clone(url)
+	e.urlLabels[url] = url
+	return url
+}
+
+func (e *Exporter) reportEngineMetrics() error {
 	sample, err := e.resources()
 	if err != nil {
 		return err

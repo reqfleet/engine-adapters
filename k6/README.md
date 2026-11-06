@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Pinned engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0). Public SDK: [v0.3.0](https://github.com/reqfleet/engine-sdk/tree/v0.3.0). Metrics: `shibuya-v1`. See the [root guide](../README.md) for manual onboarding, publication prerequisites, image release and operator responsibilities.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [v0.4.0](https://github.com/reqfleet/engine-sdk/releases/tag/v0.4.0), pinned in `go.mod`. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
@@ -36,7 +36,7 @@ The coordinator delivers an explicit per-agent string-valued settings object:
 
 The three numeric settings are required. Missing, null, nonstring, negative, signed, whitespace, fractional, exponential and overflowing inputs fail preparation. With rampup zero, the wrapper uses one `constant-vus` scenario. Positive rampup uses `ramping-vus`, starts at zero, ramps to assigned VUs and holds for the remaining duration; a zero-length hold is omitted. Both have `gracefulStop: '0s'`; ramping also has `gracefulRampDown: '0s'`.
 
-Collection scheduling owns these options: `scenarios`, `vus`, `duration`, `iterations`, `stages`, `executionSegment`, `executionSegmentSequence`. Presence of any on uploaded `options`, even null, fails inside k6 with `k6 scheduling options are managed by the collection`. A missing default function fails with `k6 plan must export a default function`. Other options, including native threshold selectors, are retained. If `options.systemTags` is explicit, it must be an array; the wrapper adds `status` without discarding other tags. Default k6 tags remain unchanged when it is absent.
+Collection scheduling owns these options: `scenarios`, `vus`, `duration`, `iterations`, `stages`, `executionSegment`, `executionSegmentSequence`. Presence of any on uploaded `options`, even null, fails inside k6 with `k6 scheduling options are managed by the collection`. A missing default function fails with `k6 plan must export a default function`. Other options, including native threshold selectors, are retained. If `options.systemTags` is explicit, it must be an array; the wrapper adds missing `status` and `url` tags without discarding other tags. Default k6 tags remain unchanged when it is absent.
 
 The adapter creates `Workspace.Temp/entry.js` atomically and leaves `/test-data/script.js` byte-for-byte original. Preparation respects cancellation and invalidates previously prepared run IDs. Only that successfully prepared run ID may build a command. Command execution is direct, not shell interpolation:
 
@@ -44,7 +44,7 @@ The adapter creates `Workspace.Temp/entry.js` atomically and leaves `/test-data/
 /usr/local/bin/k6 run --no-usage-report --out csv=<run.ResultFile> <generated-entry-path>
 ```
 
-Working directory is `Workspace.Inputs`; `K6_CSV_SAVE_INTERVAL=1s` is explicit. SDK v0.3.0 owns process groups, wait/reap, cancellation, SIGTERM and the default ten-second escalation timeout. Nonzero k6 exits, including threshold failures, remain failures rather than being reported as successful load tests. No second process supervisor runs here.
+Working directory is `Workspace.Inputs`; `K6_CSV_SAVE_INTERVAL=1s` is explicit. The SDK owns process groups, wait/reap, cancellation, SIGTERM and the default ten-second escalation timeout. Nonzero k6 exits, including threshold failures, remain failures rather than being reported as successful load tests. No second process supervisor runs here.
 
 ## CSV inputs
 
@@ -52,28 +52,65 @@ Use absolute paths, e.g. `open('/test-data/targets.csv')`, because the generated
 
 `replicated` and `materialized` assignments are consumed whole. The coordinator already chooses whether each agent receives all CSV rows or its materialized subset. The adapter must not shard those bytes again using agent ID, VU ID or shard metadata. `native` and unknown assignment modes fail explicitly. Local per-VU iteration through the supplied data is allowed; it is not a second cross-agent partition. The SDK provides run-local files and resets them before the next run.
 
-## Accurate aggregate metrics
+## URL-grouped request metrics
 
-k6 CSV contains independent metric points, **not** complete request events. Passing each row through the SDK request-event parser would fabricate requests/latency/bytes. This adapter instead runs its own synchronized normalized endpoint on **127.0.0.1:6566/metrics**, started before the SDK. A bind failure aborts startup. The SDK's authenticated `/metrics` endpoint on 8080 proxies it with `NativeMetricsSchema: shibuya-v1`; `MetricParser` is nil and native SDK folding is off.
+The exporter **collects metrics by parsing the CSV file** written by `k6 run --out csv=<run.ResultFile>`. It reads new records with Go's `encoding/csv` and converts each supported sample into the corresponding `shibuya-v1` metric. Its HTTP endpoint exposes the converted results; it is not the collection source.
 
-All request-labelled families use `label="k6"`; `label_limit=0` uses the SDK convention `label="others"`. `label_limit` defaults to 10 and must be a nonnegative decimal integer. The exporter never exports original request-name tags. This truthful aggregate contract does **not** claim per-request-name byte attribution.
+The SDK `MetricParser` callback is not suitable for these rows: it returns a `ShibuyaMetric` representing a complete request, and `ToPrometheus` always records latency, increments a status counter, sets concurrency and adds bytes together. k6 CSV instead contains independent metric samples. Passing a `vus` or `data_received` row through that callback would fabricate a request and a latency observation. The exporter therefore parses CSV directly and updates only the relevant metric family.
+
+The exporter is passed directly as `AgentServerOptions.MetricsHandler` with `NativeMetricsSchema: shibuya-v1`. The SDK serves it behind bearer authentication at `/metrics` on port 8080; there is no extra TCP listener or loopback proxy. `MetricParser` and `MetricsURL` are unset and native SDK folding is off. `ResultFile` names k6's CSV output only; the adapter owns normalization, URL admission and reset.
+
+### CSV output format
+
+This excerpt was captured from k6 v2.3.0 with its default system tags, one VU and one HTTP 200 request against a local server. Other metric rows are omitted; the header and shown rows are unchanged.
+
+```csv
+metric_name,timestamp,metric_value,check,error,error_code,expected_response,group,method,name,proto,scenario,service,status,subproto,tls_version,url,extra_tags,metadata
+http_reqs,1793861283,1.000000,,,,true,,GET,http://127.0.0.1:45775/,HTTP/1.1,default,,200,,,http://127.0.0.1:45775/,,
+http_req_duration,1793861283,4.696574,,,,true,,GET,http://127.0.0.1:45775/,HTTP/1.1,default,,200,,,http://127.0.0.1:45775/,,
+vus,1793861284,1.000000,,,,,,,,,,,,,,,,
+data_received,1793861284,151.000000,,,,,,,,,default,,,,,,,
+```
+
+- `metric_name` identifies the measurement; one row is one sample, not one complete request.
+- `timestamp` is Unix time in seconds in the default CSV format. It is not a unique request ID; the exporter does not use it to join rows.
+- `metric_value` is the numeric sample in that metric's units, described in the mapping below.
+- `status` is the HTTP status tag, populated on the HTTP rows but absent from the VU and byte rows in this example.
+- `url` supplies the request metric label. Samples with the same URL share latency and status series; different URLs remain separate within the label budget.
+- The remaining columns carry tags or metadata; an empty cell means that field has no value for that sample.
+
+The header depends on the enabled system tags. The exporter locates `metric_name`, `metric_value`, `status` and `url` by name rather than fixed positions and ignores unrelated columns. Missing required columns or an empty URL on an HTTP duration sample fail ingestion; non-request samples may leave `url` empty. Values containing commas, quotes or newlines use standard CSV quoting; splitting lines on commas is not sufficient.
+
+### Normalization and run lifecycle
+
+HTTP latency histograms and status counters use the exact CSV `url` value as `label`, not the `name` column or a fixed `k6` label. Repeated requests to the same URL accumulate in the same histogram and status counters. The adapter does not normalize paths or remove query strings: distinct emitted URLs remain distinct labels. Avoid secrets in URL tags and account for query-string cardinality when choosing a label budget.
+
+The entrypoint resolves configuration once with `agent.LoadAgentServerOptions`, passes `AgentServerOptions.LabelsUsageLimit` to the exporter, and starts `agent.NewAgentServer` with the resolved options. The adapter does not parse environment variables itself. The SDK defaults an unset or empty `label_limit` to 10, accepts decimal integers with an optional sign (for example, `+4`), and rejects negative values, malformed input, whitespace and integer overflow at startup.
+
+The first N distinct request URLs observed in each run receive their own labels; additional URLs fold into `label="others"`. Admitted URLs keep their labels after the budget fills. A zero limit folds every request into `others`. Reset clears the admitted URL set along with the metrics.
+
+The adapter uses the URL tag as k6 emits it. k6's [request grouping](https://grafana.com/docs/k6/latest/using-k6/http-requests/#group-urls-under-one-tag), such as a custom `tags.name` or `http.url` template, can replace the emitted `url` with a grouped value before CSV export. To retain distinct requested URLs, do not group them at that source; the adapter cannot reconstruct URLs omitted by k6.
+
+Received-byte samples lack request URL attribution and remain aggregate under `label="k6"` (`label="others"` when the limit is zero). They do not consume URL admission slots or create byte series for individual URLs. Per-URL bandwidth is unavailable, not zero. VUs, CPU and memory remain agent-level metrics.
 
 | CSV point | Normalized effect |
 |---|---|
-| `http_req_duration` | One latency observation in milliseconds and one status count, using its HTTP status tag; status `0` represents transport failure |
+| `http_req_duration` | One latency observation in milliseconds and one status count, grouped by URL within the label budget; status `0` represents transport failure |
 | `vus` | Set latest actual per-agent concurrency, including genuine zero; no request count |
-| `data_received` | Add received-byte delta to the historical `shibuya_egress_bytes_counter`; no request count |
+| `data_received` | Add received-byte delta to the aggregate historical `shibuya_egress_bytes_counter`; no request count or URL attribution |
 | `http_reqs`, `data_sent`, other names | Ignore; no double counting and no synthetic request observations |
 
 The exporter resolves required CSV header names, uses `encoding/csv` including quoted/multiline values, retains its committed offset, retries incomplete tails and processes records once under the same lock for observation and scrapes. Invalid recognized values, complete malformed records, required-column errors and post-start truncation/read errors fail instead of producing fabricated data. Readiness stays pending until a valid standard sample is available. The SDK separately handles a process that exits before readiness is polled.
 
-Collection, plan, run, agent and zone identity come from the current `RunContext`. Histogram boundaries and names follow the public SDK schema. Resource gauges use real cgroup memory and CPU-usage deltas over elapsed wall time (v2 microseconds; v1 nanoseconds). CPU is not invented before a second sample. Unavailable resources fail scrapes clearly. The listener persists after k6 exits so final CSV rows can be drained and cumulative values stay available until the next preparation. Reset clears identities, collectors, cursor and CPU baseline together, including preparation attempts that subsequently fail settings validation. Quiet request periods do not insert fake zero concurrency. Raw CSV is disposable run-local SDK output, not permanent result storage.
+Collection, plan, run, agent and zone identity come from the current `RunContext`. Histogram boundaries and names follow the public SDK schema. Resource gauges use real cgroup memory and CPU-usage deltas over elapsed wall time (v2 microseconds; v1 nanoseconds). CPU is not invented before a second sample. Unavailable resources fail scrapes clearly. The listener persists after k6 exits so final CSV rows can be drained and cumulative values stay available until the next preparation. Reset clears identities, collectors, URL admission, cursor and CPU baseline together, including preparation attempts that subsequently fail settings validation. Quiet request periods do not insert fake zero concurrency. Raw CSV is disposable run-local SDK output, not permanent result storage.
 
 ## Container and operational failures
 
-`../Makefile` builds `k6/Dockerfile`'s `runtime` target. Official v2.3.0 archives are verified against the published checksum file, itself pinned to the release metadata checksum. Both Linux amd64 and arm64 are supported. The CA-equipped runtime executes as UID/GID **65532**, with writable `/test-data` and `/shibuya-agent/{test-conf,test-result,run-tmp}` and `AGENT_ROOT=/shibuya-agent`.
+`../Makefile` builds `k6/Dockerfile`'s `runtime` target. The default engine is v2.3.0; `K6_VERSION` and its matching `K6_CHECKSUMS_SHA256` build argument select another release. Official archives are verified against the selected release's checksum file, itself checked against the pinned digest. The image includes that release's source and license. See [build configuration](../AGENTS.md#configuring-the-k6-version). Both Linux amd64 and arm64 are supported. The CA-equipped runtime executes as UID/GID **65532**, with writable `/test-data` and `/shibuya-agent/{test-conf,test-result,run-tmp}` and `AGENT_ROOT=/shibuya-agent`.
 
-The SDK owns port 8080, `/healthz`, coordinator TLS/CA/authentication and lifecycle. The loopback metrics port is not exposed outside the container. Supply existing coordinator settings/credentials at deployment; none are baked into the image. Do not loosen scheduler security settings to run the adapter. The harness root process is a test-only privileged-port requirement; it explicitly starts the adapter non-root.
+`ENGINE_SDK_VERSION` selects the SDK compiled into the image, its bundled notices and image metadata; the default is v0.4.0. Image-only overrides do not change the checkout's dependency files. See [SDK build configuration](../AGENTS.md#configuring-the-engine-sdk-version).
+
+The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA/authentication and lifecycle. Supply existing coordinator settings/credentials at deployment; none are baked into the image. Do not loosen scheduler security settings to run the adapter. The harness root process is a test-only privileged-port requirement; it explicitly starts the adapter non-root.
 
 - Missing or blank deployment image: install an approved immutable image digest; uploading JavaScript cannot register an engine.
 - Image pull error: check digest, package visibility, architecture and `pull_secret`.
@@ -83,4 +120,4 @@ The SDK owns port 8080, `/healthz`, coordinator TLS/CA/authentication and lifecy
 - Updated artifact/settings: trigger after the previous run ends; the same pod can reuse its agent process without old source or counters.
 - Updated image: roll out compatible configuration, then purge/relaunch collections. Rollback follows the same process using the previous tested tuple/digest.
 
-Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, SDK v0.3.0, k6 v2.3.0, metrics shibuya-v1)` tuple and live smoke results before production use.
+Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, selected SDK version, selected k6 version, metrics shibuya-v1)` tuple and live smoke results before production use.

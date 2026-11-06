@@ -119,7 +119,8 @@ export default function(){http.get('http://127.0.0.1:18080/500');sleep(0.1);}`)
 	var logs proofLog
 	child := exec.Command("/usr/local/bin/k6-adapter")
 	child.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65532, Gid: 65532}}
-	child.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + root, "AGENT_ROOT=" + root, "engine_name=engine-proof-plan-local-0", "offset=7", "coordinator_ip=127.0.0.1", "coordinator_ca_cert=" + ca, "collection_id=" + proofCollection, "plan_id=" + proofPlan, "zone=local", "api_key=" + proofKey}
+	// Exercise SDK-owned parsing with a signed, non-default label limit.
+	child.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + root, "AGENT_ROOT=" + root, "engine_name=engine-proof-plan-local-0", "offset=7", "coordinator_ip=127.0.0.1", "coordinator_ca_cert=" + ca, "collection_id=" + proofCollection, "plan_id=" + proofPlan, "zone=local", "api_key=" + proofKey, "label_limit=+4"}
 	child.Stdout, child.Stderr = &logs, &logs
 	require.NoError(t, child.Start())
 	done := make(chan struct{})
@@ -206,6 +207,17 @@ export default function(){http.get('http://127.0.0.1:18080/500');sleep(0.1);}`)
 	require.Positive(t, firstTotals.status["200"])
 	require.Positive(t, firstTotals.status["500"])
 	require.Positive(t, firstTotals.bytes)
+	require.Len(t, firstTotals.requests, 4)
+	for _, endpoint := range []string{"/200", "/500", "/setup", "/teardown"} {
+		url := "http://127.0.0.1:18080" + endpoint
+		require.Contains(t, firstTotals.requests, url)
+		require.Positive(t, firstTotals.requests[url].count)
+		status := "200"
+		if endpoint == "/500" {
+			status = "500"
+		}
+		require.Equal(t, map[string]float64{status: float64(firstTotals.requests[url].count)}, firstTotals.requests[url].status)
+	}
 	require.Equal(t, firstTotals, compareCSV(t, client, csvPath, "1001"), "final scrapes must not double-ingest")
 	seen := requests.snapshot()
 	require.Contains(t, seen, proofRequest{Path: "/setup", Plan: "first"})
@@ -226,6 +238,9 @@ export default function(){http.get('http://127.0.0.1:18080/500');sleep(0.1);}`)
 	terminal("1002", protocol.RunCanceled, proofWait)
 	secondTotals := compareCSV(t, client, csvPath, "1002")
 	require.Less(t, secondTotals.count, firstTotals.count)
+	require.Len(t, secondTotals.requests, 2)
+	require.Contains(t, secondTotals.requests, "http://127.0.0.1:18080/200")
+	require.Contains(t, secondTotals.requests, "http://127.0.0.1:18080/500")
 	body := scrape(t, client)
 	require.NotContains(t, body, `run_id="1001"`)
 	for _, request := range requests.snapshot()[requestCount:] {
@@ -329,6 +344,13 @@ type totals struct {
 	sum, bytes float64
 	status     map[string]float64
 	vus        float64
+	requests   map[string]*requestTotals
+}
+
+type requestTotals struct {
+	count  uint64
+	sum    float64
+	status map[string]float64
 }
 
 func scrape(t *testing.T, client *http.Client) string {
@@ -357,10 +379,11 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 	for i, key := range header {
 		columns[key] = i
 	}
-	for _, key := range []string{"metric_name", "metric_value", "status"} {
+	for _, key := range []string{"metric_name", "metric_value", "status", "url", "method"} {
 		require.Contains(t, columns, key)
 	}
-	expected := totals{status: map[string]float64{}}
+	expected := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}}
+	durations := map[string][]float64{}
 	for {
 		row, e := reader.Read()
 		if e == io.EOF {
@@ -371,6 +394,17 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 		require.NoError(t, e)
 		switch row[columns["metric_name"]] {
 		case "http_req_duration":
+			url := row[columns["url"]]
+			require.NotEmpty(t, url, "duration rows must retain their request URL")
+			require.Equal(t, "GET", row[columns["method"]], "existing system tags must be preserved")
+			if expected.requests[url] == nil {
+				expected.requests[url] = &requestTotals{status: map[string]float64{}}
+			}
+			request := expected.requests[url]
+			request.count++
+			request.sum += value
+			request.status[row[columns["status"]]]++
+			durations[url] = append(durations[url], value)
 			expected.count++
 			expected.sum += value
 			expected.status[row[columns["status"]]]++
@@ -384,7 +418,7 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
 	require.NoError(t, err)
-	observed := totals{status: map[string]float64{}}
+	observed := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}}
 	for name, family := range families {
 		for _, metric := range family.Metric {
 			labels := map[string]string{}
@@ -399,16 +433,34 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 			require.Equal(t, proofCollection, labels[metricschema.LabelCollectionID])
 			require.Equal(t, proofPlan, labels[metricschema.LabelPlanID])
 			require.Equal(t, "local", labels[metricschema.LabelZone])
-			if label, ok := labels[metricschema.LabelRequest]; ok {
-				require.Equal(t, "k6", label)
+			label := labels[metricschema.LabelRequest]
+			if name == metricschema.RequestLatency || name == metricschema.StatusCounter {
+				require.Contains(t, expected.requests, label, "request metrics must use a CSV URL, not k6 or a name tag")
+				if observed.requests[label] == nil {
+					observed.requests[label] = &requestTotals{status: map[string]float64{}}
+				}
 			}
 			switch name {
 			case metricschema.RequestLatency:
 				observed.count += metric.GetHistogram().GetSampleCount()
 				observed.sum += metric.GetHistogram().GetSampleSum()
+				request := observed.requests[label]
+				request.count += metric.GetHistogram().GetSampleCount()
+				request.sum += metric.GetHistogram().GetSampleSum()
+				for _, bucket := range metric.GetHistogram().Bucket {
+					var count uint64
+					for _, duration := range durations[label] {
+						if duration <= bucket.GetUpperBound() {
+							count++
+						}
+					}
+					require.Equal(t, count, bucket.GetCumulativeCount(), "URL %s, bucket %g", label, bucket.GetUpperBound())
+				}
 			case metricschema.StatusCounter:
 				observed.status[labels[metricschema.LabelStatus]] += metric.GetCounter().GetValue()
+				observed.requests[label].status[labels[metricschema.LabelStatus]] += metric.GetCounter().GetValue()
 			case metricschema.EgressBytesCounter:
+				require.Equal(t, "k6", label, "received bytes must remain aggregate, not per URL")
 				observed.bytes += metric.GetCounter().GetValue()
 			case metricschema.ThreadsGauge:
 				observed.vus = metric.GetGauge().GetValue()
@@ -422,5 +474,12 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 	require.Equal(t, expected.status, observed.status)
 	require.InDelta(t, expected.bytes, observed.bytes, 0.000001)
 	require.Equal(t, expected.vus, observed.vus)
+	require.Len(t, observed.requests, len(expected.requests))
+	for url, request := range expected.requests {
+		require.Contains(t, observed.requests, url)
+		require.Equal(t, request.count, observed.requests[url].count, "URL %s", url)
+		require.InDelta(t, request.sum, observed.requests[url].sum, 0.000001, "URL %s", url)
+		require.Equal(t, request.status, observed.requests[url].status, "URL %s", url)
+	}
 	return observed
 }

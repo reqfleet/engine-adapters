@@ -17,10 +17,10 @@ revision a07d9b52b033678746464db9d34a5a52d2198475.
 The extracted source is licensed under the Apache License, Version 2.0.
 Modified extracted files are marked in their source headers.
 
-The OCI image also contains the unmodified Grafana k6 v2.3.0 executable,
+The OCI image also contains the unmodified Grafana k6 executable,
 a separate program distributed under the GNU Affero General Public License v3.
 Copyright Grafana Labs and k6 contributors; retain upstream source notices.
-Corresponding source: https://github.com/grafana/k6/tree/e0887846143ab176d4b5483c9d52cf3b3e009f1a
-The image includes K6_LICENSE and k6-v2.3.0-source.tar.gz under
+Upstream: https://github.com/grafana/k6
+The image includes K6_LICENSE and the selected release's versioned source archive under
 /usr/share/licenses/engine-adapters/, alongside SDK_THIRD_PARTY_NOTICES.
 No k6 source is linked into the adapter executable.

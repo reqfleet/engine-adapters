@@ -30,12 +30,15 @@ type Adapter struct {
 
 func New(reporter Reporter) *Adapter { return &Adapter{reporter: reporter} }
 
-func (a *Adapter) Options() agent.AgentServerOptions {
-	return agent.AgentServerOptions{
-		TestFileName: "script.js", ResultFile: "k6.csv",
-		BeforeStart: a.BeforeStart, BuildCommand: a.BuildCommand, Observe: a.reporter.Observe,
-		MetricsURL: "http://127.0.0.1:6566/metrics", NativeMetricsSchema: agent.MetricsSchemaShibuyaV1,
-	}
+// Options adds k6 callbacks and metrics configuration to resolved SDK options.
+func (a *Adapter) Options(options agent.AgentServerOptions) agent.AgentServerOptions {
+	options.TestFileName = "script.js"
+	options.ResultFile = "k6.csv"
+	options.BeforeStart = a.BeforeStart
+	options.BuildCommand = a.BuildCommand
+	options.Observe = a.reporter.Observe
+	options.NativeMetricsSchema = agent.MetricsSchemaShibuyaV1
+	return options
 }
 
 type settings struct{ vus, seconds, rampup int64 }
@@ -204,6 +207,7 @@ if (Object.prototype.hasOwnProperty.call(originalOptions, "systemTags")) {
   }
   retainedOptions.systemTags = originalOptions.systemTags.slice();
   if (retainedOptions.systemTags.indexOf("status") === -1) retainedOptions.systemTags.push("status");
+  if (retainedOptions.systemTags.indexOf("url") === -1) retainedOptions.systemTags.push("url");
 }
 export const options = Object.assign(retainedOptions, {scenarios: {reqfleet: %s}});
 export default function(data) { return plan.default(data); }

@@ -24,7 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const csvHeader = "metric_name,metric_value,status\n"
+const csvHeader = "metric_name,metric_value,status,url\n"
 
 func fixture(t *testing.T, budget int) (*Exporter, agent.RunContext) {
 	t.Helper()
@@ -85,66 +85,165 @@ func metricLabels(metric *dto.Metric) map[string]string {
 	return labels
 }
 
+type requestMetrics struct {
+	count    uint64
+	sum      float64
+	statuses map[string]float64
+}
+
+func assertRequestMetrics(t *testing.T, all map[string]*dto.MetricFamily, want map[string]requestMetrics) {
+	t.Helper()
+	require.Contains(t, all, metricschema.RequestLatency)
+	require.Contains(t, all, metricschema.StatusCounter)
+	require.Len(t, all[metricschema.RequestLatency].Metric, len(want))
+	got := make(map[string]requestMetrics)
+	for _, metric := range all[metricschema.RequestLatency].Metric {
+		got[metricLabels(metric)["label"]] = requestMetrics{
+			count:    metric.GetHistogram().GetSampleCount(),
+			sum:      metric.GetHistogram().GetSampleSum(),
+			statuses: make(map[string]float64),
+		}
+	}
+	statusCount := 0
+	for _, expected := range want {
+		statusCount += len(expected.statuses)
+	}
+	require.Len(t, all[metricschema.StatusCounter].Metric, statusCount)
+	for _, metric := range all[metricschema.StatusCounter].Metric {
+		labels := metricLabels(metric)
+		require.Contains(t, got, labels["label"])
+		got[labels["label"]].statuses[labels["status"]] = metric.GetCounter().GetValue()
+	}
+	assert.Equal(t, want, got)
+}
+
 func TestExactIndependentSampleMapping(t *testing.T) {
 	e, run := fixture(t, 10)
 	// Header order is deliberately unrelated to k6's default order. Quoted
 	// commas, escaped quotes and multiline unrelated tags must stay opaque.
-	putCSV(t, run, "extra,status,metric_value,metric_name\n"+
-		"\"name, with \"\"quotes\"\"\",200,12.5,http_req_duration\n"+
-		"\"multi\nline\",500,30,http_req_duration\n"+
-		"x,,3,vus\nx,,120,data_received\nx,,80,data_received\n"+
-		"x,,2,http_reqs\nx,,999,data_sent\nx,,not-a-number,custom_metric\n")
+	putCSV(t, run, "extra,status,url,metric_value,name,metric_name\n"+
+		"\"name, with \"\"quotes\"\"\",200,https://example.test/items?q=one,12.5,shared-name,http_req_duration\n"+
+		"\"multi\nline\",500,https://example.test/items?q=two,30,shared-name,http_req_duration\n"+
+		"x,200,https://example.test/items?q=one,7.5,different-name,http_req_duration\n"+
+		"x,500,https://example.test/items?q=one,5,another-name,http_req_duration\n"+
+		"x,,,3,,vus\nx,,,120,,data_received\nx,,,80,,data_received\n"+
+		"x,,,2,,http_reqs\nx,,,999,,data_sent\nx,,,not-a-number,,custom_metric\n")
 	state, err := e.Observe(context.Background(), run)
 	require.NoError(t, err)
 	require.Equal(t, protocol.ObservationReady, state)
 	all := families(t, e)
-	hist := single(t, all, metricschema.RequestLatency)
-	assert.Equal(t, uint64(2), hist.GetHistogram().GetSampleCount())
-	assert.Equal(t, 42.5, hist.GetHistogram().GetSampleSum())
-	assert.Equal(t, map[string]string{"collection_id": "collection", "plan_id": "plan", "run_id": "run-one", "engine_no": "agent-2", "zone": "zone-a", "label": "k6"}, metricLabels(hist))
+	assertRequestMetrics(t, all, map[string]requestMetrics{
+		"https://example.test/items?q=one": {count: 3, sum: 25, statuses: map[string]float64{"200": 2, "500": 1}},
+		"https://example.test/items?q=two": {count: 1, sum: 30, statuses: map[string]float64{"500": 1}},
+	})
 	bounds := []float64{1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, math.Inf(1)}
-	require.Len(t, hist.GetHistogram().Bucket, len(bounds))
-	for index, bound := range bounds {
-		assert.Equal(t, bound, hist.GetHistogram().Bucket[index].GetUpperBound())
+	for _, hist := range all[metricschema.RequestLatency].Metric {
+		label := metricLabels(hist)["label"]
+		assert.Equal(t, map[string]string{"collection_id": "collection", "plan_id": "plan", "run_id": "run-one", "engine_no": "agent-2", "zone": "zone-a", "label": label}, metricLabels(hist))
+		require.Len(t, hist.GetHistogram().Bucket, len(bounds))
+		for index, bound := range bounds {
+			assert.Equal(t, bound, hist.GetHistogram().Bucket[index].GetUpperBound())
+		}
+		if label == "https://example.test/items?q=one" {
+			assert.Equal(t, uint64(3), hist.GetHistogram().Bucket[4].GetCumulativeCount())
+			assert.Equal(t, uint64(3), hist.GetHistogram().Bucket[5].GetCumulativeCount())
+		}
 	}
-	assert.Equal(t, uint64(1), hist.GetHistogram().Bucket[4].GetCumulativeCount())
-	assert.Equal(t, uint64(2), hist.GetHistogram().Bucket[5].GetCumulativeCount())
-	statuses := all[metricschema.StatusCounter].Metric
-	require.Len(t, statuses, 2)
-	seen := map[string]float64{}
-	for _, metric := range statuses {
-		seen[metricLabels(metric)["status"]] = metric.GetCounter().GetValue()
-		assert.Equal(t, "k6", metricLabels(metric)["label"])
-	}
-	assert.Equal(t, map[string]float64{"200": 1, "500": 1}, seen)
 	assert.Equal(t, float64(3), single(t, all, metricschema.ThreadsGauge).GetGauge().GetValue())
 	assert.Equal(t, float64(200), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
+	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.NotContains(t, all, metricschema.CPUGauge, "a single CPU sample has no rate")
 	assert.Equal(t, float64(4096), single(t, all, metricschema.MemoryGauge).GetGauge().GetValue())
 	for range 3 {
 		next := families(t, e)
-		assert.Equal(t, hist, single(t, next, metricschema.RequestLatency))
+		assert.Equal(t, all[metricschema.RequestLatency], next[metricschema.RequestLatency])
 		assert.Equal(t, all[metricschema.StatusCounter], next[metricschema.StatusCounter])
 		assert.Equal(t, all[metricschema.EgressBytesCounter], next[metricschema.EgressBytesCounter])
 		assert.Equal(t, float64(3), single(t, next, metricschema.ThreadsGauge).GetGauge().GetValue())
 	}
-	appendCSV(t, run, "x,,0,vus\n")
+	appendCSV(t, run, "x,,,0,,vus\n")
 	next := families(t, e)
 	assert.Equal(t, float64(0), single(t, next, metricschema.ThreadsGauge).GetGauge().GetValue())
-	assert.Equal(t, hist, single(t, next, metricschema.RequestLatency))
+	assert.Equal(t, all[metricschema.RequestLatency], next[metricschema.RequestLatency])
 	assert.Equal(t, float64(0), single(t, families(t, e), metricschema.ThreadsGauge).GetGauge().GetValue())
+}
+
+func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
+	e, run := fixture(t, 2)
+	putCSV(t, run, csvHeader+
+		"data_received,10,,https://example.test/bytes\n"+
+		"vus,2,,https://example.test/vus\n"+
+		"http_req_duration,10,200,https://example.test/a\n"+
+		"http_req_duration,20,201,https://example.test/b\n"+
+		"http_req_duration,30,500,https://example.test/c\n"+
+		"http_req_duration,40,0,https://example.test/d\n")
+	all := families(t, e)
+	assertRequestMetrics(t, all, map[string]requestMetrics{
+		"https://example.test/a": {count: 1, sum: 10, statuses: map[string]float64{"200": 1}},
+		"https://example.test/b": {count: 1, sum: 20, statuses: map[string]float64{"201": 1}},
+		"others":                 {count: 2, sum: 70, statuses: map[string]float64{"500": 1, "0": 1}},
+	})
+	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
+	assert.Equal(t, float64(10), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
+	appendCSV(t, run,
+		"http_req_duration,5,500,https://example.test/a\n"+
+			"http_req_duration,7,201,https://example.test/b\n"+
+			"http_req_duration,3,200,https://example.test/c\n"+
+			"data_received,15,,\n")
+	all = families(t, e)
+	assertRequestMetrics(t, all, map[string]requestMetrics{
+		"https://example.test/a": {count: 2, sum: 15, statuses: map[string]float64{"200": 1, "500": 1}},
+		"https://example.test/b": {count: 2, sum: 27, statuses: map[string]float64{"201": 2}},
+		"others":                 {count: 3, sum: 73, statuses: map[string]float64{"500": 1, "0": 1, "200": 1}},
+	})
+	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
+	assert.Equal(t, float64(25), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
+
+	// Reset must release slots even when the run identity is unchanged.
+	putCSV(t, run, csvHeader+
+		"http_req_duration,4,200,https://example.test/c\n"+
+		"http_req_duration,6,201,https://example.test/d\n"+
+		"http_req_duration,8,500,https://example.test/a\n")
+	e.Reset(run)
+	all = families(t, e)
+	assertRequestMetrics(t, all, map[string]requestMetrics{
+		"https://example.test/c": {count: 1, sum: 4, statuses: map[string]float64{"200": 1}},
+		"https://example.test/d": {count: 1, sum: 6, statuses: map[string]float64{"201": 1}},
+		"others":                 {count: 1, sum: 8, statuses: map[string]float64{"500": 1}},
+	})
+	assert.NotContains(t, all, metricschema.EgressBytesCounter)
+}
+
+func TestZeroURLBudgetAggregatesRequestsAndBytesSeparately(t *testing.T) {
+	e, run := fixture(t, 0)
+	putCSV(t, run, csvHeader+
+		"data_received,12,,\n"+
+		"http_req_duration,10,200,https://example.test/a\n"+
+		"http_req_duration,20,200,https://example.test/b\n"+
+		"http_req_duration,30,500,https://example.test/c\n"+
+		"http_req_duration,40,200,https://example.test/a\n"+
+		"data_received,8,,\n")
+	all := families(t, e)
+	assertRequestMetrics(t, all, map[string]requestMetrics{
+		"others": {count: 4, sum: 100, statuses: map[string]float64{"200": 3, "500": 1}},
+	})
+	assert.Equal(t, "others", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
+	assert.Equal(t, float64(20), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
+	appendCSV(t, run, "http_req_duration,5,200,\n")
+	_, err := e.Observe(context.Background(), run)
+	require.Error(t, err, "a zero budget does not make request URLs optional")
 }
 
 func TestPartialLogicalRecordsAreRetriedExactlyOnce(t *testing.T) {
 	for _, ending := range []string{"\n", "\r\n"} {
 		t.Run(fmt.Sprintf("ending-%q", ending), func(t *testing.T) {
 			e, run := fixture(t, 10)
-			putCSV(t, run, "extra,status,metric_value,metric_na")
+			putCSV(t, run, "url,extra,status,metric_value,metric_na")
 			state, err := e.Observe(context.Background(), run)
 			require.NoError(t, err)
 			assert.Equal(t, protocol.ObservationPending, state)
 			assert.Zero(t, e.offset)
-			appendCSV(t, run, "me"+ending+"\"line one"+ending)
+			appendCSV(t, run, "me"+ending+"https://example.test/partial,\"line one"+ending)
 			state, err = e.Observe(context.Background(), run)
 			require.NoError(t, err)
 			assert.Equal(t, protocol.ObservationPending, state)
@@ -160,7 +259,7 @@ func TestPartialLogicalRecordsAreRetriedExactlyOnce(t *testing.T) {
 			appendCSV(t, run, ending)
 			all := families(t, e)
 			assert.Equal(t, uint64(1), single(t, all, metricschema.RequestLatency).GetHistogram().GetSampleCount())
-			appendCSV(t, run, "x,,1")
+			appendCSV(t, run, ",x,,1")
 			all = families(t, e)
 			assert.Equal(t, uint64(1), single(t, all, metricschema.RequestLatency).GetHistogram().GetSampleCount())
 			appendCSV(t, run, "20,data_received"+ending)
@@ -177,17 +276,17 @@ func TestPendingUnsupportedAndNonRequestSamples(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, protocol.ObservationPending, state)
 	assert.Equal(t, http.StatusServiceUnavailable, scrape(e).Code)
-	putCSV(t, run, csvHeader+"http_reqs,12,\ndata_sent,999,\ncustom,nonsense,not-http\n")
+	putCSV(t, run, csvHeader+"http_reqs,12,,\ndata_sent,999,,\ncustom,nonsense,not-http,\n")
 	state, err = e.Observe(context.Background(), run)
 	require.NoError(t, err)
 	assert.Equal(t, protocol.ObservationPending, state)
-	appendCSV(t, run, "vus,0,\n")
+	appendCSV(t, run, "vus,0,,\n")
 	all := families(t, e)
 	assert.NotContains(t, all, metricschema.RequestLatency)
 	assert.NotContains(t, all, metricschema.StatusCounter)
 	assert.NotContains(t, all, metricschema.EgressBytesCounter)
 	assert.Equal(t, float64(0), single(t, all, metricschema.ThreadsGauge).GetGauge().GetValue())
-	appendCSV(t, run, "data_received,42,\n")
+	appendCSV(t, run, "data_received,42,,\n")
 	all = families(t, e)
 	assert.NotContains(t, all, metricschema.RequestLatency)
 	assert.NotContains(t, all, metricschema.StatusCounter)
@@ -196,30 +295,35 @@ func TestPendingUnsupportedAndNonRequestSamples(t *testing.T) {
 
 func TestInvalidCompleteCSVIsStickyUntilReset(t *testing.T) {
 	cases := map[string]string{
-		"missing-name":        "metric_value,status\n1,200\n",
-		"missing-value":       "metric_name,status\nhttp_req_duration,200\n",
-		"missing-status":      "metric_name,metric_value\nhttp_req_duration,1\n",
-		"duplicate-column":    "metric_name,metric_value,status,status\n",
+		"missing-name":        "metric_value,status,url\n1,200,https://example.test/\n",
+		"missing-value":       "metric_name,status,url\nhttp_req_duration,200,https://example.test/\n",
+		"missing-status":      "metric_name,metric_value,url\nhttp_req_duration,1,https://example.test/\n",
+		"missing-url-column":  "metric_name,metric_value,status\n",
+		"duplicate-column":    "metric_name,metric_value,status,status,url\n",
+		"duplicate-url":       "metric_name,metric_value,status,url,url\n",
 		"short-row":           csvHeader + "vus,3\n",
-		"long-row":            csvHeader + "vus,3,,extra\n",
-		"bare-quote":          csvHeader + "vu\"s,3,\n",
-		"extraneous-quote":    csvHeader + "\"vus\"x,3,\n",
-		"empty-value":         csvHeader + "vus,,\n",
-		"invalid-number":      csvHeader + "data_received,no,\n",
-		"negative-bytes":      csvHeader + "data_received,-1,\n",
-		"negative-latency":    csvHeader + "http_req_duration,-1,200\n",
-		"negative-vus":        csvHeader + "vus,-1,\n",
-		"fractional-vus":      csvHeader + "vus,1.5,\n",
-		"nan":                 csvHeader + "http_req_duration,NaN,200\n",
-		"infinity":            csvHeader + "data_received,+Inf,\n",
-		"overflow":            csvHeader + "vus,1e999,\n",
-		"missing-http-status": csvHeader + "http_req_duration,1,\n",
-		"status-text":         csvHeader + "http_req_duration,1,OK\n",
-		"status-low":          csvHeader + "http_req_duration,1,99\n",
-		"status-high":         csvHeader + "http_req_duration,1,600\n",
-		"status-fraction":     csvHeader + "http_req_duration,1,200.0\n",
-		"status-sign":         csvHeader + "http_req_duration,1,+200\n",
-		"status-leading-zero": csvHeader + "http_req_duration,1,0200\n",
+		"long-row":            csvHeader + "vus,3,,,extra\n",
+		"bare-quote":          csvHeader + "vu\"s,3,,\n",
+		"extraneous-quote":    csvHeader + "\"vus\"x,3,,\n",
+		"empty-value":         csvHeader + "vus,,,\n",
+		"invalid-number":      csvHeader + "data_received,no,,\n",
+		"negative-bytes":      csvHeader + "data_received,-1,,\n",
+		"negative-latency":    csvHeader + "http_req_duration,-1,200,https://example.test/\n",
+		"negative-vus":        csvHeader + "vus,-1,,\n",
+		"fractional-vus":      csvHeader + "vus,1.5,,\n",
+		"nan":                 csvHeader + "http_req_duration,NaN,200,https://example.test/\n",
+		"infinity":            csvHeader + "data_received,+Inf,,\n",
+		"overflow":            csvHeader + "vus,1e999,,\n",
+		"missing-http-status": csvHeader + "http_req_duration,1,,https://example.test/\n",
+		"missing-url-value":   csvHeader + "http_req_duration,1,200,\n",
+		"quoted-empty-url":    csvHeader + "http_req_duration,1,200,\"\"\n",
+		"missing-url-field":   csvHeader + "http_req_duration,1,200\n",
+		"status-text":         csvHeader + "http_req_duration,1,OK,https://example.test/\n",
+		"status-low":          csvHeader + "http_req_duration,1,99,https://example.test/\n",
+		"status-high":         csvHeader + "http_req_duration,1,600,https://example.test/\n",
+		"status-fraction":     csvHeader + "http_req_duration,1,200.0,https://example.test/\n",
+		"status-sign":         csvHeader + "http_req_duration,1,+200,https://example.test/\n",
+		"status-leading-zero": csvHeader + "http_req_duration,1,0200,https://example.test/\n",
 	}
 	for name, text := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -228,13 +332,13 @@ func TestInvalidCompleteCSVIsStickyUntilReset(t *testing.T) {
 			_, err := e.Observe(context.Background(), run)
 			require.Error(t, err)
 			first := err.Error()
-			appendCSV(t, run, "vus,3,\n")
+			appendCSV(t, run, "vus,3,,\n")
 			_, err = e.Observe(context.Background(), run)
 			require.EqualError(t, err, first)
 			response := scrape(e)
 			assert.Equal(t, http.StatusInternalServerError, response.Code)
 			assert.Contains(t, response.Body.String(), first)
-			putCSV(t, run, csvHeader+"http_req_duration,1,200\n")
+			putCSV(t, run, csvHeader+"http_req_duration,1,200,https://example.test/\n")
 			e.Reset(run)
 			assert.Equal(t, uint64(1), single(t, families(t, e), metricschema.RequestLatency).GetHistogram().GetSampleCount())
 		})
@@ -245,7 +349,7 @@ func TestFileLossTruncationAndReplacementFail(t *testing.T) {
 	for _, action := range []string{"truncate-committed", "truncate-partial", "remove", "replace", "directory"} {
 		t.Run(action, func(t *testing.T) {
 			e, run := fixture(t, 10)
-			putCSV(t, run, csvHeader+"vus,3,\nhttp_req_duration,12")
+			putCSV(t, run, csvHeader+"vus,3,,\nhttp_req_duration,12")
 			_, err := e.Observe(context.Background(), run)
 			require.NoError(t, err)
 			switch action {
@@ -257,7 +361,7 @@ func TestFileLossTruncationAndReplacementFail(t *testing.T) {
 				require.NoError(t, os.Remove(run.ResultFile))
 			case "replace":
 				other := filepath.Join(filepath.Dir(run.ResultFile), "replacement.csv")
-				require.NoError(t, os.WriteFile(other, []byte(csvHeader+strings.Repeat("vus,3,\n", 20)), 0600))
+				require.NoError(t, os.WriteFile(other, []byte(csvHeader+strings.Repeat("vus,3,,\n", 20)), 0600))
 				require.NoError(t, os.Rename(other, run.ResultFile))
 			case "directory":
 				require.NoError(t, os.Remove(run.ResultFile))
@@ -272,7 +376,7 @@ func TestFileLossTruncationAndReplacementFail(t *testing.T) {
 
 func TestResetClearsIdentityCountersCursorAndCPU(t *testing.T) {
 	e, run := fixture(t, 0)
-	putCSV(t, run, csvHeader+"http_req_duration,12.5,0\ndata_received,120,\nvus,3,\n")
+	putCSV(t, run, csvHeader+"http_req_duration,12.5,0,https://example.test/old\ndata_received,120,,\nvus,3,,\n")
 	old := families(t, e)
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.RequestLatency))["label"])
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.EgressBytesCounter))["label"])
@@ -281,7 +385,7 @@ func TestResetClearsIdentityCountersCursorAndCPU(t *testing.T) {
 	assert.Contains(t, families(t, e), metricschema.CPUGauge)
 	next := run
 	next.RunID, next.CollectionID, next.PlanID, next.AgentID, next.Zone = "new-run", "new-collection", "new-plan", "new-agent", "new-zone"
-	putCSV(t, next, csvHeader+"http_req_duration,30,500\n")
+	putCSV(t, next, csvHeader+"http_req_duration,30,500,https://example.test/new\n")
 	e.Reset(next)
 	_, err := e.Observe(context.Background(), run)
 	require.ErrorContains(t, err, "active run")
@@ -308,7 +412,7 @@ func TestLabelBudgetValidationAndUnpreparedExporter(t *testing.T) {
 
 func TestCanceledObservationDoesNotPoisonRun(t *testing.T) {
 	e, run := fixture(t, 10)
-	putCSV(t, run, csvHeader+"vus,3,\n")
+	putCSV(t, run, csvHeader+"vus,3,,\n")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := e.Observe(ctx, run)
@@ -321,7 +425,7 @@ func TestCanceledObservationDoesNotPoisonRun(t *testing.T) {
 
 func TestResourcesUseRealCPUIntervalsAndFailClearly(t *testing.T) {
 	e, run := fixture(t, 10)
-	putCSV(t, run, csvHeader+"vus,0,\n")
+	putCSV(t, run, csvHeader+"vus,0,,\n")
 	cpu := uint64(4_000_000_000)
 	clock := time.Unix(100, 0)
 	e.resources = func() (resourceSample, error) { return resourceSample{cpuNanos: cpu, memoryBytes: 8192}, nil }
@@ -353,7 +457,7 @@ func TestResourcesUseRealCPUIntervalsAndFailClearly(t *testing.T) {
 
 func TestConcurrentObservationAndScrapeDoNotDoubleCount(t *testing.T) {
 	e, run := fixture(t, 10)
-	putCSV(t, run, csvHeader+strings.Repeat("http_req_duration,12.5,200\n", 100))
+	putCSV(t, run, csvHeader+strings.Repeat("http_req_duration,12.5,200,https://example.test/concurrent\n", 100))
 	var group sync.WaitGroup
 	errorsSeen := make(chan error, 20)
 	for index := range 20 {
