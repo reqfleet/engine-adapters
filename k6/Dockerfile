@@ -1,13 +1,18 @@
 # syntax=docker/dockerfile:1
 ARG K6_VERSION=v2.3.0
+ARG ENGINE_SDK_VERSION=v0.4.0
 FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm AS build
 ARG TARGETOS
 ARG TARGETARCH
+ARG ENGINE_SDK_VERSION
 ENV GOWORK=off GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org CGO_ENABLED=0
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# Apply the SDK selection after COPY so it cannot be overwritten by go.mod.
+RUN go get "github.com/reqfleet/engine-sdk@${ENGINE_SDK_VERSION}" && \
+    test "$(go list -m -f '{{.Version}}' github.com/reqfleet/engine-sdk)" = "$ENGINE_SDK_VERSION"
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o /out/k6-adapter ./k6/cmd/agent && \
     GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance ./conformance
 # Keep SDK transitive license notices with the executable distribution.
@@ -51,8 +56,9 @@ USER 0:0
 ENTRYPOINT ["/usr/local/bin/conformance", "-test.v", "-test.timeout=8m"]
 
 FROM base AS runtime
+ARG ENGINE_SDK_VERSION
 LABEL org.opencontainers.image.source="https://github.com/reqfleet/engine-adapters" \
-      org.opencontainers.image.description="HTTP k6 adapter; SDK v0.4.0, k6 ${K6_VERSION}, metrics shibuya-v1" \
+      org.opencontainers.image.description="HTTP k6 adapter; SDK ${ENGINE_SDK_VERSION}, k6 ${K6_VERSION}, metrics shibuya-v1" \
       org.opencontainers.image.licenses="Apache-2.0 AND AGPL-3.0-only"
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/k6-adapter"]

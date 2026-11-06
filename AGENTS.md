@@ -72,6 +72,20 @@ GOWORK=off go list -deps -test -json ./... | jq -e -s 'all(.[]; (.ImportPath | s
 GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.4.0") and all(.[]; .Replace == null)'
 ```
 
+### Configuring the engine SDK version
+
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.4.0`. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+
+```sh
+docker build -f k6/Dockerfile --target runtime \
+  --build-arg ENGINE_SDK_VERSION=v0.4.0 \
+  -t k6-adapter:sdk-v0.4.0 .
+```
+
+Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
+
+The override changes module files only inside the Docker build. The checkout's `go.mod` and `go.sum`, ordinary Go commands and host CI still use the repository pin. Keep the Dockerfile default, module files, CI dependency assertion and documentation aligned when upgrading the repository's SDK. Before publishing an overridden image, build and run the `conformance` target with the same SDK argument and verify the executable's SDK version, image metadata and notices.
+
 ### Configuring the k6 version
 
 `k6/Dockerfile` defaults to `K6_VERSION=v2.3.0`. Use the upstream release tag, including its leading `v`. The argument controls the binary download, corresponding source archive, license download and runtime image description.
@@ -143,7 +157,7 @@ The action retains QEMU because the Dockerfile's target-platform `base` stage ru
 Record this **manually tested** tuple for every rollout:
 
 ```text
-(Shibuya release, adapter image digest, SDK v0.4.0, selected k6 version, metrics shibuya-v1)
+(Shibuya release, adapter image digest, selected SDK version, selected k6 version, metrics shibuya-v1)
 ```
 
 Do not fill unspecified Shibuya releases or digests with presumed compatibility. This relaxed issue #1155 item 4 supports maintainer-managed external onboarding; it does **not** satisfy the original no-source-rebuild or automatic unsupported-protocol-version rejection criteria. No dynamic catalog, hot reload or automatic registration is claimed.
