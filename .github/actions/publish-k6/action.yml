@@ -2,7 +2,7 @@ name: Publish k6 adapter
 description: Publish the versioned multi-platform k6 runtime image to GHCR.
 inputs:
   version:
-    description: Adapter image version without the k6/ tag prefix, such as v0.1.0.
+    description: Independent k6 adapter image version with a leading v, such as v0.2.0; not the upstream k6 version.
     required: true
   registry-token:
     description: GitHub token with packages write permission.
