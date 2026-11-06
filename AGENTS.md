@@ -72,6 +72,23 @@ GOWORK=off go list -deps -test -json ./... | jq -e -s 'all(.[]; (.ImportPath | s
 GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.3.1-0.20261106013417-bc85eb9551f9") and all(.[]; .Replace == null)'
 ```
 
+### Configuring the k6 version
+
+`k6/Dockerfile` defaults to `K6_VERSION=v2.3.0`. Use the upstream release tag, including its leading `v`. The argument controls the binary download, corresponding source archive, license download and runtime image description.
+
+When selecting another release, also override `K6_CHECKSUMS_SHA256` with the SHA-256 digest of that release's `k6-<version>-checksums.txt` asset from trusted release metadata. This is the checksum file's digest, not the binary archive's digest. The build verifies both the checksum file and the selected architecture archive; a mismatched pin fails the build.
+
+For example, to build the verified v2.2.0 release:
+
+```sh
+docker build -f k6/Dockerfile --target runtime \
+  --build-arg K6_VERSION=v2.2.0 \
+  --build-arg K6_CHECKSUMS_SHA256=cecbd810434043492a60fc6f2d32f60036118927e0164757271823f6c96c64f2 \
+  -t k6-adapter:k6-v2.2.0 .
+```
+
+Before publishing an override, build the `conformance` target with the same arguments and run it with `docker run --rm --network none`. Verify the runtime's `k6 version`, image description and versioned source archive under `/usr/share/licenses/engine-adapters/`. Do not assume another engine version is compatible without conformance and deployment smoke evidence. The Makefile and release workflow use the Dockerfile defaults; change both default arguments together when updating the published engine version.
+
 ## Responsibilities and manual onboarding
 
 ### Adapter author
@@ -126,11 +143,11 @@ The action retains QEMU because the Dockerfile's target-platform `base` stage ru
 Record this **manually tested** tuple for every rollout:
 
 ```text
-(Shibuya release, adapter image digest, SDK bc85eb9551f9, k6 v2.3.0, metrics shibuya-v1)
+(Shibuya release, adapter image digest, SDK bc85eb9551f9, selected k6 version, metrics shibuya-v1)
 ```
 
 Do not fill unspecified Shibuya releases or digests with presumed compatibility. This relaxed issue #1155 item 4 supports maintainer-managed external onboarding; it does **not** satisfy the original no-source-rebuild or automatic unsupported-protocol-version rejection criteria. No dynamic catalog, hot reload or automatic registration is claimed.
 
 ## Licensing
 
-Adapter code is Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The public SDK harness and cgroup code are attributed adaptations. The OCI image also distributes unmodified k6 v2.3.0, a separate AGPLv3 program; its license and corresponding upstream source archive are included under `/usr/share/licenses/engine-adapters/`, with SDK transitive notices. Review upstream and transitive licenses before redistributing. Publication maintainers must preserve corresponding-source availability and notices for all shipped versions.
+Adapter code is Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The public SDK harness and cgroup code are attributed adaptations. The OCI image also distributes the selected unmodified k6 release, a separate AGPLv3 program; its license and corresponding upstream source archive are included under `/usr/share/licenses/engine-adapters/`, with SDK transitive notices. Review upstream and transitive licenses before redistributing. Publication maintainers must preserve corresponding-source availability and notices for all shipped versions.

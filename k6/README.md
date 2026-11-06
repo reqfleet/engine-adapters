@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Pinned engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0). Public SDK: [commit bc85eb9551f9](https://github.com/reqfleet/engine-sdk/tree/bc85eb9551f902fbb6a4e36e60ca5e3b038f6e88), pinned as `v0.3.1-0.20261106013417-bc85eb9551f9` in `go.mod`. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Public SDK: [commit bc85eb9551f9](https://github.com/reqfleet/engine-sdk/tree/bc85eb9551f902fbb6a4e36e60ca5e3b038f6e88), pinned as `v0.3.1-0.20261106013417-bc85eb9551f9` in `go.mod`. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
@@ -106,7 +106,7 @@ Collection, plan, run, agent and zone identity come from the current `RunContext
 
 ## Container and operational failures
 
-`../Makefile` builds `k6/Dockerfile`'s `runtime` target. Official v2.3.0 archives are verified against the published checksum file, itself pinned to the release metadata checksum. Both Linux amd64 and arm64 are supported. The CA-equipped runtime executes as UID/GID **65532**, with writable `/test-data` and `/shibuya-agent/{test-conf,test-result,run-tmp}` and `AGENT_ROOT=/shibuya-agent`.
+`../Makefile` builds `k6/Dockerfile`'s `runtime` target. The default engine is v2.3.0; `K6_VERSION` and its matching `K6_CHECKSUMS_SHA256` build argument select another release. Official archives are verified against the selected release's checksum file, itself checked against the pinned digest. The image includes that release's source and license. See [build configuration](../AGENTS.md#configuring-the-k6-version). Both Linux amd64 and arm64 are supported. The CA-equipped runtime executes as UID/GID **65532**, with writable `/test-data` and `/shibuya-agent/{test-conf,test-result,run-tmp}` and `AGENT_ROOT=/shibuya-agent`.
 
 The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA/authentication and lifecycle. Supply existing coordinator settings/credentials at deployment; none are baked into the image. Do not loosen scheduler security settings to run the adapter. The harness root process is a test-only privileged-port requirement; it explicitly starts the adapter non-root.
 
@@ -118,4 +118,4 @@ The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA
 - Updated artifact/settings: trigger after the previous run ends; the same pod can reuse its agent process without old source or counters.
 - Updated image: roll out compatible configuration, then purge/relaunch collections. Rollback follows the same process using the previous tested tuple/digest.
 
-Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, SDK bc85eb9551f9, k6 v2.3.0, metrics shibuya-v1)` tuple and live smoke results before production use.
+Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, SDK bc85eb9551f9, selected k6 version, metrics shibuya-v1)` tuple and live smoke results before production use.
