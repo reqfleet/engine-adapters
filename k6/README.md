@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Pinned engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0). Public SDK: [commit 0be3f54c6200](https://github.com/reqfleet/engine-sdk/tree/0be3f54c6200873999ea941ceef582b5812aa488), pinned as `v0.3.1-0.20261105101419-0be3f54c6200` in `go.mod`. Metrics: `shibuya-v1`. See the [root guide](../README.md) for manual onboarding, publication prerequisites, image release and operator responsibilities.
+Pinned engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0). Public SDK: [commit bc85eb9551f9](https://github.com/reqfleet/engine-sdk/tree/bc85eb9551f902fbb6a4e36e60ca5e3b038f6e88), pinned as `v0.3.1-0.20261106013417-bc85eb9551f9` in `go.mod`. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
@@ -118,4 +118,4 @@ The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA
 - Updated artifact/settings: trigger after the previous run ends; the same pod can reuse its agent process without old source or counters.
 - Updated image: roll out compatible configuration, then purge/relaunch collections. Rollback follows the same process using the previous tested tuple/digest.
 
-Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, SDK 0be3f54c6200, k6 v2.3.0, metrics shibuya-v1)` tuple and live smoke results before production use.
+Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, SDK bc85eb9551f9, k6 v2.3.0, metrics shibuya-v1)` tuple and live smoke results before production use.

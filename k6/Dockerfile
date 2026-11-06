@@ -48,7 +48,7 @@ ENTRYPOINT ["/usr/local/bin/conformance", "-test.v", "-test.timeout=8m"]
 
 FROM base AS runtime
 LABEL org.opencontainers.image.source="https://github.com/reqfleet/engine-adapters" \
-      org.opencontainers.image.description="HTTP k6 adapter; SDK 0be3f54c6200, k6 v2.3.0, metrics shibuya-v1" \
+      org.opencontainers.image.description="HTTP k6 adapter; SDK bc85eb9551f9, k6 v2.3.0, metrics shibuya-v1" \
       org.opencontainers.image.licenses="Apache-2.0 AND AGPL-3.0-only"
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/k6-adapter"]
