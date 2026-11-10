@@ -10,6 +10,15 @@
 - Keep the root `README.md` limited to minimal human-facing project information, quick-start commands and links.
 - Keep detailed agent development, verification, onboarding and release instructions in this file. Keep adapter usage and metrics contracts in `k6/README.md`.
 
+## Report readable errors across all adapters
+
+- Every adapter MUST translate engine-specific error codes or types into stable, easily readable descriptions when reporting errors in metrics. Do not expose only opaque codes or failure sentinels; retain the native code or type alongside the description for diagnostics when available.
+- Preserve the engine's actual failure classification. Distinguish DNS, connection refusal, connection timeout, response timeout and TLS failures when the engine provides that information. Never infer a more specific cause from the target configuration or reinterpret a timeout as a refusal.
+- Preserve native error metadata during ingestion. Unknown codes must remain identifiable with an explicit unknown-error description; missing details must be reported as an unspecified failure, not success or a guessed cause. Keep genuine protocol response statuses distinct from transport failures.
+- Use bounded, deterministic descriptions for metric labels. Do not label metrics with raw error messages containing changing addresses, ports, URLs, request IDs or sensitive data.
+- Count each reported failed request exactly once, including failures before a response or with zero recorded duration. Preserve available attribution and timing without fabricating response statuses, latency or bytes.
+- Document each adapter's error mapping and verify representative failures, unknown or missing metadata, and unchanged successful-response reporting through regression coverage and live conformance where supported.
+
 ## Request labels are a reporting contract
 
 For the k6 adapter, group request metrics by the exact CSV `url` value:
