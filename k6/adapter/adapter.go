@@ -150,12 +150,19 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	cmd := exec.CommandContext(ctx, a.executable, "inspect", entry)
 	cmd.Dir = run.Workspace.Inputs
 	cmd.Env = append(os.Environ(), "K6_CSV_SAVE_INTERVAL=1s")
-	output, err := cmd.CombinedOutput()
+	var stderr inspectionStderr
+	cmd.Stderr = &stderr
+	// A nil Stdout discards inspect's options JSON without buffering it.
+	err = cmd.Run()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if err != nil {
-		return fmt.Errorf("k6 inspect failed: %w: %s", err, strings.TrimSpace(string(output)))
+		detail := strings.TrimSpace(string(stderr.data[:stderr.used]))
+		if stderr.truncated {
+			detail = "[stderr truncated; showing final 16 KiB]\n" + detail
+		}
+		return fmt.Errorf("k6 inspect failed: %w: %s", err, detail)
 	}
 	a.preparedRun, a.entry = run.RunID, entry
 	return nil
@@ -169,6 +176,32 @@ func (a *Adapter) BuildCommand(ctx context.Context, run agent.RunContext) (agent
 		return agent.Command{}, fmt.Errorf("run %q has not been prepared", run.RunID)
 	}
 	return agent.Command{Command: a.executable, Args: []string{"run", "--no-usage-report", "--out", "csv=" + run.ResultFile, a.entry}, Dir: run.Workspace.Inputs, Env: []string{"K6_CSV_SAVE_INTERVAL=1s"}}, nil
+}
+
+const inspectionStderrLimit = 16 * 1024
+
+// inspectionStderr retains the tail while draining all output, so verbose init
+// logging cannot block inspection or displace its final error diagnostic.
+type inspectionStderr struct {
+	data      [inspectionStderrLimit]byte
+	used      int
+	truncated bool
+}
+
+func (b *inspectionStderr) Write(p []byte) (int, error) {
+	n := len(p)
+	if n >= len(b.data) {
+		b.truncated = b.truncated || b.used > 0 || n > len(b.data)
+		b.used = copy(b.data[:], p[n-len(b.data):])
+		return n, nil
+	}
+	if overflow := b.used + n - len(b.data); overflow > 0 {
+		copy(b.data[:], b.data[overflow:b.used])
+		b.used -= overflow
+		b.truncated = true
+	}
+	b.used += copy(b.data[b.used:], p)
+	return n, nil
 }
 
 func writeAtomic(ctx context.Context, destination, content string) error {

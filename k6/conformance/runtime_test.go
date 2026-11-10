@@ -90,6 +90,7 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	add("missing.js", "export const options = {};")
 	add("syntax.js", "export default function(")
 	add("tags.js", "export const options={systemTags:'status'};export default function(){}")
+	add("verbose.js", `console.log("x".repeat(1024*1024)); throw new Error("verbose init failure"); export default function(){}`)
 	add("labels.js", `import http from 'k6/http'; import {sleep} from 'k6';
 export default function(){for(const path of ['/200','/200','/200?item=a','/200?item=b','/500','/overflow','/overflow?item=c'])http.get('http://127.0.0.1:18080'+path);sleep(0.2);}`)
 	settings := json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)
@@ -225,7 +226,7 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 	start("1006", "threshold.js", "1", "")
 	status = terminal("1006", protocol.RunFailed, 90*time.Second)
 	require.NotZero(t, status.ExitCode)
-	for index, key := range []string{"scenarios", "vus", "duration", "iterations", "stages", "executionSegment", "executionSegmentSequence", "missing", "syntax", "tags"} {
+	for index, key := range []string{"scenarios", "vus", "duration", "iterations", "stages", "executionSegment", "executionSegmentSequence", "missing", "syntax", "tags", "verbose"} {
 		id := strconv.Itoa(1100 + index)
 		start(id, key+".js", "1", "")
 		status = terminal(id, protocol.RunFailed, proofWait)
@@ -238,6 +239,10 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 			require.Contains(t, status.ErrorMessage, "script.js")
 		case "tags":
 			require.Contains(t, status.ErrorMessage, "k6 options.systemTags must be an array")
+		case "verbose":
+			require.Contains(t, status.ErrorMessage, "[stderr truncated;")
+			require.Contains(t, status.ErrorMessage, "verbose init failure")
+			require.LessOrEqual(t, len(status.ErrorMessage), 16*1024+256)
 		default:
 			require.Contains(t, status.ErrorMessage, "k6 scheduling options are managed by the collection")
 		}

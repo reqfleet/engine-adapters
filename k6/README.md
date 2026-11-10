@@ -42,6 +42,8 @@ The adapter creates `Workspace.Temp/entry.js` atomically and leaves `/test-data/
 
 Before marking the run prepared, `BeforeStart` executes `/usr/local/bin/k6 inspect <generated-entry-path>` in `Workspace.Inputs`. Inspection errors, including k6's syntax diagnostics and source location, are returned through the SDK startup failure to the control plane rather than only logged. Cancellation terminates inspection. Inspection evaluates init code (again when the actual run starts), but does not execute setup, VU iterations or teardown; plans must allow repeated init evaluation.
 
+Inspection stdout is discarded. Stderr capture is limited to its final 16 KiB while excess output is drained; oversized diagnostics include a truncation marker. This bounds memory and error payloads while retaining the final diagnostic after verbose init logging.
+
 Command execution is direct, not shell interpolation:
 
 ```text

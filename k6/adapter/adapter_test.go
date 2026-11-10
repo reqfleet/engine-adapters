@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,4 +118,24 @@ func TestInspectionCancellation(t *testing.T) {
 	require.ErrorIs(t, a.BeforeStart(ctx, run), context.DeadlineExceeded)
 	_, err := a.BuildCommand(context.Background(), run)
 	require.ErrorContains(t, err, "has not been prepared")
+}
+
+func TestInspectionStderrBoundaries(t *testing.T) {
+	for _, size := range []int{0, inspectionStderrLimit - 1, inspectionStderrLimit, inspectionStderrLimit + 1, 3 * inspectionStderrLimit} {
+		for _, chunk := range []int{1, 137, inspectionStderrLimit, 2 * inspectionStderrLimit} {
+			t.Run(fmt.Sprintf("size=%d/chunk=%d", size, chunk), func(t *testing.T) {
+				input := strings.Repeat("0123456789", size/10+1)[:size]
+				var output inspectionStderr
+				for offset := 0; offset < len(input); offset += chunk {
+					part := input[offset:min(offset+chunk, len(input))]
+					n, err := output.Write([]byte(part))
+					require.NoError(t, err)
+					require.Equal(t, len(part), n, "discarded bytes must still be consumed")
+				}
+				want := input[max(0, len(input)-inspectionStderrLimit):]
+				require.Equal(t, want, string(output.data[:output.used]))
+				require.Equal(t, size > inspectionStderrLimit, output.truncated)
+			})
+		}
+	}
 }
