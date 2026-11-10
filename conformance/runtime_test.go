@@ -10,8 +10,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -175,6 +177,190 @@ func readFixturePID(t *testing.T, root, name string) int {
 	pid, err := strconv.Atoi(string(body))
 	require.NoError(t, err)
 	return pid
+}
+
+func TestRuntimeCleanupStopsActiveRunAfterRejectedOverlap(t *testing.T) {
+	requireRuntimeContainer(t)
+	var finalized atomic.Int64
+	t.Run("scenario", func(t *testing.T) {
+		contract := fixtureContract(t, "complete")
+		contract.Artifacts["graceful.txt"] = "graceful"
+		contract.Target = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			if request.URL.Path == "/finalize" {
+				finalized.Add(1)
+			}
+			_, _ = io.WriteString(w, "real fixture response")
+		})
+		runtime := startRuntime(t, contract)
+		runtime.Start(t, "8901", Fixture{File: "graceful.txt"})
+		runtime.Running(t, "8901")
+		runtime.AwaitRequests(t, "8901", 1)
+		runtime.Start(t, "8902", contract.Basic.Reuse)
+		require.Eventually(t, func() bool {
+			return strings.Contains(runtime.Logs(), "run 8901 is still active")
+		}, proofWait, 25*time.Millisecond, "overlapping start must reach SDK admission")
+		require.Zero(t, finalized.Load(), "workload must remain active until registered cleanup")
+		// Do not explicitly Stop: exercise the registered runtime cleanup.
+	})
+	require.Equal(t, int64(1), finalized.Load(), "cleanup must gracefully finalize the admitted workload despite the rejected overlap")
+}
+
+func TestRuntimeCleanupCancelsArtifactPreparation(t *testing.T) {
+	requireRuntimeContainer(t)
+	for _, verb := range []string{protocol.VerbStart, protocol.VerbPrepare} {
+		t.Run(verb, func(t *testing.T) {
+			runtime := startRuntime(t, fixtureContract(t, "complete"))
+			payload := Payload(verb, "8901", runtime.BlockedFile(), nil)
+			want := protocol.RunStarting
+			if verb == protocol.VerbPrepare {
+				payload.PlanMessage[proofPlan].DependencyFile = runtime.BlockedFile()
+				want = protocol.RunPreparing
+			}
+			runtime.Send(t, payload)
+			runtime.AwaitDownload(t)
+			status, err := runtime.Progress("8901")
+			require.NoError(t, err)
+			require.Equal(t, want, status.State, "the SDK must enter the requested lifecycle, not a substituted Start")
+
+			// Exercise the same graceful phase as registered cleanup, while
+			// leaving forced supervisor teardown pending until this test ends.
+			runtime.stopSubmitted(proofWait)
+			runtime.AwaitDownloadCancellation(t)
+			assertFixtureCanceledWhileAlive(t, runtime, verb == protocol.VerbPrepare)
+		})
+	}
+}
+
+func TestRuntimeCleanupCancelsDependencyPreparationHook(t *testing.T) {
+	contract := fixtureContract(t, "complete")
+	dependency, err := protocol.DependencyFilePath(proofCollection, proofPlan, "dependencies.txt")
+	require.NoError(t, err)
+	contract.DataArtifacts = map[string]string{
+		path.Join(protocol.ArtifactPathPrefix, dependency): "block preparation",
+	}
+	runtime := startRuntime(t, contract)
+	payload := Payload(protocol.VerbPrepare, "8901", "complete.txt", nil)
+	payload.PlanMessage[proofPlan].DependencyFile = "dependencies.txt"
+	runtime.Send(t, payload)
+	require.Eventually(t, func() bool {
+		body, err := os.ReadFile(filepath.Join(runtime.Root, "preparing"))
+		return err == nil && string(body) == "block preparation"
+	}, proofWait, 10*time.Millisecond, "the SDK hook must read the downloaded dependency artifact")
+	status, err := runtime.Progress("8901")
+	require.NoError(t, err)
+	require.Equal(t, protocol.RunPreparing, status.State)
+	require.Equal(t, int64(1), runtime.Downloads(), "Prepare downloads dependencies, not the execution test file")
+
+	runtime.stopSubmitted(proofWait)
+	body, err := os.ReadFile(filepath.Join(runtime.Root, "preparation-canceled"))
+	require.NoError(t, err, "the SDK hook must observe cancellation before any forced teardown")
+	require.Equal(t, context.Canceled.Error(), string(body))
+	assertFixtureCanceledWhileAlive(t, runtime, true)
+}
+
+func assertFixtureCanceledWhileAlive(t *testing.T, runtime *Runtime, preparing bool) {
+	t.Helper()
+	status, err := runtime.Progress("8901")
+	require.NoError(t, err, "the adapter must still serve its terminal state before forced teardown")
+	require.Equal(t, protocol.RunCanceled, status.State)
+	require.Equal(t, protocol.StopCanceled, status.StopReason)
+	if preparing {
+		request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/prepare-progress", nil)
+		require.NoError(t, err)
+		request.Header.Set("Authorization", "Bearer "+proofKey)
+		response, err := runtime.Client.Do(request)
+		require.NoError(t, err)
+		defer response.Body.Close()
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		var preparation protocol.PreparationProgress
+		require.NoError(t, json.NewDecoder(response.Body).Decode(&preparation))
+		require.Equal(t, "8901", preparation.RunID)
+		require.Equal(t, protocol.PreparationStateCanceled, preparation.Status)
+	}
+	runtime.AssertAlive(t)
+	require.NoError(t, syscall.Kill(readFixturePID(t, runtime.Root, "adapter.pid"), 0))
+}
+
+// Cap individual pipe stalls so reverting the whole-map cleanup deadline fails
+// in hundreds of milliseconds rather than waiting seconds for each submitted ID.
+type cleanupDeadlineConn struct {
+	net.Conn
+	writes int
+	stall  time.Duration
+}
+
+func (connection *cleanupDeadlineConn) SetWriteDeadline(deadline time.Time) error {
+	if cap := time.Now().Add(connection.stall); cap.Before(deadline) {
+		deadline = cap
+	}
+	return connection.Conn.SetWriteDeadline(deadline)
+}
+
+func (connection *cleanupDeadlineConn) Write(body []byte) (int, error) {
+	connection.writes++
+	return connection.Conn.Write(body)
+}
+
+func TestRuntimeCleanupSharesDeadlineAcrossSubmittedIDs(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		blocked   string
+		submitted int
+		stall     time.Duration
+	}{
+		{"writes/accumulated", "writes", 16, 25 * time.Millisecond},
+		{"progress/accumulated", "progress", 16, 25 * time.Millisecond},
+		{"writes/single", "writes", 1, 400 * time.Millisecond},
+		{"progress/single", "progress", 1, 400 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+				requests.Add(1)
+				<-request.Context().Done()
+			}))
+			defer server.Close()
+			transport := &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+				},
+			}
+			defer transport.CloseIdleConnections()
+			writer, reader := net.Pipe()
+			defer writer.Close()
+			defer reader.Close()
+			connection := &cleanupDeadlineConn{Conn: writer, stall: test.stall}
+			if test.blocked == "progress" {
+				go func() { _, _ = io.Copy(io.Discard, reader) }()
+			}
+			runtime := &Runtime{
+				peer:    &proofPeer{connection: connection},
+				Client:  &http.Client{Transport: transport, Timeout: test.stall},
+				done:    make(chan struct{}),
+				started: make(map[string]struct{}),
+			}
+			for id := range test.submitted {
+				runtime.started[strconv.Itoa(id)] = struct{}{}
+			}
+			started := time.Now()
+			runtime.stopSubmitted(75 * time.Millisecond)
+			elapsed := time.Since(started)
+			require.Less(t, elapsed, 250*time.Millisecond, "one budget must include every Stop write and progress request")
+			if test.blocked == "writes" {
+				require.Positive(t, connection.writes)
+				if test.submitted > 1 {
+					require.Less(t, connection.writes, test.submitted, "check the shared deadline between Stop IDs")
+				}
+				require.Zero(t, requests.Load(), "Stop writes already exhausted the shared budget")
+			} else {
+				require.Equal(t, test.submitted, connection.writes)
+				require.Positive(t, requests.Load())
+				if test.submitted > 1 {
+					require.Less(t, requests.Load(), int64(test.submitted), "check the shared deadline between progress IDs")
+				}
+			}
+		})
+	}
 }
 
 func TestRuntimeCleanupOwnsSeparateProcessGroups(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -67,7 +68,28 @@ func runFixtureAdapter() error {
 	var current agent.RunContext
 	options, err := agent.LoadAgentServerOptions(agent.AgentServerOptions{
 		TestFileName:        "fixture.txt",
+		DependencyFileName:  "fixture-dependencies.txt",
 		NativeMetricsSchema: agent.MetricsSchemaShibuyaV1,
+		PrepareDependencies: func(ctx context.Context, run agent.RunContext) error {
+			if run.DependencyFile == "" {
+				return nil
+			}
+			body, err := os.ReadFile(run.DependencyFile)
+			if err != nil {
+				return err
+			}
+			if string(body) != "block preparation" {
+				return fmt.Errorf("unexpected fixture dependency: %q", body)
+			}
+			if err := os.WriteFile(filepath.Join(run.Workspace.Root, "preparing"), body, 0600); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			if err := os.WriteFile(filepath.Join(run.Workspace.Root, "preparation-canceled"), []byte(ctx.Err().Error()), 0600); err != nil {
+				return err
+			}
+			return ctx.Err()
+		},
 		BeforeStart: func(_ context.Context, run agent.RunContext) error {
 			mu.Lock()
 			current = run
@@ -111,6 +133,12 @@ func runFixtureAdapter() error {
 }
 
 func runFixtureWorkload() error {
+	var stopped chan os.Signal
+	if os.Args[2] == "graceful" {
+		stopped = make(chan os.Signal, 1)
+		signal.Notify(stopped, syscall.SIGTERM)
+		defer signal.Stop(stopped)
+	}
 	if err := writeFixturePID("engine.pid"); err != nil {
 		return err
 	}
@@ -131,6 +159,23 @@ func runFixtureWorkload() error {
 	}
 	switch os.Args[2] {
 	case "complete":
+		return nil
+	case "graceful":
+		<-stopped
+		// Only a gracefully stopped workload sends this final request.
+		// Forced process-tree cleanup cannot manufacture this evidence.
+		response, err := (&http.Client{Timeout: time.Second}).Get(TargetURL + "/finalize")
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		_, err = io.Copy(io.Discard, response.Body)
+		if err != nil {
+			return err
+		}
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("fixture finalization returned HTTP %d", response.StatusCode)
+		}
 		return nil
 	case "failed":
 		return fmt.Errorf("intentional workload failure after a real request")

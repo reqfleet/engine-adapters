@@ -3,6 +3,8 @@ package conformance
 import (
 	"fmt"
 	"math"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -90,12 +92,6 @@ type MetricsSnapshot struct {
 	Concurrency *float64
 }
 
-type metricSeriesIdentity struct {
-	MetricIdentity
-	Request string
-	Status  string
-}
-
 // AssertMetrics checks the shibuya-v1 request metrics contract for either an SDK
 // result-event producer or a native normalized producer. Non-shibuya collectors
 // are ignored. Counter counts and histogram bounds are exact; sums and byte
@@ -114,6 +110,9 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 		Identity: expected.Identity,
 		Requests: make(map[string]RequestSnapshot),
 		Bytes:    make(map[string]float64),
+	}
+	if err := validateRawMetricSamples(exposition); err != nil {
+		return snapshot, err
 	}
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(strings.NewReader(exposition))
@@ -159,7 +158,6 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 		if len(family.Metric) == 0 {
 			return snapshot, fmt.Errorf("%s: empty metric family", name)
 		}
-		seenSeries := make(map[metricSeriesIdentity]struct{}, len(family.Metric))
 		for _, metric := range family.Metric {
 			labels, err := validateMetricLabels(metric, labelNames, identity)
 			prior := false
@@ -181,21 +179,11 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 					return snapshot, fmt.Errorf("%s: %w", name, err)
 				}
 			}
-			key := metricSeriesIdentity{
-				MetricIdentity: MetricIdentity{
-					CollectionID: labels[metricschema.LabelCollectionID],
-					PlanID:       labels[metricschema.LabelPlanID],
-					RunID:        labels[metricschema.LabelRunID],
-					EngineNo:     labels[metricschema.LabelEngineNo],
-					Zone:         labels[metricschema.LabelZone],
-				},
-				Request: labels[metricschema.LabelRequest],
-				Status:  labels[metricschema.LabelStatus],
+			label := labels[metricschema.LabelRequest]
+			// Native folding preserves the LLM family while replacing its label.
+			if name == metricschema.LLMResponseLatency && label != metricschema.LLMResponseLabel && label != "others" && label != "_other_" {
+				return snapshot, fmt.Errorf("%s: invalid LLM response label %q", name, label)
 			}
-			if _, duplicate := seenSeries[key]; duplicate {
-				return snapshot, fmt.Errorf("%s: duplicate series", name)
-			}
-			seenSeries[key] = struct{}{}
 			if prior {
 				if err := validateRetainedValues(metric, kind, bounds); err != nil {
 					return snapshot, fmt.Errorf("%s retained series: %w", name, err)
@@ -208,7 +196,6 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 				}
 				seenGauges[name] = true
 			}
-			label := labels[metricschema.LabelRequest]
 			switch name {
 			case metricschema.RequestLatency, metricschema.LLMResponseLatency, metricschema.StatusCounter:
 				want, ok := expected.Requests[label]
@@ -314,6 +301,74 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 		}
 	}
 	return snapshot, nil
+}
+
+// Like the SDK native validator, check raw histogram components separately:
+// expfmt's typed parser overwrites repeated _sum and _count samples. Removing
+// comments (including TYPE declarations) makes expfmt preserve each sample as
+// an untyped metric, while still handling quoted names and escaped labels.
+func validateRawMetricSamples(exposition string) error {
+	var samples strings.Builder
+	samples.Grow(len(exposition))
+	for line := range strings.Lines(exposition) {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			samples.WriteString(line)
+		}
+	}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(samples.String()))
+	if err != nil {
+		return fmt.Errorf("parse raw samples: %w", err)
+	}
+	var key []byte
+	histogramLabels := metricschema.LatencyLabels()
+	bucketLabels := append(metricschema.LatencyLabels(), "le")
+	for name, family := range families {
+		if !strings.HasPrefix(name, "shibuya_") {
+			continue
+		}
+		var componentLabels []string
+		countComponent := false
+		switch name {
+		case metricschema.RequestLatency, metricschema.LLMResponseLatency:
+			return fmt.Errorf("%s: histogram base name is not a sample", name)
+		case metricschema.RequestLatency + "_bucket", metricschema.LLMResponseLatency + "_bucket":
+			componentLabels, countComponent = bucketLabels, true
+		case metricschema.RequestLatency + "_count", metricschema.LLMResponseLatency + "_count":
+			componentLabels, countComponent = histogramLabels, true
+		case metricschema.RequestLatency + "_sum", metricschema.LLMResponseLatency + "_sum":
+			componentLabels = histogramLabels
+		}
+		seen := make(map[string]struct{}, len(family.Metric))
+		for _, metric := range family.Metric {
+			if componentLabels != nil {
+				if _, err := validateMetricLabels(metric, componentLabels, nil); err != nil {
+					return fmt.Errorf("%s: invalid histogram component: %w", name, err)
+				}
+			}
+			if countComponent {
+				value := metric.GetUntyped().GetValue()
+				if !finiteNonnegative(value) || math.Trunc(value) != value || value >= 0x1p64 {
+					return fmt.Errorf("%s: invalid raw histogram count %g", name, value)
+				}
+			}
+			slices.SortFunc(metric.Label, func(a, b *dto.LabelPair) int {
+				return strings.Compare(a.GetName(), b.GetName())
+			})
+			key = key[:0]
+			for _, label := range metric.Label {
+				key = strconv.AppendQuote(key, label.GetName())
+				key = append(key, '=')
+				key = strconv.AppendQuote(key, label.GetValue())
+				key = append(key, ',')
+			}
+			if _, duplicate := seen[string(key)]; duplicate {
+				return fmt.Errorf("%s: duplicate raw sample", name)
+			}
+			seen[string(key)] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func validateMetricLabels(metric *dto.Metric, names []string, identity map[string]string) (map[string]string, error) {

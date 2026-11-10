@@ -5,6 +5,7 @@
 package conformance
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,7 +82,7 @@ type Runtime struct {
 	peer            *proofPeer
 	logs            proofLog
 	done            chan struct{}
-	active          string
+	started         map[string]struct{}
 	downloads       atomic.Int64
 	blockedDownload chan struct{}
 	endedDownload   chan struct{}
@@ -140,6 +141,8 @@ func startRuntime(t *testing.T, contract Contract) *Runtime {
 	certificate, ca := proofCertificate(t)
 	r := &Runtime{peer: newProofPeer(t, certificate), LabelLimit: contract.LabelLimit, blockedDownload: make(chan struct{}, 1), endedDownload: make(chan struct{}, 1)}
 	r.blockedFile = "conformance-blocked" + filepath.Ext(contract.Basic.Complete.File)
+	blockedDependency, err := protocol.DependencyFilePath(proofCollection, proofPlan, r.blockedFile)
+	require.NoError(t, err)
 	artifacts := make(map[string]string, len(contract.Artifacts)+len(contract.DataArtifacts))
 	for name, body := range contract.Artifacts {
 		artifacts[proofArtifactPath(t, name)] = body
@@ -157,7 +160,7 @@ func startRuntime(t *testing.T, contract Contract) *Runtime {
 			return
 		}
 		r.downloads.Add(1)
-		if request.URL.Path == proofArtifactPath(t, r.blockedFile) {
+		if request.URL.Path == proofArtifactPath(t, r.blockedFile) || request.URL.Path == path.Join(protocol.ArtifactPathPrefix, blockedDependency) {
 			select {
 			case r.blockedDownload <- struct{}{}:
 			default:
@@ -187,23 +190,7 @@ func startRuntime(t *testing.T, contract Contract) *Runtime {
 	r.Client = &http.Client{Timeout: 3 * time.Second}
 	t.Cleanup(r.Client.CloseIdleConnections)
 	t.Cleanup(func() {
-		if r.active != "" {
-			_ = r.peer.send(proofPayload(protocol.VerbStop, r.active, "", nil))
-			deadline := time.Now().Add(proofWait)
-		gracefulStop:
-			for time.Now().Before(deadline) {
-				select {
-				case <-r.done:
-					break gracefulStop
-				default:
-				}
-				status, e := r.Progress(r.active)
-				if e == nil && status.State.Terminal() {
-					break
-				}
-				time.Sleep(25 * time.Millisecond)
-			}
-		}
+		r.stopSubmitted(proofWait)
 		if err := process.close(); err != nil {
 			t.Logf("adapter output:\n%s", r.Logs())
 			abortRuntimeCleanup(err)
@@ -227,6 +214,58 @@ func startRuntime(t *testing.T, contract Contract) *Runtime {
 	require.Contains(t, string(status), "Gid:\t65532\t65532\t65532\t65532")
 	r.assertAuthentication(t)
 	return r
+}
+
+// stopSubmitted shares one budget across all command writes and progress reads.
+// Stop every submitted start/prepare: rejected overlaps must not hide the active
+// run, and ordered stops also cover requests still in flight after Send returns.
+// Forced process teardown remains the caller's responsibility after this returns.
+func (r *Runtime) stopSubmitted(timeout time.Duration) {
+	if len(r.started) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	for id := range r.started {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		select {
+		case <-r.done:
+			return
+		default:
+		}
+		_ = r.peer.sendBefore(proofPayload(protocol.VerbStop, id, "", nil), deadline)
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for len(r.started) != 0 {
+		for id := range r.started {
+			if !time.Now().Before(deadline) {
+				return
+			}
+			select {
+			case <-r.done:
+				return
+			default:
+			}
+			status, err := proofProgressContext(ctx, r.Client, id)
+			if err == nil && status.State.Terminal() {
+				delete(r.started, id)
+			}
+		}
+		if len(r.started) == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.done:
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (r *Runtime) assertAuthentication(t *testing.T) {
@@ -307,8 +346,13 @@ func (r *Runtime) Start(t *testing.T, id string, fixture Fixture) protocol.Paylo
 
 func (r *Runtime) Send(t *testing.T, payload protocol.Payload) {
 	t.Helper()
-	if payload.Verb == protocol.VerbStart {
-		r.active = payload.PlanMessage[proofPlan].RunID
+	if payload.Verb == protocol.VerbStart || payload.Verb == protocol.VerbPrepare {
+		if r.started == nil {
+			r.started = make(map[string]struct{})
+		}
+		if id := payload.PlanMessage[proofPlan].RunID; id != "" {
+			r.started[id] = struct{}{}
+		}
 	}
 	require.NoError(t, r.peer.send(payload))
 }

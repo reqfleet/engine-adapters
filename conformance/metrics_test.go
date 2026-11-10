@@ -172,19 +172,15 @@ func TestMetricValidationRejectsMissingAndDuplicateSeries(t *testing.T) {
 			require.NotEmpty(t, selected)
 			_, err := validateMetrics(strings.Replace(text, selected, "", 1), expected)
 			require.Error(t, err, "missing measurement")
-			// The Prometheus parser coalesces repeated histogram sums/counts;
-			// buckets and independent series remain available for duplicate checks.
-			if !strings.Contains(prefix, "_count{") && !strings.Contains(prefix, "_sum{") {
-				_, err = validateMetrics(text+selected, expected)
-				require.Error(t, err, "duplicate measurement")
-			}
+			_, err = validateMetrics(text+selected, expected)
+			require.Error(t, err, "duplicate measurement")
 		})
 	}
 	text, expected := metricFixture()
 	_, err := validateMetrics(text+"# TYPE shibuya_unrecognized gauge\nshibuya_unrecognized 1\n", expected)
 	require.ErrorContains(t, err, "unexpected schema family")
 	_, err = validateMetrics(text+"not valid exposition\n", expected)
-	require.ErrorContains(t, err, "parse exposition")
+	require.Error(t, err)
 }
 
 func TestMetricValidationExplicitPriorIdentity(t *testing.T) {
@@ -294,7 +290,11 @@ func TestMetricValidationRetainedHistogramStructure(t *testing.T) {
 			prior.RunID = "prior"
 			expected.AllowedPriorIdentities = []MetricIdentity{prior}
 			identity := strings.ReplaceAll(metricTestIdentity, `run_id="current"`, `run_id="prior"`)
-			retained := latencyMetricFixture(family, identity, "old", []float64{0, 200, 400000})
+			label := "old"
+			if family == metricschema.LLMResponseLatency {
+				label = "llm_resp"
+			}
+			retained := latencyMetricFixture(family, identity, label, []float64{0, 200, 400000})
 			// The ordinary family already has a TYPE in the current fixture.
 			retained = strings.TrimPrefix(retained, "# TYPE "+family+" histogram\n")
 			header := ""
@@ -307,9 +307,9 @@ func TestMetricValidationRetainedHistogramStructure(t *testing.T) {
 			require.NoError(t, err, "retained observations need not match current observations")
 			require.Equal(t, current, got)
 
-			firstBucket := fmt.Sprintf("%s_bucket{%s,label=\"old\",le=%q} 1\n", family, identity, first)
-			sum := fmt.Sprintf("%s_sum{%s,label=\"old\"} 400200\n", family, identity)
-			count := fmt.Sprintf("%s_count{%s,label=\"old\"} 3\n", family, identity)
+			firstBucket := fmt.Sprintf("%s_bucket{%s,label=%q,le=%q} 1\n", family, identity, label, first)
+			sum := fmt.Sprintf("%s_sum{%s,label=%q} 400200\n", family, identity, label)
+			count := fmt.Sprintf("%s_count{%s,label=%q} 3\n", family, identity, label)
 			cases := []struct {
 				name string
 				old  string
@@ -321,7 +321,7 @@ func TestMetricValidationRetainedHistogramStructure(t *testing.T) {
 				{"duplicate bucket", firstBucket, firstBucket + firstBucket},
 				{"decreasing counts", firstBucket, strings.ReplaceAll(firstBucket, "} 1\n", "} 3\n")},
 				{"infinite bucket mismatch", `le="+Inf"} 3`, `le="+Inf"} 2`},
-				{"missing infinite bucket", fmt.Sprintf("%s_bucket{%s,label=\"old\",le=\"+Inf\"} 3\n", family, identity), ""},
+				{"missing infinite bucket", fmt.Sprintf("%s_bucket{%s,label=%q,le=\"+Inf\"} 3\n", family, identity, label), ""},
 				{"missing sum", sum, ""},
 				{"negative sum", sum, strings.ReplaceAll(sum, "400200", "-1")},
 				{"NaN sum", sum, strings.ReplaceAll(sum, "400200", "NaN")},
@@ -343,7 +343,7 @@ func TestMetricValidationRetainedHistogramStructure(t *testing.T) {
 					require.Error(t, err)
 				})
 			}
-			zero := latencyMetricFixture(family, identity, "old", nil)
+			zero := latencyMetricFixture(family, identity, label, nil)
 			zero = strings.TrimPrefix(zero, "# TYPE "+family+" histogram\n")
 			got, err = validateMetrics(text+header+zero, expected)
 			require.NoError(t, err)
@@ -382,30 +382,76 @@ func TestMetricValidationLLMResponseLatency(t *testing.T) {
 	_, err = validateMetrics(text+"# TYPE "+metricschema.LLMResponseLatency+" histogram\n"+retained, expected)
 	require.ErrorContains(t, err, "missing LLM response latency histogram", "retained observations must not satisfy current expectations")
 
-	// Both histograms may independently be present for a label.
-	both := strings.ReplaceAll(llm, `label="llm_resp"`, `label="/a?x=1"`)
+	// Both histograms may independently be present for a folded label.
+	ordinary := strings.ReplaceAll(text, `label="/a?x=1"`, `label="others"`)
+	both := strings.ReplaceAll(llm, `label="llm_resp"`, `label="others"`)
 	request := expected.Requests["/a?x=1"]
 	request.LLMResponseLatenciesMS = observations
-	expected.Requests["/a?x=1"] = request
+	expected.Requests["others"] = request
+	delete(expected.Requests, "/a?x=1")
 	delete(expected.Requests, "llm_resp")
+	text = ordinary
 	snapshot, err = validateMetrics(text+both, expected)
 	require.NoError(t, err)
-	require.Equal(t, uint64(4), snapshot.Requests["/a?x=1"].Latency.Count)
-	require.Equal(t, uint64(5), snapshot.Requests["/a?x=1"].LLMResponseLatency.Count)
+	require.Equal(t, uint64(4), snapshot.Requests["others"].Latency.Count)
+	require.Equal(t, uint64(5), snapshot.Requests["others"].LLMResponseLatency.Count)
 
 	request.LLMResponseLatenciesMS = []float64{}
-	expected.Requests["/a?x=1"] = request
-	zero := latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "/a?x=1", nil)
+	expected.Requests["others"] = request
+	zero := latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "others", nil)
 	snapshot, err = validateMetrics(text+zero, expected)
 	require.NoError(t, err)
-	require.Zero(t, snapshot.Requests["/a?x=1"].LLMResponseLatency.Count)
-	require.Zero(t, snapshot.Requests["/a?x=1"].LLMResponseLatency.Sum)
+	require.Zero(t, snapshot.Requests["others"].LLMResponseLatency.Count)
+	require.Zero(t, snapshot.Requests["others"].LLMResponseLatency.Sum)
 	_, err = validateMetrics(text, expected)
 	require.ErrorContains(t, err, "missing LLM response latency histogram")
 	request.LLMResponseLatenciesMS = nil
-	expected.Requests["/a?x=1"] = request
+	expected.Requests["others"] = request
 	_, err = validateMetrics(text+zero, expected)
 	require.ErrorContains(t, err, "unexpected or duplicate histogram")
+}
+
+func TestMetricValidationLLMResponseFamilyLabels(t *testing.T) {
+	for _, family := range []string{metricschema.RequestLatency, metricschema.LLMResponseLatency} {
+		for _, retained := range []bool{false, true} {
+			for _, label := range []string{"llm_resp", "others", "_other_", "/url", "LLM_RESP", "Llm_Resp", "ttft", "Others", "_OTHER_"} {
+				t.Run(fmt.Sprintf("%s/retained=%t/%s", family, retained, label), func(t *testing.T) {
+					_, fixture := metricFixture()
+					expected := MetricsExpectation{Identity: fixture.Identity}
+					identity := metricTestIdentity
+					if retained {
+						prior := expected.Identity
+						prior.RunID = "prior"
+						expected.AllowedPriorIdentities = []MetricIdentity{prior}
+						identity = strings.ReplaceAll(identity, `run_id="current"`, `run_id="prior"`)
+					} else {
+						request := RequestExpectation{LatenciesMS: []float64{100}}
+						if family == metricschema.LLMResponseLatency {
+							request = RequestExpectation{LLMResponseLatenciesMS: []float64{100}}
+						}
+						// Matching expectations must not legitimize a wrong-family label.
+						expected.Requests = map[string]RequestExpectation{label: request}
+					}
+					text := latencyMetricFixture(family, identity, label, []float64{100})
+					snapshot, err := validateMetrics(text, expected)
+					if family == metricschema.LLMResponseLatency && label != "llm_resp" && label != "others" && label != "_other_" {
+						require.Error(t, err)
+						return
+					}
+					require.NoError(t, err)
+					if retained {
+						require.Empty(t, snapshot.Requests)
+					} else if family == metricschema.LLMResponseLatency {
+						require.Equal(t, uint64(1), snapshot.Requests[label].LLMResponseLatency.Count)
+						require.Nil(t, snapshot.Requests[label].Latency)
+					} else {
+						require.Equal(t, uint64(1), snapshot.Requests[label].Latency.Count)
+						require.Nil(t, snapshot.Requests[label].LLMResponseLatency)
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestMetricValidationLLMRejectsInvalidCurrentMeasurements(t *testing.T) {
@@ -465,10 +511,8 @@ func TestMetricValidationDuplicateSeriesAcrossIdentities(t *testing.T) {
 			} {
 				t.Run(fmt.Sprintf("%s/retained=%t/reordered=%t", family, retained, reordered), func(t *testing.T) {
 					text, expected := metricFixture()
-					text += latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "/a?x=1", []float64{100})
-					request := expected.Requests["/a?x=1"]
-					request.LLMResponseLatenciesMS = []float64{100}
-					expected.Requests["/a?x=1"] = request
+					text += latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "llm_resp", []float64{100})
+					expected.Requests["llm_resp"] = RequestExpectation{LLMResponseLatenciesMS: []float64{100}}
 					var selected strings.Builder
 					for _, line := range strings.Split(text, "\n") {
 						if strings.HasPrefix(line, family+"{") || strings.HasPrefix(line, family+"_") {
@@ -497,12 +541,74 @@ func TestMetricValidationDuplicateSeriesAcrossIdentities(t *testing.T) {
 	}
 }
 
+func TestMetricValidationDuplicateHistogramComponents(t *testing.T) {
+	for _, family := range []string{metricschema.RequestLatency, metricschema.LLMResponseLatency} {
+		for _, retained := range []bool{false, true} {
+			for _, component := range []string{"_count", "_sum", "_bucket"} {
+				for _, reordered := range []bool{false, true} {
+					for _, quoted := range []bool{false, true} {
+						t.Run(fmt.Sprintf("%s%s/retained=%t/reordered=%t/quoted=%t", family, component, retained, reordered, quoted), func(t *testing.T) {
+							// Delimiters and escaped quotes/newlines must remain label
+							// content, not be mistaken for sample or label boundaries.
+							label := "request,} # TYPE \"quoted\" \\\nnext"
+							otherLabel := label + ",other"
+							request := RequestExpectation{LatenciesMS: []float64{100}}
+							if family == metricschema.LLMResponseLatency {
+								label, otherLabel = "llm_resp", "others"
+								request = RequestExpectation{LLMResponseLatenciesMS: []float64{100}}
+							}
+							expected := MetricsExpectation{
+								Identity: MetricIdentity{CollectionID: "collection", PlanID: "plan", RunID: "current", EngineNo: "7", Zone: "local"},
+								Requests: map[string]RequestExpectation{label: request, otherLabel: request},
+							}
+							header := fmt.Sprintf("# TYPE %s histogram\n", family)
+							text := latencyMetricFixture(family, metricTestIdentity, label, []float64{100})
+							text += strings.TrimPrefix(latencyMetricFixture(family, metricTestIdentity, otherLabel, []float64{100}), header)
+							identity := metricTestIdentity
+							if retained {
+								prior := expected.Identity
+								prior.RunID = "prior"
+								expected.AllowedPriorIdentities = []MetricIdentity{prior}
+								identity = strings.ReplaceAll(identity, `run_id="current"`, `run_id="prior"`)
+								text += strings.TrimPrefix(latencyMetricFixture(family, identity, label, []float64{100}), header)
+							}
+							labels := fmt.Sprintf("%s,label=%q", identity, label)
+							value := "1"
+							if component == "_sum" {
+								value = "100"
+							} else if component == "_bucket" {
+								labels += `,le="+Inf"`
+							}
+							sample := fmt.Sprintf("%s%s{%s} %s\n", family, component, labels, value)
+							originalSample := sample
+							// Comments resembling samples do not create identities.
+							text += "# " + sample
+							if reordered {
+								labels = strings.ReplaceAll(labels, `collection_id="collection",plan_id="plan"`, `plan_id="plan",collection_id="collection"`)
+							}
+							sample = fmt.Sprintf("%s%s{%s} %s\n", family, component, labels, value)
+							if quoted {
+								// Prometheus also permits the quoted metric name
+								// inside the braces, after label assignments.
+								sample = fmt.Sprintf("{%s,%q} %s\n", labels, family+component, value)
+							}
+							text = strings.Replace(text, originalSample, sample, 1)
+							_, err := validateMetrics(text, expected)
+							require.NoError(t, err, "distinct requests, runs and histogram components are valid")
+							_, err = validateMetrics(text+sample, expected)
+							require.Error(t, err, "even a single repeated component must be rejected")
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
 func TestMetricValidationDistinctRetainedSeries(t *testing.T) {
 	text, expected := metricFixture()
-	text += latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "/a?x=1", []float64{100})
-	request := expected.Requests["/a?x=1"]
-	request.LLMResponseLatenciesMS = []float64{100}
-	expected.Requests["/a?x=1"] = request
+	text += latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "llm_resp", []float64{100})
+	expected.Requests["llm_resp"] = RequestExpectation{LLMResponseLatenciesMS: []float64{100}}
 	current, err := validateMetrics(text, expected)
 	require.NoError(t, err)
 	var samples strings.Builder
@@ -542,6 +648,10 @@ func TestMetricValidationZeroCountHistogramSum(t *testing.T) {
 				_, fixture := metricFixture()
 				expected := MetricsExpectation{Identity: fixture.Identity}
 				identity := metricTestIdentity
+				label := "zero"
+				if family == metricschema.LLMResponseLatency {
+					label = "llm_resp"
+				}
 				if retained {
 					prior := expected.Identity
 					prior.RunID = "prior"
@@ -552,15 +662,15 @@ func TestMetricValidationZeroCountHistogramSum(t *testing.T) {
 					if family == metricschema.LLMResponseLatency {
 						request = RequestExpectation{LLMResponseLatenciesMS: []float64{}}
 					}
-					expected.Requests = map[string]RequestExpectation{"zero": request}
+					expected.Requests = map[string]RequestExpectation{label: request}
 				}
-				text := latencyMetricFixture(family, identity, "zero", nil)
+				text := latencyMetricFixture(family, identity, label, nil)
 				_, err := validateMetrics(text, expected)
 				require.NoError(t, err, "a genuinely empty histogram is valid")
-				sumLine := fmt.Sprintf("%s_sum{%s,label=\"zero\"} 0\n", family, identity)
+				sumLine := fmt.Sprintf("%s_sum{%s,label=%q} 0\n", family, identity, label)
 				require.Contains(t, text, sumLine)
 				for _, sum := range []float64{math.SmallestNonzeroFloat64, 0.0000001, 1} {
-					badSum := fmt.Sprintf("%s_sum{%s,label=\"zero\"} %g\n", family, identity, sum)
+					badSum := fmt.Sprintf("%s_sum{%s,label=%q} %g\n", family, identity, label, sum)
 					_, err := validateMetrics(strings.Replace(text, sumLine, badSum, 1), expected)
 					require.ErrorContains(t, err, "zero-count histogram has nonzero sum", "sum %g", sum)
 				}
@@ -582,8 +692,10 @@ func TestMetricValidationRequestLabelByteLimit(t *testing.T) {
 		{"Unicode 1024", strings.Repeat("界", 341) + "x", false},
 		{"Unicode 1025", strings.Repeat("界", 341) + "é", false},
 	}
+	// LLM labels have a closed reserved/folded vocabulary, tested separately;
+	// arbitrary boundary-length labels are valid only in the other families.
 	for _, family := range []string{
-		metricschema.RequestLatency, metricschema.LLMResponseLatency, metricschema.StatusCounter, metricschema.EgressBytesCounter,
+		metricschema.RequestLatency, metricschema.StatusCounter, metricschema.EgressBytesCounter,
 	} {
 		for _, retained := range []bool{false, true} {
 			for _, label := range labels {
@@ -603,9 +715,6 @@ func TestMetricValidationRequestLabelByteLimit(t *testing.T) {
 					case metricschema.RequestLatency:
 						request.LatenciesMS = []float64{1}
 						text = latencyMetricFixture(family, identity, label.value, request.LatenciesMS)
-					case metricschema.LLMResponseLatency:
-						request.LLMResponseLatenciesMS = []float64{100}
-						text = latencyMetricFixture(family, identity, label.value, request.LLMResponseLatenciesMS)
 					case metricschema.StatusCounter:
 						request.Statuses = map[string]uint64{"200": 1}
 						text = fmt.Sprintf("# TYPE %s counter\n%s{%s,label=%q,status=\"200\"} 1\n", family, family, identity, label.value)
@@ -661,5 +770,96 @@ func TestMetricValidationResourceIdentityLabelsHaveNoRequestByteLimit(t *testing
 			_, err := validateMetrics(text, expected)
 			require.NoError(t, err)
 		})
+	}
+}
+
+func TestMetricValidationRawHistogramShapes(t *testing.T) {
+	for _, family := range []string{metricschema.RequestLatency, metricschema.LLMResponseLatency} {
+		for _, retained := range []bool{false, true} {
+			_, fixture := metricFixture()
+			expected := MetricsExpectation{Identity: fixture.Identity}
+			identity := metricTestIdentity
+			if retained {
+				prior := expected.Identity
+				prior.RunID = "prior"
+				expected.AllowedPriorIdentities = []MetricIdentity{prior}
+				identity = strings.ReplaceAll(identity, `run_id="current"`, `run_id="prior"`)
+			} else {
+				request := RequestExpectation{LatenciesMS: []float64{}}
+				if family == metricschema.LLMResponseLatency {
+					request = RequestExpectation{LLMResponseLatenciesMS: []float64{}}
+				}
+				expected.Requests = map[string]RequestExpectation{"llm_resp": request}
+			}
+			text := latencyMetricFixture(family, identity, "llm_resp", nil)
+			labels := identity + `,label="llm_resp"`
+			cases := map[string]string{
+				"base sample":          text + fmt.Sprintf("%s{%s} 7\n", family, labels),
+				"bucket without bound": text + fmt.Sprintf("%s_bucket{%s} 7\n", family, labels),
+				"sum with bound":       strings.Replace(text, family+"_sum{"+labels+"}", family+"_sum{"+labels+`,le="1"}`, 1),
+				"count with bound":     strings.Replace(text, family+"_count{"+labels+"}", family+"_count{"+labels+`,le="1"}`, 1),
+			}
+			for name, malformed := range cases {
+				t.Run(fmt.Sprintf("%s/retained=%t/%s", family, retained, name), func(t *testing.T) {
+					_, err := validateMetrics(text, expected)
+					require.NoError(t, err)
+					_, err = validateMetrics(malformed, expected)
+					require.Error(t, err)
+					// Verify valid quoted exposition too, so syntax rejection
+					// cannot masquerade as component validation.
+					quoteNames := strings.NewReplacer(
+						family+"{", `"`+family+`"{`,
+						family+"_bucket{", `"`+family+`_bucket"{`,
+						family+"_sum{", `"`+family+`_sum"{`,
+						family+"_count{", `"`+family+`_count"{`,
+					)
+					_, err = validateMetrics(quoteNames.Replace(text), expected)
+					require.NoError(t, err)
+					_, err = validateMetrics(quoteNames.Replace(malformed), expected)
+					require.Error(t, err)
+				})
+			}
+		}
+	}
+}
+
+func TestMetricValidationRawHistogramCountRange(t *testing.T) {
+	for _, family := range []string{metricschema.RequestLatency, metricschema.LLMResponseLatency} {
+		for _, test := range []struct {
+			name, value string
+			valid       bool
+		}{
+			{"zero", "0", true},
+			{"one", "1", true},
+			{"largest representable below limit", fmt.Sprintf("%.0f", math.Nextafter(0x1p64, 0)), true},
+			{"limit", "18446744073709551616", false},
+			{"above limit", "36893488147419103232", false},
+			{"negative", "-1", false},
+			{"fractional", "1.5", false},
+			{"infinite", "+Inf", false},
+			{"not a number", "NaN", false},
+		} {
+			t.Run(family+"/"+test.name, func(t *testing.T) {
+				_, fixture := metricFixture()
+				prior := fixture.Identity
+				prior.RunID = "prior"
+				expected := MetricsExpectation{Identity: fixture.Identity, AllowedPriorIdentities: []MetricIdentity{prior}}
+				identity := strings.ReplaceAll(metricTestIdentity, `run_id="current"`, `run_id="prior"`)
+				text := latencyMetricFixture(family, identity, "llm_resp", nil)
+				var samples strings.Builder
+				for line := range strings.Lines(text) {
+					if strings.HasPrefix(line, family+"_bucket{") || strings.HasPrefix(line, family+"_count{") {
+						line = strings.TrimSuffix(line, " 0\n") + " " + test.value + "\n"
+					}
+					samples.WriteString(line)
+				}
+				_, err := validateMetrics(samples.String(), expected)
+				if test.valid {
+					require.NoError(t, err)
+				} else {
+					require.Error(t, err)
+				}
+			})
+		}
 	}
 }
