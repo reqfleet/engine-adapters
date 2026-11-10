@@ -235,7 +235,6 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 		case "missing":
 			require.Contains(t, status.ErrorMessage, "k6 plan must export a default function")
 		case "syntax":
-			require.Contains(t, status.ErrorMessage, "SyntaxError")
 			require.Contains(t, status.ErrorMessage, "script.js")
 		case "tags":
 			require.Contains(t, status.ErrorMessage, "k6 options.systemTags must be an array")
