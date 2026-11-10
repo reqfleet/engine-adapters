@@ -49,7 +49,7 @@ k6 CSV rows are independent metric samples, not complete request records:
 - Retain both `url` and `status` in k6 `systemTags`, including when a plan supplies an explicit tag list; preserve the other requested tags.
 - Parse CSV with `encoding/csv`, locate required columns by name, and reject missing URL columns or empty URLs on HTTP duration samples. Non-request samples may have empty URL fields.
 - Regression coverage must distinguish multiple URLs, repeated requests to one URL, query-string variants, and URL versus name columns. Cover overflow, zero budget, reset, independent status counts, and aggregate-only bytes.
-- For metrics behavior changes, run `make test-unit` and container-only `make test-conformance`, plus a live smoke when adding behavior not exercised by conformance. Never run the integration binary directly on the host; it owns fixed ports and `/test-data`.
+- For metrics behavior changes, run `make -C k6 test-unit` and container-only `make -C k6 test-conformance` from the repository root, plus a live smoke when adding behavior not exercised by conformance. Never run the integration binary directly on the host; it owns fixed ports and `/test-data`.
 - Keep [the metrics documentation](k6/README.md#url-grouped-request-metrics), exporter tests, and live conformance assertions aligned with these semantics.
 
 **Publication:** source is maintained at [reqfleet/engine-adapters](https://github.com/reqfleet/engine-adapters). Versioned OCI images use `ghcr.io/reqfleet/engine-adapters/k6`. Check [releases](https://github.com/reqfleet/engine-adapters/releases), successful publication workflow output, package visibility, and the immutable digest before deployment. A published adapter does not mean your Shibuya deployment admits or installs it.
@@ -58,15 +58,17 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 Prerequisites: Go **1.26.10**, Docker with Linux containers, and public HTTPS access to Go modules, Debian packages, and the k6 release. There is one module, no workspace, private dependency, Shibuya checkout, or `replace` directive.
 
+Build targets belong to each adapter's directory. From the repository root, use `make -C k6` for the k6 adapter; inside `k6/`, use `make` directly. Go builds and unit tests are scoped to that adapter, while Docker builds keep the repository root as their context for the shared module, conformance harness and licenses.
+
 ```sh
-make test-unit       # go test -race -count=1 ./...
-make test-conformance
-make image IMAGE=k6-adapter:local
+make -C k6 test-unit       # go test -race -count=1 ./... inside k6/
+make -C k6 test-conformance
+make -C k6 image IMAGE=k6-adapter:local
 # Or run both test targets:
-make test
+make -C k6 test
 ```
 
-`make test-conformance` builds the Dockerfile's `conformance` target and runs a disposable container with **no host mounts, published ports, or external network**. Its privileged test process supplies an ephemeral HTTPS artifact peer on 443, TLS command peer on 2416, and HTTP target on 18080. The real adapter runs as UID/GID 65532 and exposes the SDK server on 8080. The harness exercises real k6 HTTP 200/500 responses, a full one-minute run, optional hooks, original source preservation, CSV/normalized metric equality, retained final metrics, reused-process reset, duplicate starts, stale stops, blocked download and in-flight cancellation, settings/JavaScript/scheduling failures, failed thresholds, assignment modes, and recovery. It is intentionally not a standalone engine runner or substitute coordinator.
+`make -C k6 test-conformance` builds the Dockerfile's `conformance` target and runs a disposable container with **no host mounts, published ports, or external network**. Its privileged test process supplies an ephemeral HTTPS artifact peer on 443, TLS command peer on 2416, and HTTP target on 18080. The real adapter runs as UID/GID 65532 and exposes the SDK server on 8080. The harness exercises real k6 HTTP 200/500 responses, a full one-minute run, optional hooks, original source preservation, CSV/normalized metric equality, retained final metrics, reused-process reset, duplicate starts, stale stops, blocked download and in-flight cancellation, settings/JavaScript/scheduling failures, failed thresholds, assignment modes, and recovery. It is intentionally not a standalone engine runner or substitute coordinator.
 
 Do **not** invoke the integration test binary directly on your machine: it owns fixed ports and `/test-data`. Conformance takes longer than a minute because it proves natural completion, not just startup. Ordinary unit tests require no k6 binary. The harness is opt-in through the `integration` build tag inside its container. Source delivery is not evidence of successful execution: record actual test output and an immutable digest before claiming a tested release.
 
@@ -101,7 +103,7 @@ docker build -f k6/Dockerfile --target runtime \
   -t k6-adapter:k6-v2.2.0 .
 ```
 
-Before publishing an override, build the `conformance` target with the same arguments and run it with `docker run --rm --network none`. Verify the runtime's `k6 version`, image description and versioned source archive under `/usr/share/licenses/engine-adapters/`. Do not assume another engine version is compatible without conformance and deployment smoke evidence. The Makefile and release workflow use the Dockerfile defaults; change both default arguments together when updating the published engine version.
+Before publishing an override, build the `conformance` target with the same arguments and run it with `docker run --rm --network none`. Verify the runtime's `k6 version`, image description and versioned source archive under `/usr/share/licenses/engine-adapters/`. Do not assume another engine version is compatible without conformance and deployment smoke evidence. `k6/Makefile` and the release workflow use the Dockerfile defaults; change both default arguments together when updating the published engine version.
 
 ## Responsibilities and manual onboarding
 

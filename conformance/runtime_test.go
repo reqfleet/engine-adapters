@@ -32,7 +32,7 @@ import (
 // Fixed privileged ports and /test-data belong ONLY to the disposable image.
 // The adapter itself runs as the production UID/GID 65532, not harness root.
 func TestPublicK6Runtime(t *testing.T) {
-	require.Zero(t, os.Geteuid(), "use make test-conformance")
+	require.Zero(t, os.Geteuid(), "use make -C k6 test-conformance from the repository root")
 	_, err := os.Stat("/.dockerenv")
 	require.NoError(t, err)
 	startProofDNS(t)

@@ -15,6 +15,6 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Unit and race tests
-        run: make test-unit
+        run: make -C k6 test-unit
       - name: Real HTTP engine conformance
-        run: make test-conformance
+        run: make -C k6 test-conformance
