@@ -21,6 +21,6 @@ jobs:
         run: |
           set -euo pipefail
           GOWORK=off go list -deps -test -json ./... | jq -e -s 'all(.[]; (.ImportPath | startswith("github.com/reqfleet/shibuya") | not))'
-          GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.4.0") and all(.[]; .Replace == null)'
+          GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.5.0") and all(.[]; .Replace == null)'
       - name: Real HTTP engine conformance
         run: make test-conformance

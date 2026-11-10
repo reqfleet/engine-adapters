@@ -29,6 +29,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/reqfleet/engine-sdk/agent"
+	"github.com/reqfleet/engine-sdk/containerstats"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
 )
@@ -49,9 +50,10 @@ type Exporter struct {
 	nameIndex, valueIndex, statusIndex, urlIndex int
 	ready                                        bool
 	failure                                      error
-	resources                                    func() (resourceSample, error)
+	readCPUUsage                                 func() (uint64, error)
+	readMemoryUsage                              func() (uint64, error)
 	now                                          func() time.Time
-	cpuBaseline                                  resourceSample
+	cpuBaseline                                  uint64 // cumulative microseconds
 	cpuAt                                        time.Time
 	cpuStarted                                   bool
 	latency                                      *prometheus.HistogramVec
@@ -69,7 +71,11 @@ func New(labelLimit int) (*Exporter, error) {
 	if labelLimit < 0 {
 		return nil, errors.New("label_limit must be a nonnegative integer")
 	}
-	e := &Exporter{byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]string), resources: cgroupReader("/sys/fs/cgroup"), now: time.Now}
+	e := &Exporter{
+		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]string),
+		readCPUUsage: containerstats.ReadCPUUsage, readMemoryUsage: containerstats.ReadMemoryUsage,
+		now: time.Now,
+	}
 	if labelLimit == 0 {
 		e.byteLabel = "others"
 	}
@@ -107,7 +113,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
 	clear(e.urlLabels)
 	e.ready, e.failure = false, nil
-	e.cpuBaseline, e.cpuAt, e.cpuStarted = resourceSample{}, time.Time{}, false
+	e.cpuBaseline, e.cpuAt, e.cpuStarted = 0, time.Time{}, false
 	e.latency.Reset()
 	e.status.Reset()
 	e.bytes.Reset()
@@ -312,21 +318,25 @@ func (e *Exporter) requestLabel(url string) string {
 }
 
 func (e *Exporter) reportEngineMetrics() error {
-	sample, err := e.resources()
+	cpuMicros, err := e.readCPUUsage()
 	if err != nil {
-		return err
+		return fmt.Errorf("CPU usage: %w", err)
+	}
+	memoryBytes, err := e.readMemoryUsage()
+	if err != nil {
+		return fmt.Errorf("memory usage: %w", err)
 	}
 	now := e.now()
 	run := e.run
 	if e.cpuStarted {
 		elapsed := now.Sub(e.cpuAt).Seconds()
-		if elapsed <= 0 || sample.cpuNanos < e.cpuBaseline.cpuNanos {
+		if elapsed <= 0 || cpuMicros < e.cpuBaseline {
 			return errors.New("CPU usage or sampling clock moved backwards")
 		}
-		cores := float64(sample.cpuNanos-e.cpuBaseline.cpuNanos) / 1e9 / elapsed
+		cores := float64(cpuMicros-e.cpuBaseline) / 1e6 / elapsed
 		e.cpu.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(cores)
 	}
-	e.cpuBaseline, e.cpuAt, e.cpuStarted = sample, now, true
-	e.memory.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(float64(sample.memoryBytes))
+	e.cpuBaseline, e.cpuAt, e.cpuStarted = cpuMicros, now, true
+	e.memory.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(float64(memoryBytes))
 	return nil
 }
