@@ -38,7 +38,13 @@ The three numeric settings are required. Missing, null, nonstring, negative, sig
 
 Collection scheduling owns these options: `scenarios`, `vus`, `duration`, `iterations`, `stages`, `executionSegment`, `executionSegmentSequence`. Presence of any on uploaded `options`, even null, fails inside k6 with `k6 scheduling options are managed by the collection`. A missing default function fails with `k6 plan must export a default function`. Other options, including native threshold selectors, are retained. If `options.systemTags` is explicit, it must be an array; the wrapper adds missing `status`, `url` and `error_code` tags without discarding other tags. Default k6 tags remain unchanged when it is absent.
 
-The adapter creates `Workspace.Temp/entry.js` atomically and leaves `/test-data/script.js` byte-for-byte original. Preparation respects cancellation and invalidates previously prepared run IDs. Only that successfully prepared run ID may build a command. Command execution is direct, not shell interpolation:
+The adapter creates `Workspace.Temp/entry.js` atomically and leaves `/test-data/script.js` byte-for-byte original. Preparation respects cancellation and invalidates previously prepared run IDs. Only that successfully prepared run ID may build a command.
+
+Before marking the run prepared, `BeforeStart` executes `/usr/local/bin/k6 inspect <generated-entry-path>` in `Workspace.Inputs`. Inspection errors, including k6's syntax diagnostics and source location, are returned through the SDK startup failure to the control plane rather than only logged. Cancellation terminates inspection. Inspection evaluates init code (again when the actual run starts), but does not execute setup, VU iterations or teardown; plans must allow repeated init evaluation.
+
+Inspection stdout is discarded. Stderr capture is limited to its final 16 KiB while excess output is drained; oversized diagnostics include a truncation marker. This bounds memory and error payloads while retaining the final diagnostic after verbose init logging.
+
+Command execution is direct, not shell interpolation:
 
 ```text
 /usr/local/bin/k6 run --no-usage-report --out csv=<run.ResultFile> <generated-entry-path>

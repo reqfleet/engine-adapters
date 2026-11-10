@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/reqfleet/engine-sdk/agent"
 	"github.com/reqfleet/engine-sdk/protocol"
@@ -63,6 +65,8 @@ func TestPreparationAndCommand(t *testing.T) {
 	run := fixture(t)
 	r := &reporter{}
 	a := New(r)
+	a.executable = filepath.Join(t.TempDir(), "k6")
+	require.NoError(t, os.WriteFile(a.executable, []byte("#!/bin/sh\nexit 0\n"), 0700))
 	_, err := a.BuildCommand(context.Background(), run)
 	require.Error(t, err)
 	run.Artifacts = map[string]protocol.ArtifactAssignment{"copy.csv": {Mode: protocol.PartitionReplicated}, "split.csv": {Mode: protocol.PartitionMaterialized}}
@@ -102,4 +106,36 @@ func TestCancellationAndAssignmentFailures(t *testing.T) {
 	run.TestFile = filepath.Join(run.Workspace.Inputs, "missing.js")
 	require.ErrorContains(t, a.BeforeStart(context.Background(), run), "test file")
 	require.ErrorIs(t, writeAtomic(ctx, filepath.Join(run.Workspace.Temp, "entry.js"), "data"), context.Canceled)
+}
+
+func TestInspectionCancellation(t *testing.T) {
+	run := fixture(t)
+	a := New(&reporter{})
+	a.executable = filepath.Join(t.TempDir(), "k6")
+	require.NoError(t, os.WriteFile(a.executable, []byte("#!/bin/sh\nexec sleep 30\n"), 0700))
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, a.BeforeStart(ctx, run), context.DeadlineExceeded)
+	_, err := a.BuildCommand(context.Background(), run)
+	require.ErrorContains(t, err, "has not been prepared")
+}
+
+func TestInspectionStderrBoundaries(t *testing.T) {
+	for _, size := range []int{0, inspectionStderrLimit - 1, inspectionStderrLimit, inspectionStderrLimit + 1, 3 * inspectionStderrLimit} {
+		for _, chunk := range []int{1, 137, inspectionStderrLimit, 2 * inspectionStderrLimit} {
+			t.Run(fmt.Sprintf("size=%d/chunk=%d", size, chunk), func(t *testing.T) {
+				input := strings.Repeat("0123456789", size/10+1)[:size]
+				var output inspectionStderr
+				for offset := 0; offset < len(input); offset += chunk {
+					part := input[offset:min(offset+chunk, len(input))]
+					n, err := output.Write([]byte(part))
+					require.NoError(t, err)
+					require.Equal(t, len(part), n, "discarded bytes must still be consumed")
+				}
+				want := input[max(0, len(input)-inspectionStderrLimit):]
+				require.Equal(t, want, string(output.data[:output.used]))
+				require.Equal(t, size > inspectionStderrLimit, output.truncated)
+			})
+		}
+	}
 }

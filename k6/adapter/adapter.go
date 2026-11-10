@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/reqfleet/engine-sdk/agent"
@@ -26,9 +28,12 @@ type Adapter struct {
 	reporter    Reporter
 	preparedRun string
 	entry       string
+	executable  string
 }
 
-func New(reporter Reporter) *Adapter { return &Adapter{reporter: reporter} }
+func New(reporter Reporter) *Adapter {
+	return &Adapter{reporter: reporter, executable: "/usr/local/bin/k6"}
+}
 
 // Options adds k6 callbacks and metrics configuration to resolved SDK options.
 func (a *Adapter) Options(options agent.AgentServerOptions) agent.AgentServerOptions {
@@ -142,6 +147,25 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	if err := writeAtomic(ctx, entry, content); err != nil {
 		return fmt.Errorf("prepare k6 wrapper: %w", err)
 	}
+	cmd := exec.CommandContext(ctx, a.executable, "inspect", entry)
+	cmd.Dir = run.Workspace.Inputs
+	cmd.Env = append(os.Environ(), "K6_CSV_SAVE_INTERVAL=1s")
+	var stderr inspectionStderr
+	cmd.Stderr = &stderr
+	// A nil Stdout discards inspect's options JSON without buffering it.
+	err = cmd.Run()
+	// CommandContext can return "signal: killed" on cancellation; preserve the
+	// context error rather than reporting it as a plan inspection failure.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		detail := strings.TrimSpace(string(stderr.data[:stderr.used]))
+		if stderr.truncated {
+			detail = "[stderr truncated; showing final 16 KiB]\n" + detail
+		}
+		return fmt.Errorf("k6 inspect failed: %w: %s", err, detail)
+	}
 	a.preparedRun, a.entry = run.RunID, entry
 	return nil
 }
@@ -153,7 +177,34 @@ func (a *Adapter) BuildCommand(ctx context.Context, run agent.RunContext) (agent
 	if run.RunID == "" || a.preparedRun != run.RunID {
 		return agent.Command{}, fmt.Errorf("run %q has not been prepared", run.RunID)
 	}
-	return agent.Command{Command: "/usr/local/bin/k6", Args: []string{"run", "--no-usage-report", "--out", "csv=" + run.ResultFile, a.entry}, Dir: run.Workspace.Inputs, Env: []string{"K6_CSV_SAVE_INTERVAL=1s"}}, nil
+	return agent.Command{Command: a.executable, Args: []string{"run", "--no-usage-report", "--out", "csv=" + run.ResultFile, a.entry}, Dir: run.Workspace.Inputs, Env: []string{"K6_CSV_SAVE_INTERVAL=1s"}}, nil
+}
+
+const inspectionStderrLimit = 16 * 1024
+
+// inspectionStderr retains the tail while draining all output. Init logging
+// precedes k6's final error diagnostic, so retaining the head could lose the
+// failure reason after verbose logs.
+type inspectionStderr struct {
+	data      [inspectionStderrLimit]byte
+	used      int // Number of valid bytes retained in data[:used]
+	truncated bool
+}
+
+func (b *inspectionStderr) Write(p []byte) (int, error) {
+	n := len(p)
+	if n >= len(b.data) {
+		b.truncated = b.truncated || b.used > 0 || n > len(b.data)
+		b.used = copy(b.data[:], p[n-len(b.data):])
+		return n, nil
+	}
+	if overflow := b.used + n - len(b.data); overflow > 0 {
+		copy(b.data[:], b.data[overflow:b.used])
+		b.used -= overflow
+		b.truncated = true
+	}
+	b.used += copy(b.data[b.used:], p)
+	return n, nil
 }
 
 func writeAtomic(ctx context.Context, destination, content string) error {
