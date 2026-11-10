@@ -72,13 +72,6 @@ Do **not** invoke the integration test binary directly on your machine: it owns 
 
 The initial reference was exercised on Linux arm64 and Linux amd64 (under QEMU), using real k6 container conformance. Its Shibuya integration was exercised in Kind with two agents, two then three VUs per agent, shared CSV split/copy, mixed Replay logs, natural completion, Stop, failed startup, cancellation and same-pod recovery. That integration used a modified Shibuya checkout based on `44e1381b7ad31b0172aadba107e583663e16c74b`, **not a released compatibility guarantee**. Select a Shibuya release containing the static k6 admission/UI/chart changes and repeat the deployment smoke before production rollout.
 
-Dependency proof used by CI:
-
-```sh
-GOWORK=off go list -deps -test -json ./... | jq -e -s 'all(.[]; (.ImportPath | startswith("github.com/reqfleet/shibuya") | not))'
-GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.5.0") and all(.[]; .Replace == null)'
-```
-
 ### Configuring the engine SDK version
 
 `k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.0`. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
@@ -91,7 +84,7 @@ docker build -f k6/Dockerfile --target runtime \
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
 
-The override changes module files only inside the Docker build. The checkout's `go.mod` and `go.sum`, ordinary Go commands and host CI still use the repository pin. Keep the Dockerfile default, module files, CI dependency assertion and documentation aligned when upgrading the repository's SDK. Before publishing an overridden image, build and run the `conformance` target with the same SDK argument and verify the executable's SDK version, image metadata and notices.
+The override changes module files only inside the Docker build. The checkout's `go.mod` and `go.sum`, ordinary Go commands and host CI still use the repository pin. Keep the Dockerfile default, module files and documentation aligned when upgrading the repository's SDK. Before publishing an overridden image, build and run the `conformance` target with the same SDK argument and verify the executable's SDK version, image metadata and notices.
 
 ### Configuring the k6 version
 
@@ -145,7 +138,7 @@ Upload one bundled `.js` plus optional CSVs, choose per-agent VUs, duration in m
 
 ## Releases and compatibility
 
-PR CI runs race/unit tests, public dependency checks and Docker conformance. On each push to `main`, [the release workflow](.github/workflows/publish.yml) runs release-please using [the component configuration](release-please-config.json) and [the version manifest](.release-please-manifest.json). Each adapter has its own version and release PR; there is no repository-wide adapter version or coupling to upstream engine versions.
+PR CI runs race/unit tests and Docker conformance. On each push to `main`, [the release workflow](.github/workflows/publish.yml) runs release-please using [the component configuration](release-please-config.json) and [the version manifest](.release-please-manifest.json). Each adapter has its own version and release PR; there is no repository-wide adapter version or coupling to upstream engine versions.
 
 The `k6` component tracks `k6/` with the Go release strategy. Release-please owns `k6/CHANGELOG.md` and the `k6` entry in the version manifest. The initial manifest version is `0.1.0`, and `bootstrap-sha` points to the existing historical `v0.1.0` release commit. Do not recreate or move that tag. Release-please manages subsequent version updates; do not manually edit changelogs or bump the manifest after bootstrap.
 
