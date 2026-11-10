@@ -14,6 +14,7 @@ COPY . .
 RUN go get "github.com/reqfleet/engine-sdk@${ENGINE_SDK_VERSION}" && \
     test "$(go list -m -f '{{.Version}}' github.com/reqfleet/engine-sdk)" = "$ENGINE_SDK_VERSION"
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o /out/k6-adapter ./k6/cmd/agent && \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance-runtime ./conformance && \
     GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance ./k6/conformance
 # Keep SDK transitive license notices with the executable distribution.
 RUN cp "$(go list -m -f '{{.Dir}}' github.com/reqfleet/engine-sdk)/THIRD_PARTY_NOTICES" /out/SDK_THIRD_PARTY_NOTICES
@@ -52,8 +53,9 @@ EXPOSE 8080
 
 FROM base AS conformance
 COPY --from=build /out/conformance /usr/local/bin/conformance
+COPY --from=build /out/conformance-runtime /usr/local/bin/conformance-runtime
 USER 0:0
-ENTRYPOINT ["/usr/local/bin/conformance", "-test.v", "-test.timeout=8m"]
+ENTRYPOINT ["/bin/sh", "-c", "/usr/local/bin/conformance-runtime -test.v -test.timeout=2m && exec /usr/local/bin/conformance -test.v -test.timeout=8m"]
 
 FROM base AS runtime
 ARG ENGINE_SDK_VERSION

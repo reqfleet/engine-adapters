@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -448,7 +450,9 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 		Resources:   conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
 	})
 	observed := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}, vus: *snapshot.Concurrency}
-	for label, request := range snapshot.Requests {
+	// Stable addition order keeps retained-scrape comparisons deterministic.
+	for _, label := range slices.Sorted(maps.Keys(snapshot.Requests)) {
+		request := snapshot.Requests[label]
 		value := &requestTotals{count: request.Latency.Count, sum: request.Latency.Sum, status: map[string]float64{}}
 		observed.count += value.count
 		observed.sum += value.sum

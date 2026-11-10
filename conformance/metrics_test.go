@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/stretchr/testify/require"
 )
 
@@ -254,4 +255,203 @@ func TestMetricValidationIgnoresExpositionOrderAndUnrelatedCollectors(t *testing
 	second, err := validateMetrics(reordered.String(), expected)
 	require.NoError(t, err)
 	require.Equal(t, first, second)
+}
+
+// These fixtures deliberately state both SDK profiles independently of the
+// validator, so changing its accepted bounds cannot silently change the oracle.
+func latencyMetricFixture(name, identity, label string, observations []float64) string {
+	bounds := []float64{1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, math.Inf(1)}
+	if name == metricschema.LLMResponseLatency {
+		bounds = []float64{100, 250, 500, 1000, 2500, 5000, 7500, 10000, 15000, 20000, 30000, 45000, 60000, 90000, 120000, 180000, 300000, math.Inf(1)}
+	}
+	var text strings.Builder
+	fmt.Fprintf(&text, "# TYPE %s histogram\n", name)
+	for _, bound := range bounds {
+		var count int
+		for _, observation := range observations {
+			if observation <= bound {
+				count++
+			}
+		}
+		fmt.Fprintf(&text, "%s_bucket{%s,label=%q,le=%q} %d\n", name, identity, label, fmt.Sprint(bound), count)
+	}
+	var sum float64
+	for _, observation := range observations {
+		sum += observation
+	}
+	fmt.Fprintf(&text, "%s_count{%s,label=%q} %d\n", name, identity, label, len(observations))
+	fmt.Fprintf(&text, "%s_sum{%s,label=%q} %g\n", name, identity, label, sum)
+	return text.String()
+}
+
+func TestMetricValidationRetainedHistogramStructure(t *testing.T) {
+	for _, family := range []string{metricschema.RequestLatency, metricschema.LLMResponseLatency} {
+		t.Run(family, func(t *testing.T) {
+			text, expected := metricFixture()
+			current, err := validateMetrics(text, expected)
+			require.NoError(t, err)
+			prior := expected.Identity
+			prior.RunID = "prior"
+			expected.AllowedPriorIdentities = []MetricIdentity{prior}
+			identity := strings.ReplaceAll(metricTestIdentity, `run_id="current"`, `run_id="prior"`)
+			retained := latencyMetricFixture(family, identity, "old", []float64{0, 200, 400000})
+			// The ordinary family already has a TYPE in the current fixture.
+			retained = strings.TrimPrefix(retained, "# TYPE "+family+" histogram\n")
+			header := ""
+			first, second := "1", "2.5"
+			if family == metricschema.LLMResponseLatency {
+				header = "# TYPE " + family + " histogram\n"
+				first, second = "100", "250"
+			}
+			got, err := validateMetrics(text+header+retained, expected)
+			require.NoError(t, err, "retained observations need not match current observations")
+			require.Equal(t, current, got)
+
+			firstBucket := fmt.Sprintf("%s_bucket{%s,label=\"old\",le=%q} 1\n", family, identity, first)
+			sum := fmt.Sprintf("%s_sum{%s,label=\"old\"} 400200\n", family, identity)
+			count := fmt.Sprintf("%s_count{%s,label=\"old\"} 3\n", family, identity)
+			cases := []struct {
+				name string
+				old  string
+				new  string
+			}{
+				{"wrong bound", `le="` + first + `"`, `le="0.5"`},
+				{"duplicate bound", `le="` + second + `"`, `le="` + first + `"`},
+				{"missing bucket", firstBucket, ""},
+				{"duplicate bucket", firstBucket, firstBucket + firstBucket},
+				{"decreasing counts", firstBucket, strings.ReplaceAll(firstBucket, "} 1\n", "} 3\n")},
+				{"infinite bucket mismatch", `le="+Inf"} 3`, `le="+Inf"} 2`},
+				{"missing infinite bucket", fmt.Sprintf("%s_bucket{%s,label=\"old\",le=\"+Inf\"} 3\n", family, identity), ""},
+				{"missing sum", sum, ""},
+				{"negative sum", sum, strings.ReplaceAll(sum, "400200", "-1")},
+				{"NaN sum", sum, strings.ReplaceAll(sum, "400200", "NaN")},
+				{"infinite sum", sum, strings.ReplaceAll(sum, "400200", "+Inf")},
+				{"missing count", count, ""},
+				{"negative count", count, strings.ReplaceAll(count, "} 3\n", "} -1\n")},
+				{"fractional count", count, strings.ReplaceAll(count, "} 3\n", "} 3.5\n")},
+				{"NaN count", count, strings.ReplaceAll(count, "} 3\n", "} NaN\n")},
+				{"infinite count", count, strings.ReplaceAll(count, "} 3\n", "} +Inf\n")},
+				{"negative bucket", firstBucket, strings.ReplaceAll(firstBucket, "} 1\n", "} -1\n")},
+				{"fractional bucket", firstBucket, strings.ReplaceAll(firstBucket, "} 1\n", "} 1.5\n")},
+				{"NaN bucket", firstBucket, strings.ReplaceAll(firstBucket, "} 1\n", "} NaN\n")},
+				{"infinite bucket", firstBucket, strings.ReplaceAll(firstBucket, "} 1\n", "} +Inf\n")},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					require.Contains(t, retained, tc.old)
+					_, err := validateMetrics(text+header+strings.ReplaceAll(retained, tc.old, tc.new), expected)
+					require.Error(t, err)
+				})
+			}
+			zero := latencyMetricFixture(family, identity, "old", nil)
+			zero = strings.TrimPrefix(zero, "# TYPE "+family+" histogram\n")
+			got, err = validateMetrics(text+header+zero, expected)
+			require.NoError(t, err)
+			require.Equal(t, current, got)
+		})
+	}
+}
+
+func TestMetricValidationLLMResponseLatency(t *testing.T) {
+	text, expected := metricFixture()
+	observations := []float64{0, 100, 7500, 300000, 400000}
+	llm := latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "llm_resp", observations)
+	expected.Requests["llm_resp"] = RequestExpectation{LLMResponseLatenciesMS: observations}
+	snapshot, err := validateMetrics(text+llm, expected)
+	require.NoError(t, err)
+	require.Nil(t, snapshot.Requests["llm_resp"].Latency)
+	require.Empty(t, snapshot.Requests["llm_resp"].Statuses)
+	latency := snapshot.Requests["llm_resp"].LLMResponseLatency
+	require.Equal(t, uint64(5), latency.Count)
+	require.Equal(t, 707600.0, latency.Sum)
+	require.Len(t, latency.Buckets, 18)
+	require.Equal(t, uint64(3), latency.Buckets[7500])
+	require.Equal(t, uint64(4), latency.Buckets[300000])
+	require.Equal(t, uint64(5), latency.Buckets[math.Inf(1)])
+	require.Nil(t, snapshot.Requests["/a?x=1"].LLMResponseLatency)
+
+	prior := expected.Identity
+	prior.RunID = "prior"
+	expected.AllowedPriorIdentities = []MetricIdentity{prior}
+	priorIdentity := strings.ReplaceAll(metricTestIdentity, `run_id="current"`, `run_id="prior"`)
+	retained := latencyMetricFixture(metricschema.LLMResponseLatency, priorIdentity, "llm_resp", []float64{20000})
+	retained = strings.TrimPrefix(retained, "# TYPE "+metricschema.LLMResponseLatency+" histogram\n")
+	withPrior, err := validateMetrics(text+llm+retained, expected)
+	require.NoError(t, err)
+	require.Equal(t, snapshot, withPrior, "retained LLM observations must not enter current snapshot")
+	_, err = validateMetrics(text+"# TYPE "+metricschema.LLMResponseLatency+" histogram\n"+retained, expected)
+	require.ErrorContains(t, err, "missing LLM response latency histogram", "retained observations must not satisfy current expectations")
+
+	// Both histograms may independently be present for a label.
+	both := strings.ReplaceAll(llm, `label="llm_resp"`, `label="/a?x=1"`)
+	request := expected.Requests["/a?x=1"]
+	request.LLMResponseLatenciesMS = observations
+	expected.Requests["/a?x=1"] = request
+	delete(expected.Requests, "llm_resp")
+	snapshot, err = validateMetrics(text+both, expected)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), snapshot.Requests["/a?x=1"].Latency.Count)
+	require.Equal(t, uint64(5), snapshot.Requests["/a?x=1"].LLMResponseLatency.Count)
+
+	request.LLMResponseLatenciesMS = []float64{}
+	expected.Requests["/a?x=1"] = request
+	zero := latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "/a?x=1", nil)
+	snapshot, err = validateMetrics(text+zero, expected)
+	require.NoError(t, err)
+	require.Zero(t, snapshot.Requests["/a?x=1"].LLMResponseLatency.Count)
+	require.Zero(t, snapshot.Requests["/a?x=1"].LLMResponseLatency.Sum)
+	_, err = validateMetrics(text, expected)
+	require.ErrorContains(t, err, "missing LLM response latency histogram")
+	request.LLMResponseLatenciesMS = nil
+	expected.Requests["/a?x=1"] = request
+	_, err = validateMetrics(text+zero, expected)
+	require.ErrorContains(t, err, "unexpected or duplicate histogram")
+}
+
+func TestMetricValidationLLMRejectsInvalidCurrentMeasurements(t *testing.T) {
+	cases := []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{"wrong profile", `le="7500"`, `le="8000"`},
+		{"wrong observations", `le="7500"} 3`, `le="7500"} 2`},
+		{"decreasing counts", `le="100"} 2`, `le="100"} 4`},
+		{"wrong infinite bucket", `le="+Inf"} 5`, `le="+Inf"} 4`},
+		{"wrong sum", "} 707600\n", "} 707601\n"},
+		{"negative sum", "} 707600\n", "} -1\n"},
+		{"nonfinite sum", "} 707600\n", "} +Inf\n"},
+		{"wrong count", `label="llm_resp"} 5`, `label="llm_resp"} 4`},
+		{"fractional count", `label="llm_resp"} 5`, `label="llm_resp"} 5.5`},
+		{"nonfinite count", `label="llm_resp"} 5`, `label="llm_resp"} NaN`},
+		{"wrong label", `label="llm_resp"`, `label="unknown"`},
+		{"extra label", `label="llm_resp"`, `label="llm_resp",extra="invalid"`},
+		{"wrong identity", `zone="local"`, `zone="other"`},
+		{"wrong type", " histogram\n", " gauge\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			text, expected := metricFixture()
+			observations := []float64{0, 100, 7500, 300000, 400000}
+			llm := latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "llm_resp", observations)
+			expected.Requests["llm_resp"] = RequestExpectation{LLMResponseLatenciesMS: observations}
+			require.Contains(t, llm, tc.old)
+			_, err := validateMetrics(text+strings.ReplaceAll(llm, tc.old, tc.new), expected)
+			require.Error(t, err)
+		})
+	}
+	text, expected := metricFixture()
+	llm := latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "llm_resp", []float64{100})
+	_, err := validateMetrics(text+llm, expected)
+	require.ErrorContains(t, err, "unexpected request label")
+	expected.Requests["llm_resp"] = RequestExpectation{LLMResponseLatenciesMS: []float64{100}}
+	ordinary := latencyMetricFixture(metricschema.RequestLatency, metricTestIdentity, "llm_resp", []float64{100})
+	ordinary = strings.ReplaceAll(ordinary, metricschema.RequestLatency, metricschema.LLMResponseLatency)
+	_, err = validateMetrics(text+ordinary, expected)
+	require.ErrorContains(t, err, "bucket count")
+	for _, observation := range []float64{-1, math.NaN(), math.Inf(1)} {
+		expected.Requests["llm_resp"] = RequestExpectation{LLMResponseLatenciesMS: []float64{observation}}
+		_, err = validateMetrics(text+llm, expected)
+		require.ErrorContains(t, err, "invalid expected latency")
+	}
 }

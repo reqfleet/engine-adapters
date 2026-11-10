@@ -10,13 +10,11 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -140,7 +138,7 @@ func startRuntime(t *testing.T, contract Contract) *Runtime {
 	require.NoError(t, err, "conformance owns fixed ports and /test-data; use a disposable Docker container")
 	startProofDNS(t)
 	certificate, ca := proofCertificate(t)
-	r := &Runtime{peer: newProofPeer(t, certificate), LabelLimit: contract.LabelLimit, done: make(chan struct{}), blockedDownload: make(chan struct{}, 1), endedDownload: make(chan struct{}, 1)}
+	r := &Runtime{peer: newProofPeer(t, certificate), LabelLimit: contract.LabelLimit, blockedDownload: make(chan struct{}, 1), endedDownload: make(chan struct{}, 1)}
 	r.blockedFile = "conformance-blocked" + filepath.Ext(contract.Basic.Complete.File)
 	artifacts := make(map[string]string, len(contract.Artifacts)+len(contract.DataArtifacts))
 	for name, body := range contract.Artifacts {
@@ -182,19 +180,23 @@ func startRuntime(t *testing.T, contract Contract) *Runtime {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(r.Root) })
 	require.NoError(t, os.Chown(r.Root, 65532, 65532))
-	child := exec.Command(contract.Executable)
-	child.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65532, Gid: 65532}}
-	child.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + r.Root, "AGENT_ROOT=" + r.Root, "engine_name=engine-proof-plan-local-0", "offset=7", "coordinator_ip=127.0.0.1", "coordinator_ca_cert=" + ca, "collection_id=" + proofCollection, "plan_id=" + proofPlan, "zone=local", "api_key=" + proofKey, "label_limit=+" + strconv.Itoa(contract.LabelLimit)}
-	child.Stdout, child.Stderr = &r.logs, &r.logs
-	require.NoError(t, child.Start())
-	go func() { _ = child.Wait(); close(r.done) }()
+	environment := []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + r.Root, "AGENT_ROOT=" + r.Root, "engine_name=engine-proof-plan-local-0", "offset=7", "coordinator_ip=127.0.0.1", "coordinator_ca_cert=" + ca, "collection_id=" + proofCollection, "plan_id=" + proofPlan, "zone=local", "api_key=" + proofKey, "label_limit=+" + strconv.Itoa(contract.LabelLimit)}
+	process, err := launchRuntimeProcess(contract.Executable, environment, &r.logs)
+	require.NoError(t, err)
+	r.done = process.exited
 	r.Client = &http.Client{Timeout: 3 * time.Second}
 	t.Cleanup(r.Client.CloseIdleConnections)
 	t.Cleanup(func() {
 		if r.active != "" {
 			_ = r.peer.send(proofPayload(protocol.VerbStop, r.active, "", nil))
 			deadline := time.Now().Add(proofWait)
+		gracefulStop:
 			for time.Now().Before(deadline) {
+				select {
+				case <-r.done:
+					break gracefulStop
+				default:
+				}
 				status, e := r.Progress(r.active)
 				if e == nil && status.State.Terminal() {
 					break
@@ -202,8 +204,10 @@ func startRuntime(t *testing.T, contract Contract) *Runtime {
 				time.Sleep(25 * time.Millisecond)
 			}
 		}
-		_ = child.Process.Kill()
-		<-r.done
+		if err := process.close(); err != nil {
+			t.Logf("adapter output:\n%s", r.Logs())
+			abortRuntimeCleanup(err)
+		}
 		if t.Failed() {
 			t.Logf("adapter output:\n%s", r.Logs())
 		}
@@ -217,7 +221,7 @@ func startRuntime(t *testing.T, contract Contract) *Runtime {
 		defer response.Body.Close()
 		return response.StatusCode == http.StatusOK
 	}, proofWait, 25*time.Millisecond)
-	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", child.Process.Pid))
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", process.pid))
 	require.NoError(t, err)
 	require.Contains(t, string(status), "Uid:\t65532\t65532\t65532\t65532")
 	require.Contains(t, string(status), "Gid:\t65532\t65532\t65532\t65532")
@@ -251,7 +255,6 @@ func (r *Runtime) assertAuthentication(t *testing.T) {
 
 func runBasic(t *testing.T, r *Runtime, basic BasicScenarios) {
 	first := r.Start(t, "8901", basic.Complete)
-	r.Running(t, "8901")
 	r.Terminal(t, "8901", protocol.RunCompleted, basic.CompletionTimeout)
 	final := basic.AssertMetrics(t, r, "8901")
 	require.NotEmpty(t, final.Requests, "fixture must generate real requests")

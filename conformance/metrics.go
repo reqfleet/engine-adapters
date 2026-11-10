@@ -22,12 +22,15 @@ type MetricIdentity struct {
 }
 
 // RequestExpectation describes independently available request measurements.
-// Nil LatenciesMS requires an absent histogram; a non-nil empty slice expects
-// an explicitly reported zero-observation histogram. Status counts need not
-// equal latency observations: a failed request may have no measured duration.
+// Nil latency slices require absent histograms; non-nil empty slices expect
+// explicitly reported zero-observation histograms. Status counts need not equal
+// either latency observation count: measurements are checked independently.
 type RequestExpectation struct {
 	Statuses    map[string]uint64
 	LatenciesMS []float64
+	// LLMResponseLatenciesMS expects the optional SDK LLM response histogram
+	// with its wide millisecond profile, independently of ordinary LatenciesMS.
+	LLMResponseLatenciesMS []float64
 }
 
 // MeasurementPresence controls whether an agent resource must be reported.
@@ -55,9 +58,9 @@ type MetricsExpectation struct {
 	Identity MetricIdentity
 	Requests map[string]RequestExpectation
 	// AllowedPriorIdentities permits SDK result-event registries to retain these
-	// complete identities. Their series are checked for schema and finite values,
-	// but excluded from the current run's totals and snapshot. Native normalized
-	// producers should leave this nil to reject stale series.
+	// complete identities. Their series are checked for schema, histogram
+	// structure and finite values, but excluded from the current totals and snapshot.
+	// Native normalized producers should leave this nil to reject stale series.
 	AllowedPriorIdentities []MetricIdentity
 	Bytes                  map[string]float64
 	Concurrency            *float64
@@ -72,8 +75,9 @@ type LatencySnapshot struct {
 }
 
 type RequestSnapshot struct {
-	Statuses map[string]uint64
-	Latency  *LatencySnapshot
+	Statuses           map[string]uint64
+	Latency            *LatencySnapshot
+	LLMResponseLatency *LatencySnapshot
 }
 
 // MetricsSnapshot can be compared across repeated or retained scrapes. It
@@ -124,9 +128,14 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 		}
 		var labelNames []string
 		var kind dto.MetricType
+		var bounds []float64
 		switch name {
 		case metricschema.RequestLatency:
 			labelNames, kind = metricschema.LatencyLabels(), dto.MetricType_HISTOGRAM
+			bounds = requestLatencyBounds[:]
+		case metricschema.LLMResponseLatency:
+			labelNames, kind = metricschema.LatencyLabels(), dto.MetricType_HISTOGRAM
+			bounds = llmResponseLatencyBounds[:]
 		case metricschema.StatusCounter:
 			labelNames, kind = metricschema.StatusLabels(), dto.MetricType_COUNTER
 		case metricschema.EgressBytesCounter:
@@ -164,7 +173,7 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 				if !prior {
 					return snapshot, fmt.Errorf("%s: %w", name, err)
 				}
-				if err := validateRetainedValues(metric, kind); err != nil {
+				if err := validateRetainedValues(metric, kind, bounds); err != nil {
 					return snapshot, fmt.Errorf("%s retained series: %w", name, err)
 				}
 				continue
@@ -177,7 +186,7 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 			}
 			label := labels[metricschema.LabelRequest]
 			switch name {
-			case metricschema.RequestLatency, metricschema.StatusCounter:
+			case metricschema.RequestLatency, metricschema.LLMResponseLatency, metricschema.StatusCounter:
 				want, ok := expected.Requests[label]
 				if !ok {
 					return snapshot, fmt.Errorf("%s: unexpected request label %q", name, label)
@@ -186,11 +195,15 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 				if !ok {
 					request.Statuses = make(map[string]uint64)
 				}
-				if name == metricschema.RequestLatency {
-					if want.LatenciesMS == nil || request.Latency != nil {
+				if kind == dto.MetricType_HISTOGRAM {
+					observations, latency := want.LatenciesMS, &request.Latency
+					if name == metricschema.LLMResponseLatency {
+						observations, latency = want.LLMResponseLatenciesMS, &request.LLMResponseLatency
+					}
+					if observations == nil || *latency != nil {
 						return snapshot, fmt.Errorf("%s: unexpected or duplicate histogram for %q", name, label)
 					}
-					request.Latency, err = validateLatency(metric.GetHistogram(), want.LatenciesMS)
+					*latency, err = validateLatency(metric.GetHistogram(), observations, bounds)
 					if err != nil {
 						return snapshot, fmt.Errorf("%s label %q: %w", name, label, err)
 					}
@@ -248,6 +261,9 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 		if want.LatenciesMS != nil && request.Latency == nil {
 			return snapshot, fmt.Errorf("request %q: missing latency histogram", label)
 		}
+		if want.LLMResponseLatenciesMS != nil && request.LLMResponseLatency == nil {
+			return snapshot, fmt.Errorf("request %q: missing LLM response latency histogram", label)
+		}
 	}
 	if len(snapshot.Bytes) != len(expected.Bytes) {
 		return snapshot, fmt.Errorf("missing byte series: got %d, want %d", len(snapshot.Bytes), len(expected.Bytes))
@@ -301,14 +317,14 @@ func validateMetricLabels(metric *dto.Metric, names []string, identity map[strin
 	return labels, nil
 }
 
-func validateLatency(histogram *dto.Histogram, observations []float64) (*LatencySnapshot, error) {
-	if histogram == nil || histogram.SampleCount == nil || histogram.SampleSum == nil {
-		return nil, fmt.Errorf("incomplete histogram")
-	}
-	// shibuya-v1: 1ms, 2.5ms, then Prometheus default bounds converted to ms.
-	bounds := [...]float64{1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, math.Inf(1)}
-	if len(histogram.Bucket) != len(bounds) {
-		return nil, fmt.Errorf("bucket count %d, want %d", len(histogram.Bucket), len(bounds))
+// SDK v0.5.0 agent/metrics.go profiles, including the implicit +Inf bucket.
+var requestLatencyBounds = [...]float64{1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, math.Inf(1)}
+var llmResponseLatencyBounds = [...]float64{100, 250, 500, 1000, 2500, 5000, 7500, 10000, 15000, 20000, 30000, 45000, 60000, 90000, 120000, 180000, 300000, math.Inf(1)}
+
+func validateLatency(histogram *dto.Histogram, observations, bounds []float64) (*LatencySnapshot, error) {
+	snapshot, err := validateLatencyStructure(histogram, bounds)
+	if err != nil {
+		return nil, err
 	}
 	var sum float64
 	for _, observation := range observations {
@@ -317,34 +333,59 @@ func validateLatency(histogram *dto.Histogram, observations []float64) (*Latency
 		}
 		sum += observation
 	}
-	if histogram.GetSampleCount() != uint64(len(observations)) || !sameMetricTotal(histogram.GetSampleSum(), sum) {
-		return nil, fmt.Errorf("count/sum %d/%g, want %d/%g", histogram.GetSampleCount(), histogram.GetSampleSum(), len(observations), sum)
-	}
-	snapshot := &LatencySnapshot{Count: histogram.GetSampleCount(), Sum: histogram.GetSampleSum(), Buckets: make(map[float64]uint64, len(bounds))}
-	for _, bucket := range histogram.Bucket {
-		bound := bucket.GetUpperBound()
-		if bucket.UpperBound == nil || bucket.CumulativeCount == nil {
-			return nil, fmt.Errorf("incomplete bucket")
-		}
-		if _, duplicate := snapshot.Buckets[bound]; duplicate {
-			return nil, fmt.Errorf("duplicate bucket bound %g", bound)
-		}
-		snapshot.Buckets[bound] = bucket.GetCumulativeCount()
+	if snapshot.Count != uint64(len(observations)) || !sameMetricTotal(snapshot.Sum, sum) {
+		return nil, fmt.Errorf("count/sum %d/%g, want %d/%g", snapshot.Count, snapshot.Sum, len(observations), sum)
 	}
 	for _, bound := range bounds {
-		observed, ok := snapshot.Buckets[bound]
-		if !ok {
-			return nil, fmt.Errorf("missing schema bucket bound %g", bound)
-		}
 		var count uint64
 		for _, observation := range observations {
 			if observation <= bound {
 				count++
 			}
 		}
-		if observed != count {
+		if observed := snapshot.Buckets[bound]; observed != count {
 			return nil, fmt.Errorf("bucket %g: count %d, want %d", bound, observed, count)
 		}
+	}
+	return snapshot, nil
+}
+
+func validateLatencyStructure(histogram *dto.Histogram, bounds []float64) (*LatencySnapshot, error) {
+	// Integer fields must be present: the parser represents fractional and
+	// nonfinite counts using the separate floating-point fields instead.
+	if histogram == nil || histogram.SampleCount == nil || histogram.SampleCountFloat != nil || histogram.SampleSum == nil {
+		return nil, fmt.Errorf("incomplete histogram or non-integer count")
+	}
+	if !finiteNonnegative(histogram.GetSampleSum()) {
+		return nil, fmt.Errorf("invalid histogram sum %g", histogram.GetSampleSum())
+	}
+	if len(histogram.Bucket) != len(bounds) {
+		return nil, fmt.Errorf("bucket count %d, want %d", len(histogram.Bucket), len(bounds))
+	}
+	snapshot := &LatencySnapshot{Count: histogram.GetSampleCount(), Sum: histogram.GetSampleSum(), Buckets: make(map[float64]uint64, len(bounds))}
+	for _, bucket := range histogram.Bucket {
+		if bucket == nil || bucket.UpperBound == nil || bucket.CumulativeCount == nil || bucket.CumulativeCountFloat != nil {
+			return nil, fmt.Errorf("incomplete bucket or non-integer count")
+		}
+		bound := bucket.GetUpperBound()
+		if _, duplicate := snapshot.Buckets[bound]; duplicate {
+			return nil, fmt.Errorf("duplicate bucket bound %g", bound)
+		}
+		snapshot.Buckets[bound] = bucket.GetCumulativeCount()
+	}
+	var previous uint64
+	for _, bound := range bounds {
+		count, ok := snapshot.Buckets[bound]
+		if !ok {
+			return nil, fmt.Errorf("missing schema bucket bound %g", bound)
+		}
+		if count < previous {
+			return nil, fmt.Errorf("bucket %g: cumulative count %d below preceding count %d", bound, count, previous)
+		}
+		previous = count
+	}
+	if previous != snapshot.Count {
+		return nil, fmt.Errorf("+Inf bucket count %d, want histogram count %d", previous, snapshot.Count)
 	}
 	return snapshot, nil
 }
@@ -357,7 +398,7 @@ func sameMetricTotal(value, want float64) bool {
 	return finiteNonnegative(value) && finiteNonnegative(want) && math.Abs(value-want) <= 0.000001
 }
 
-func validateRetainedValues(metric *dto.Metric, kind dto.MetricType) error {
+func validateRetainedValues(metric *dto.Metric, kind dto.MetricType, bounds []float64) error {
 	switch kind {
 	case dto.MetricType_COUNTER:
 		if !finiteNonnegative(metric.GetCounter().GetValue()) {
@@ -368,10 +409,8 @@ func validateRetainedValues(metric *dto.Metric, kind dto.MetricType) error {
 			return fmt.Errorf("invalid gauge value")
 		}
 	case dto.MetricType_HISTOGRAM:
-		histogram := metric.GetHistogram()
-		if histogram == nil || histogram.SampleCount == nil || histogram.SampleSum == nil || !finiteNonnegative(histogram.GetSampleSum()) {
-			return fmt.Errorf("invalid histogram")
-		}
+		_, err := validateLatencyStructure(metric.GetHistogram(), bounds)
+		return err
 	}
 	return nil
 }
