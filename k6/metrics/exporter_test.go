@@ -167,6 +167,67 @@ func TestExactIndependentSampleMapping(t *testing.T) {
 	assert.Equal(t, float64(0), single(t, families(t, e), metricschema.ThreadsGauge).GetGauge().GetValue())
 }
 
+func TestTransportFailuresKeepErrorCodesAndRequests(t *testing.T) {
+	for _, budget := range []int{1, 0} {
+		t.Run(fmt.Sprintf("budget-%d", budget), func(t *testing.T) {
+			e, run := fixture(t, budget)
+			// All failed attempts have zero request duration. They must still
+			// make the exporter ready and count once, independently of http_reqs.
+			putCSV(t, run, "error_code,url,status,metric_name,metric_value\n"+
+				"1101,http://missing.invalid/,0,http_req_duration,0\n"+
+				"1101,http://missing.invalid/,0,http_reqs,1\n"+
+				"1101,http://missing.invalid/,0,http_req_duration,0\n"+
+				"1212,http://127.0.0.1:1/,0,http_req_duration,0\n"+
+				"1212,http://127.0.0.1:1/,0,http_reqs,1\n"+
+				"1050,http://127.0.0.1:1/,0,http_req_duration,1000\n"+
+				"1211,http://127.0.0.1:1/,0,http_req_duration,0\n"+
+				"1500,http://127.0.0.1:1/,500,http_req_duration,2\n"+
+				",,,data_received,0\n"+
+				",,,vus,1\n")
+			state, err := e.Observe(context.Background(), run)
+			require.NoError(t, err)
+			require.Equal(t, protocol.ObservationReady, state)
+			want := map[string]requestMetrics{
+				"http://missing.invalid/": {count: 2, sum: 0, statuses: map[string]float64{"DNS host not found (k6 1101)": 2}},
+				"others": {count: 4, sum: 1002, statuses: map[string]float64{
+					"TCP connection refused (k6 1212)": 1, "HTTP request timeout (k6 1050)": 1, "TCP connection timeout (k6 1211)": 1, "500": 1,
+				}},
+			}
+			if budget == 0 {
+				want = map[string]requestMetrics{
+					"others": {count: 6, sum: 1002, statuses: map[string]float64{
+						"DNS host not found (k6 1101)": 2, "TCP connection refused (k6 1212)": 1, "HTTP request timeout (k6 1050)": 1, "TCP connection timeout (k6 1211)": 1, "500": 1,
+					}},
+				}
+			}
+			all := families(t, e)
+			assertRequestMetrics(t, all, want)
+			assert.Zero(t, single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
+			assertRequestMetrics(t, families(t, e), want)
+		})
+	}
+}
+
+func TestTransportErrorMetadataResetsWithRun(t *testing.T) {
+	e, run := fixture(t, 10)
+	putCSV(t, run, "metric_name,metric_value,error_code,status,url\n"+
+		"http_req_duration,0,1100,0,http://missing.invalid/\n"+
+		"http_req_duration,0,,0,http://missing.invalid/\n"+
+		"http_req_duration,0,1999,0,http://missing.invalid/\n")
+	assertRequestMetrics(t, families(t, e), map[string]requestMetrics{
+		"http://missing.invalid/": {count: 3, sum: 0, statuses: map[string]float64{
+			"DNS lookup error (k6 1100)": 1, "Transport error (cause unavailable)": 1, "Unknown k6 error (k6 1999)": 1,
+		}},
+	})
+	// Missing error metadata cannot identify a cause, but must not suppress
+	// the failed request or reuse the previous run's column position.
+	putCSV(t, run, csvHeader+"http_req_duration,0,0,http://127.0.0.1:1/\n")
+	e.Reset(run)
+	assertRequestMetrics(t, families(t, e), map[string]requestMetrics{
+		"http://127.0.0.1:1/": {count: 1, sum: 0, statuses: map[string]float64{"Transport error (cause unavailable)": 1}},
+	})
+}
+
 func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 	e, run := fixture(t, 2)
 	putCSV(t, run, csvHeader+
@@ -180,7 +241,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/a": {count: 1, sum: 10, statuses: map[string]float64{"200": 1}},
 		"https://example.test/b": {count: 1, sum: 20, statuses: map[string]float64{"201": 1}},
-		"others":                 {count: 2, sum: 70, statuses: map[string]float64{"500": 1, "0": 1}},
+		"others":                 {count: 2, sum: 70, statuses: map[string]float64{"500": 1, "Transport error (cause unavailable)": 1}},
 	})
 	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, float64(10), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
@@ -193,7 +254,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/a": {count: 2, sum: 15, statuses: map[string]float64{"200": 1, "500": 1}},
 		"https://example.test/b": {count: 2, sum: 27, statuses: map[string]float64{"201": 2}},
-		"others":                 {count: 3, sum: 73, statuses: map[string]float64{"500": 1, "0": 1, "200": 1}},
+		"others":                 {count: 3, sum: 73, statuses: map[string]float64{"500": 1, "Transport error (cause unavailable)": 1, "200": 1}},
 	})
 	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, float64(25), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
@@ -294,35 +355,41 @@ func TestPendingUnsupportedAndNonRequestSamples(t *testing.T) {
 
 func TestInvalidCompleteCSVIsStickyUntilReset(t *testing.T) {
 	cases := map[string]string{
-		"missing-name":        "metric_value,status,url\n1,200,https://example.test/\n",
-		"missing-value":       "metric_name,status,url\nhttp_req_duration,200,https://example.test/\n",
-		"missing-status":      "metric_name,metric_value,url\nhttp_req_duration,1,https://example.test/\n",
-		"missing-url-column":  "metric_name,metric_value,status\n",
-		"duplicate-column":    "metric_name,metric_value,status,status,url\n",
-		"duplicate-url":       "metric_name,metric_value,status,url,url\n",
-		"short-row":           csvHeader + "vus,3\n",
-		"long-row":            csvHeader + "vus,3,,,extra\n",
-		"bare-quote":          csvHeader + "vu\"s,3,,\n",
-		"extraneous-quote":    csvHeader + "\"vus\"x,3,,\n",
-		"empty-value":         csvHeader + "vus,,,\n",
-		"invalid-number":      csvHeader + "data_received,no,,\n",
-		"negative-bytes":      csvHeader + "data_received,-1,,\n",
-		"negative-latency":    csvHeader + "http_req_duration,-1,200,https://example.test/\n",
-		"negative-vus":        csvHeader + "vus,-1,,\n",
-		"fractional-vus":      csvHeader + "vus,1.5,,\n",
-		"nan":                 csvHeader + "http_req_duration,NaN,200,https://example.test/\n",
-		"infinity":            csvHeader + "data_received,+Inf,,\n",
-		"overflow":            csvHeader + "vus,1e999,,\n",
-		"missing-http-status": csvHeader + "http_req_duration,1,,https://example.test/\n",
-		"missing-url-value":   csvHeader + "http_req_duration,1,200,\n",
-		"quoted-empty-url":    csvHeader + "http_req_duration,1,200,\"\"\n",
-		"missing-url-field":   csvHeader + "http_req_duration,1,200\n",
-		"status-text":         csvHeader + "http_req_duration,1,OK,https://example.test/\n",
-		"status-low":          csvHeader + "http_req_duration,1,99,https://example.test/\n",
-		"status-high":         csvHeader + "http_req_duration,1,600,https://example.test/\n",
-		"status-fraction":     csvHeader + "http_req_duration,1,200.0,https://example.test/\n",
-		"status-sign":         csvHeader + "http_req_duration,1,+200,https://example.test/\n",
-		"status-leading-zero": csvHeader + "http_req_duration,1,0200,https://example.test/\n",
+		"missing-name":         "metric_value,status,url\n1,200,https://example.test/\n",
+		"missing-value":        "metric_name,status,url\nhttp_req_duration,200,https://example.test/\n",
+		"missing-status":       "metric_name,metric_value,url\nhttp_req_duration,1,https://example.test/\n",
+		"missing-url-column":   "metric_name,metric_value,status\n",
+		"duplicate-column":     "metric_name,metric_value,status,status,url\n",
+		"duplicate-url":        "metric_name,metric_value,status,url,url\n",
+		"short-row":            csvHeader + "vus,3\n",
+		"long-row":             csvHeader + "vus,3,,,extra\n",
+		"bare-quote":           csvHeader + "vu\"s,3,,\n",
+		"extraneous-quote":     csvHeader + "\"vus\"x,3,,\n",
+		"empty-value":          csvHeader + "vus,,,\n",
+		"invalid-number":       csvHeader + "data_received,no,,\n",
+		"negative-bytes":       csvHeader + "data_received,-1,,\n",
+		"negative-latency":     csvHeader + "http_req_duration,-1,200,https://example.test/\n",
+		"negative-vus":         csvHeader + "vus,-1,,\n",
+		"fractional-vus":       csvHeader + "vus,1.5,,\n",
+		"nan":                  csvHeader + "http_req_duration,NaN,200,https://example.test/\n",
+		"infinity":             csvHeader + "data_received,+Inf,,\n",
+		"overflow":             csvHeader + "vus,1e999,,\n",
+		"missing-http-status":  csvHeader + "http_req_duration,1,,https://example.test/\n",
+		"missing-url-value":    csvHeader + "http_req_duration,1,200,\n",
+		"quoted-empty-url":     csvHeader + "http_req_duration,1,200,\"\"\n",
+		"missing-url-field":    csvHeader + "http_req_duration,1,200\n",
+		"status-text":          csvHeader + "http_req_duration,1,OK,https://example.test/\n",
+		"status-low":           csvHeader + "http_req_duration,1,99,https://example.test/\n",
+		"status-high":          csvHeader + "http_req_duration,1,600,https://example.test/\n",
+		"status-fraction":      csvHeader + "http_req_duration,1,200.0,https://example.test/\n",
+		"status-sign":          csvHeader + "http_req_duration,1,+200,https://example.test/\n",
+		"status-leading-zero":  csvHeader + "http_req_duration,1,0200,https://example.test/\n",
+		"duplicate-error-code": "metric_name,metric_value,status,url,error_code,error_code\n",
+		"error-code-text":      "metric_name,metric_value,status,url,error_code\nhttp_req_duration,0,0,http://example.test/,refused\n",
+		"error-code-low":       "metric_name,metric_value,status,url,error_code\nhttp_req_duration,0,0,http://example.test/,999\n",
+		"error-code-sign":      "metric_name,metric_value,status,url,error_code\nhttp_req_duration,0,0,http://example.test/,+1212\n",
+		"error-code-zero":      "metric_name,metric_value,status,url,error_code\nhttp_req_duration,0,0,http://example.test/,01212\n",
+		"error-code-overflow":  "metric_name,metric_value,status,url,error_code\nhttp_req_duration,0,0,http://example.test/,4294967296\n",
 	}
 	for name, text := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -380,7 +447,7 @@ func TestResetClearsIdentityCountersCursorAndCPU(t *testing.T) {
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.RequestLatency))["label"])
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.StatusCounter))["label"])
-	assert.Equal(t, "0", metricLabels(single(t, old, metricschema.StatusCounter))["status"])
+	assert.Equal(t, "Transport error (cause unavailable)", metricLabels(single(t, old, metricschema.StatusCounter))["status"])
 	assert.Contains(t, families(t, e), metricschema.CPUGauge)
 	next := run
 	next.RunID, next.CollectionID, next.PlanID, next.AgentID, next.Zone = "new-run", "new-collection", "new-plan", "new-agent", "new-zone"

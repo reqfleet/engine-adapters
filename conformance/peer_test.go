@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path"
 	"sync"
 	"testing"
@@ -208,6 +209,38 @@ func startProofHTTP(t *testing.T, address string, handler http.Handler, certific
 		server.CloseClientConnections()
 		server.Close()
 	})
+}
+
+func startProofDNS(t *testing.T) {
+	t.Helper()
+	listener, err := net.ListenPacket("udp", "127.0.0.1:53")
+	require.NoError(t, err)
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-done
+	})
+	go func() {
+		defer close(done)
+		buffer := make([]byte, 4096)
+		for {
+			n, address, err := listener.ReadFrom(buffer)
+			if err != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			// NXDOMAIN, retaining the question and any EDNS record. No
+			// external resolver or network is involved in DNS failure tests.
+			buffer[2] |= 0x80
+			buffer[3] = 0x83
+			if _, err := listener.WriteTo(buffer[:n], address); err != nil {
+				return
+			}
+		}
+	}()
+	require.NoError(t, os.WriteFile("/etc/resolv.conf", []byte("nameserver 127.0.0.1\noptions attempts:1 timeout:1\n"), 0644))
 }
 
 func proofCertificate(t *testing.T) (tls.Certificate, string) {

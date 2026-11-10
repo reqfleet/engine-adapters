@@ -35,6 +35,7 @@ func TestPublicK6Runtime(t *testing.T) {
 	require.Zero(t, os.Geteuid(), "use make test-conformance")
 	_, err := os.Stat("/.dockerenv")
 	require.NoError(t, err)
+	startProofDNS(t)
 	certificate, ca := proofCertificate(t)
 	peer := newProofPeer(t, certificate)
 	requests := &proofRequests{}
@@ -44,6 +45,10 @@ func TestPublicK6Runtime(t *testing.T) {
 		requests.record(r.URL.Path, r.Header.Get("X-Revision"))
 		if strings.HasPrefix(r.URL.Path, "/data") {
 			assert.Equal(t, "row-a|row-b", r.Header.Get("X-Data"))
+		}
+		if r.URL.Path == "/timeout" {
+			<-r.Context().Done()
+			return
 		}
 		if r.URL.Path == "/blocked" {
 			w.WriteHeader(200)
@@ -77,6 +82,13 @@ export const options={thresholds:{http_req_failed:[{threshold:'rate<0',abortOnFa
 export default function(){http.get('http://127.0.0.1:18080/500');sleep(0.1);}`)
 	add("inflight.js", `import http from 'k6/http'; export default function(){http.get('http://127.0.0.1:18080/blocked',{timeout:'120s'});}`)
 	add("data.js", `import http from 'k6/http'; import {sleep} from 'k6'; const data=open('/test-data/rows.csv').trim().split('\n').join('|'); export default function(){http.get('http://127.0.0.1:18080/data',{headers:{'X-Data':data}});sleep(0.1);}`)
+	add("dns.js", `import http from 'k6/http'; import {sleep} from 'k6';
+export default function(){http.get('http://missing.invalid/');sleep(0.1);}`)
+	add("refused.js", `import http from 'k6/http'; import {sleep} from 'k6';
+export const options={systemTags:['method']};
+export default function(){http.get('http://127.0.0.1:1/');sleep(0.1);}`)
+	add("timeout.js", `import http from 'k6/http'; import {sleep} from 'k6';
+export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'100ms'});sleep(5);}`)
 	for _, key := range []string{"scenarios", "vus", "duration", "iterations", "stages", "executionSegment", "executionSegmentSequence"} {
 		add(key+".js", fmt.Sprintf("export const options={%s:null}; export default function(){}", key))
 	}
@@ -305,6 +317,47 @@ export default function(){http.get('http://127.0.0.1:18080/500');sleep(0.1);}`)
 		require.NoError(t, e)
 		require.Equal(t, "row-a\nrow-b\n", string(data))
 	}
+	for index, failure := range []struct {
+		file, url, status string
+		connected         bool
+	}{
+		{"dns.js", "http://missing.invalid/", "DNS host not found (k6 1101)", false},
+		{"refused.js", "http://127.0.0.1:1/", "TCP connection refused (k6 1212)", false},
+		{"timeout.js", "http://127.0.0.1:18080/timeout", "HTTP request timeout (k6 1050)", true},
+	} {
+		id := strconv.Itoa(1400 + index)
+		start(id, failure.file, "1", "")
+		running(id)
+		require.Eventually(t, func() bool {
+			parser := expfmt.NewTextParser(model.UTF8Validation)
+			families, err := parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
+			if err != nil || families[metricschema.StatusCounter] == nil {
+				return false
+			}
+			for _, metric := range families[metricschema.StatusCounter].Metric {
+				for _, label := range metric.Label {
+					if label.GetName() == metricschema.LabelStatus && label.GetValue() == failure.status && metric.GetCounter().GetValue() > 0 {
+						return true
+					}
+				}
+			}
+			return false
+		}, proofWait, 100*time.Millisecond, "failed requests must be visible while running")
+		stop(id)
+		terminal(id, protocol.RunCanceled, proofWait)
+		failedTotals := compareCSV(t, client, csvPath, id)
+		require.Len(t, failedTotals.requests, 1)
+		require.Contains(t, failedTotals.requests, failure.url)
+		require.Equal(t, map[string]float64{failure.status: float64(failedTotals.count)}, failedTotals.status)
+		if failure.connected {
+			require.Positive(t, failedTotals.sum, "waiting for a response contributes request duration")
+		} else {
+			require.Zero(t, failedTotals.sum, "failed connections still count despite zero http_req_duration")
+		}
+		require.Zero(t, failedTotals.bytes, "no response bytes may be fabricated")
+		require.Equal(t, failedTotals, compareCSV(t, client, csvPath, id), "final error metrics must persist without double counting")
+		t.Logf("%s: %d failed requests, status=%s, latency sum=%g ms", failure.file, failedTotals.count, failure.status, failedTotals.sum)
+	}
 	// Exercise positive ramp-up through the actual engine, not generated source.
 	rampSettings, err := json.Marshal(map[string]string{"concurrency": "3", "duration": "1", "rampup": "3"})
 	require.NoError(t, err)
@@ -391,7 +444,7 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 	for i, key := range header {
 		columns[key] = i
 	}
-	for _, key := range []string{"metric_name", "metric_value", "status", "url", "method"} {
+	for _, key := range []string{"metric_name", "metric_value", "status", "url", "method", "error_code"} {
 		require.Contains(t, columns, key)
 	}
 	expected := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}}
@@ -413,13 +466,26 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 				expected.requests[url] = &requestTotals{status: map[string]float64{}}
 			}
 			request := expected.requests[url]
+			status := row[columns["status"]]
+			if status == "0" {
+				switch row[columns["error_code"]] {
+				case "1101":
+					status = "DNS host not found (k6 1101)"
+				case "1212":
+					status = "TCP connection refused (k6 1212)"
+				case "1050":
+					status = "HTTP request timeout (k6 1050)"
+				default:
+					t.Fatalf("unexpected transport failure in fixture: %s", row[columns["error_code"]])
+				}
+			}
 			request.count++
 			request.sum += value
-			request.status[row[columns["status"]]]++
+			request.status[status]++
 			durations[url] = append(durations[url], value)
 			expected.count++
 			expected.sum += value
-			expected.status[row[columns["status"]]]++
+			expected.status[status]++
 		case "data_received":
 			expected.bytes += value
 		case "vus":

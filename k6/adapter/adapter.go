@@ -208,6 +208,7 @@ if (Object.prototype.hasOwnProperty.call(originalOptions, "systemTags")) {
   retainedOptions.systemTags = originalOptions.systemTags.slice();
   if (retainedOptions.systemTags.indexOf("status") === -1) retainedOptions.systemTags.push("status");
   if (retainedOptions.systemTags.indexOf("url") === -1) retainedOptions.systemTags.push("url");
+  if (retainedOptions.systemTags.indexOf("error_code") === -1) retainedOptions.systemTags.push("error_code");
 }
 export const options = Object.assign(retainedOptions, {scenarios: {reqfleet: %s}});
 export default function(data) { return plan.default(data); }
