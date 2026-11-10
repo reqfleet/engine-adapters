@@ -154,6 +154,8 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	cmd.Stderr = &stderr
 	// A nil Stdout discards inspect's options JSON without buffering it.
 	err = cmd.Run()
+	// CommandContext can return "signal: killed" on cancellation; preserve the
+	// context error rather than reporting it as a plan inspection failure.
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -180,11 +182,12 @@ func (a *Adapter) BuildCommand(ctx context.Context, run agent.RunContext) (agent
 
 const inspectionStderrLimit = 16 * 1024
 
-// inspectionStderr retains the tail while draining all output, so verbose init
-// logging cannot block inspection or displace its final error diagnostic.
+// inspectionStderr retains the tail while draining all output. Init logging
+// precedes k6's final error diagnostic, so retaining the head could lose the
+// failure reason after verbose logs.
 type inspectionStderr struct {
 	data      [inspectionStderrLimit]byte
-	used      int
+	used      int // Number of valid bytes retained in data[:used]
 	truncated bool
 }
 
