@@ -36,7 +36,7 @@ The coordinator delivers an explicit per-agent string-valued settings object:
 
 The three numeric settings are required. Missing, null, nonstring, negative, signed, whitespace, fractional, exponential and overflowing inputs fail preparation. With rampup zero, the wrapper uses one `constant-vus` scenario. Positive rampup uses `ramping-vus`, starts at zero, ramps to assigned VUs and holds for the remaining duration; a zero-length hold is omitted. Both have `gracefulStop: '0s'`; ramping also has `gracefulRampDown: '0s'`.
 
-Collection scheduling owns these options: `scenarios`, `vus`, `duration`, `iterations`, `stages`, `executionSegment`, `executionSegmentSequence`. Presence of any on uploaded `options`, even null, fails inside k6 with `k6 scheduling options are managed by the collection`. A missing default function fails with `k6 plan must export a default function`. Other options, including native threshold selectors, are retained. If `options.systemTags` is explicit, it must be an array; the wrapper adds missing `status` and `url` tags without discarding other tags. Default k6 tags remain unchanged when it is absent.
+Collection scheduling owns these options: `scenarios`, `vus`, `duration`, `iterations`, `stages`, `executionSegment`, `executionSegmentSequence`. Presence of any on uploaded `options`, even null, fails inside k6 with `k6 scheduling options are managed by the collection`. A missing default function fails with `k6 plan must export a default function`. Other options, including native threshold selectors, are retained. If `options.systemTags` is explicit, it must be an array; the wrapper adds missing `status`, `url` and `error_code` tags without discarding other tags. Default k6 tags remain unchanged when it is absent.
 
 The adapter creates `Workspace.Temp/entry.js` atomically and leaves `/test-data/script.js` byte-for-byte original. Preparation respects cancellation and invalidates previously prepared run IDs. Only that successfully prepared run ID may build a command. Command execution is direct, not shell interpolation:
 
@@ -75,11 +75,12 @@ data_received,1793861284,151.000000,,,,,,,,,default,,,,,,,
 - `metric_name` identifies the measurement; one row is one sample, not one complete request.
 - `timestamp` is Unix time in seconds in the default CSV format. It is not a unique request ID; the exporter does not use it to join rows.
 - `metric_value` is the numeric sample in that metric's units, described in the mapping below.
-- `status` is the HTTP status tag, populated on the HTTP rows but absent from the VU and byte rows in this example.
+- `status` is the HTTP status tag, populated on the HTTP rows but absent from the VU and byte rows in this example. k6 uses `0` when no HTTP response was received.
+- `error_code` identifies a k6 request failure, including DNS and TCP errors. It is empty on successful requests; HTTP 4xx/5xx responses also carry an error code, but retain their actual HTTP status in normalized metrics.
 - `url` supplies the request metric label. Samples with the same URL share latency and status series; different URLs remain separate within the label budget.
 - The remaining columns carry tags or metadata; an empty cell means that field has no value for that sample.
 
-The header depends on the enabled system tags. The exporter locates `metric_name`, `metric_value`, `status` and `url` by name rather than fixed positions and ignores unrelated columns. Missing required columns or an empty URL on an HTTP duration sample fail ingestion; non-request samples may leave `url` empty. Values containing commas, quotes or newlines use standard CSV quoting; splitting lines on commas is not sufficient.
+The header depends on the enabled system tags. The exporter locates `metric_name`, `metric_value`, `status`, `url` and optional `error_code` by name rather than fixed positions and ignores unrelated columns. Missing required columns or an empty URL on an HTTP duration sample fail ingestion; non-request samples may leave `url` empty. Values containing commas, quotes or newlines use standard CSV quoting; splitting lines on commas is not sufficient.
 
 ### Normalization and run lifecycle
 
@@ -95,10 +96,28 @@ Received-byte samples lack request URL attribution and remain aggregate under `l
 
 | CSV point | Normalized effect |
 |---|---|
-| `http_req_duration` | One latency observation in milliseconds and one status count, grouped by URL within the label budget; status `0` represents transport failure |
+| `http_req_duration` | One latency observation in milliseconds and one status count, grouped by URL within the label budget; transport failures use the error statuses below, including when duration is zero |
 | `vus` | Set latest actual per-agent concurrency, including genuine zero; no request count |
 | `data_received` | Add received-byte delta to the aggregate historical `shibuya_egress_bytes_counter`; no request count or URL attribution |
 | `http_reqs`, `data_sent`, other names | Ignore; no double counting and no synthetic request observations |
+
+#### Transport failures
+
+When k6 emits `status=0`, the normalized `shibuya_status_counter` uses a stable, readable description with the native error code instead of an apparent HTTP status of `0`. The code comes from the same duration sample as the URL; no cross-row matching is used. Common [k6 error codes](https://grafana.com/docs/k6/latest/javascript-api/error-codes/):
+
+| k6 `error_code` | Normalized `status` |
+|---|---|
+| `1100` | `DNS lookup error (k6 1100)` |
+| `1101` | `DNS host not found (k6 1101)` |
+| `1211` | `TCP connection timeout (k6 1211)` |
+| `1212` | `TCP connection refused (k6 1212)` |
+| `1050` | `HTTP request timeout (k6 1050)` |
+
+Known network, TCP, TLS and request errors receive fixed descriptions; HTTP/2 codes include their error family and native code. Unrecognized numeric codes remain visible as `Unknown k6 error (k6 <code>)`. If error metadata is absent or empty, the status is `Transport error (cause unavailable)`: a failure is known, but its cause is unavailable. Free-form error messages are not metric labels because they can contain changing hosts, addresses and ports. Real HTTP responses keep their numeric status, e.g. HTTP 500 remains `status="500"`.
+
+DNS failures and refused connections can have `http_req_duration=0`: k6's request duration excludes DNS lookup and connection establishment. Those samples still produce a histogram observation and an error count. An all-failing run remains observable, with cumulative URL-grouped error metrics retained after it stops; zero latency or zero received bytes does not mean there were no attempts.
+
+#### Collection lifecycle
 
 The exporter resolves required CSV header names, uses `encoding/csv` including quoted/multiline values, retains its committed offset, retries incomplete tails and processes records once under the same lock for observation and scrapes. Invalid recognized values, complete malformed records, required-column errors and post-start truncation/read errors fail instead of producing fabricated data. Readiness stays pending until a valid standard sample is available. The SDK separately handles a process that exits before readiness is polled.
 

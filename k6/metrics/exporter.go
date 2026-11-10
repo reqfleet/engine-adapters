@@ -48,6 +48,7 @@ type Exporter struct {
 	fileInfo                                     os.FileInfo
 	columns                                      int
 	nameIndex, valueIndex, statusIndex, urlIndex int
+	errorCodeIndex                               int
 	ready                                        bool
 	failure                                      error
 	readCPUUsage                                 func() (uint64, error)
@@ -111,6 +112,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
+	e.errorCodeIndex = -1
 	clear(e.urlLabels)
 	e.ready, e.failure = false, nil
 	e.cpuBaseline, e.cpuAt, e.cpuStarted = 0, time.Time{}, false
@@ -248,7 +250,7 @@ func (e *Exporter) drain(ctx context.Context) error {
 func (e *Exporter) header(record []string) error {
 	indexes := map[string]int{}
 	for index, name := range record {
-		if name != "metric_name" && name != "metric_value" && name != "status" && name != "url" {
+		if name != "metric_name" && name != "metric_value" && name != "status" && name != "url" && name != "error_code" {
 			continue
 		}
 		if _, exists := indexes[name]; exists {
@@ -263,6 +265,10 @@ func (e *Exporter) header(record []string) error {
 	}
 	e.columns = len(record)
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = indexes["metric_name"], indexes["metric_value"], indexes["status"], indexes["url"]
+	e.errorCodeIndex = -1
+	if index, exists := indexes["error_code"]; exists {
+		e.errorCodeIndex = index
+	}
 	return nil
 }
 
@@ -289,6 +295,19 @@ func (e *Exporter) point(record []string) error {
 		if err != nil || strconv.Itoa(code) != status || (code != 0 && (code < 100 || code > 599)) {
 			return fmt.Errorf("invalid HTTP status %q", status)
 		}
+		if code == 0 {
+			// Use stable descriptions with native codes, never free-form
+			// messages containing changing hosts, addresses or ports.
+			status = "Transport error (cause unavailable)"
+			if e.errorCodeIndex >= 0 && record[e.errorCodeIndex] != "" {
+				errorCode := record[e.errorCodeIndex]
+				value, err := strconv.ParseUint(errorCode, 10, 32)
+				if err != nil || value < 1000 || errorCode[0] < '1' || errorCode[0] > '9' {
+					return fmt.Errorf("invalid k6 error code %q", errorCode)
+				}
+				status = transportErrorStatus(value)
+			}
+		}
 		label := e.requestLabel(url)
 		e.latency.WithLabelValues(run.CollectionID, label, run.RunID, run.AgentID, run.PlanID, run.Zone).Observe(value)
 		e.status.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, label, run.Zone, status).Inc()
@@ -302,6 +321,72 @@ func (e *Exporter) point(record []string) error {
 	}
 	e.ready = true
 	return nil
+}
+
+// transportErrorStatus describes k6 error codes without confusing them with HTTP
+// statuses. Keep common labels constant to avoid allocating on each failed request.
+// https://grafana.com/docs/k6/latest/javascript-api/error-codes/
+func transportErrorStatus(code uint64) string {
+	switch code {
+	case 1000:
+		return "Request error (k6 1000)"
+	case 1010:
+		return "Network error (k6 1010)"
+	case 1020:
+		return "Invalid URL (k6 1020)"
+	case 1050:
+		return "HTTP request timeout (k6 1050)"
+	case 1100:
+		return "DNS lookup error (k6 1100)"
+	case 1101:
+		return "DNS host not found (k6 1101)"
+	case 1110:
+		return "Blocked IP address (k6 1110)"
+	case 1111:
+		return "Blocked hostname (k6 1111)"
+	case 1200:
+		return "TCP error (k6 1200)"
+	case 1201:
+		return "TCP broken pipe (k6 1201)"
+	case 1202:
+		return "TCP system error (k6 1202)"
+	case 1210:
+		return "TCP connection error (k6 1210)"
+	case 1211:
+		return "TCP connection timeout (k6 1211)"
+	case 1212:
+		return "TCP connection refused (k6 1212)"
+	case 1213:
+		return "TCP connection system error (k6 1213)"
+	case 1220:
+		return "TCP connection reset by peer (k6 1220)"
+	case 1300:
+		return "TLS error (k6 1300)"
+	case 1301:
+		return "TLS protocol error (k6 1301)"
+	case 1310:
+		return "TLS untrusted certificate (k6 1310)"
+	case 1311:
+		return "TLS certificate hostname mismatch (k6 1311)"
+	case 1600:
+		return "HTTP/2 error (k6 1600)"
+	case 1701:
+		return "Response decompression error (k6 1701)"
+	}
+	description := "Unknown k6 error"
+	switch {
+	case code >= 1400 && code <= 1499:
+		description = "HTTP client error"
+	case code >= 1500 && code <= 1599:
+		description = "HTTP server error"
+	case code >= 1610 && code <= 1629:
+		description = "HTTP/2 GOAWAY error"
+	case code >= 1630 && code <= 1649:
+		description = "HTTP/2 stream error"
+	case code >= 1650 && code <= 1669:
+		description = "HTTP/2 connection error"
+	}
+	return description + " (k6 " + strconv.FormatUint(code, 10) + ")"
 }
 
 func (e *Exporter) requestLabel(url string) string {
