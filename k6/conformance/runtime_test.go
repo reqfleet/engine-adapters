@@ -226,17 +226,23 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 	status = terminal("1006", protocol.RunFailed, 90*time.Second)
 	require.NotZero(t, status.ExitCode)
 	for index, key := range []string{"scenarios", "vus", "duration", "iterations", "stages", "executionSegment", "executionSegmentSequence", "missing", "syntax", "tags"} {
-		logOffset := len(runtime.Logs())
 		id := strconv.Itoa(1100 + index)
 		start(id, key+".js", "1", "")
 		status = terminal(id, protocol.RunFailed, proofWait)
-		require.NotZero(t, status.ExitCode)
-		if index < 7 {
-			require.Contains(t, runtime.Logs()[logOffset:], "k6 scheduling options are managed by the collection")
+		require.Equal(t, protocol.FailureStartup, status.FailurePhase)
+		require.Contains(t, status.ErrorMessage, "k6 inspect failed")
+		switch key {
+		case "missing":
+			require.Contains(t, status.ErrorMessage, "k6 plan must export a default function")
+		case "syntax":
+			require.Contains(t, status.ErrorMessage, "SyntaxError")
+			require.Contains(t, status.ErrorMessage, "script.js")
+		case "tags":
+			require.Contains(t, status.ErrorMessage, "k6 options.systemTags must be an array")
+		default:
+			require.Contains(t, status.ErrorMessage, "k6 scheduling options are managed by the collection")
 		}
 	}
-	require.Contains(t, runtime.Logs(), "k6 plan must export a default function")
-	require.Contains(t, runtime.Logs(), "k6 options.systemTags must be an array")
 	for index, mode := range []protocol.PartitionMode{protocol.PartitionNative, protocol.PartitionReplicated, protocol.PartitionMaterialized} {
 		id := strconv.Itoa(1200 + index)
 		start(id, "data.js", "1", mode)

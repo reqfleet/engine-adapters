@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/reqfleet/engine-sdk/agent"
@@ -26,9 +28,12 @@ type Adapter struct {
 	reporter    Reporter
 	preparedRun string
 	entry       string
+	executable  string
 }
 
-func New(reporter Reporter) *Adapter { return &Adapter{reporter: reporter} }
+func New(reporter Reporter) *Adapter {
+	return &Adapter{reporter: reporter, executable: "/usr/local/bin/k6"}
+}
 
 // Options adds k6 callbacks and metrics configuration to resolved SDK options.
 func (a *Adapter) Options(options agent.AgentServerOptions) agent.AgentServerOptions {
@@ -142,6 +147,16 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	if err := writeAtomic(ctx, entry, content); err != nil {
 		return fmt.Errorf("prepare k6 wrapper: %w", err)
 	}
+	cmd := exec.CommandContext(ctx, a.executable, "inspect", entry)
+	cmd.Dir = run.Workspace.Inputs
+	cmd.Env = append(os.Environ(), "K6_CSV_SAVE_INTERVAL=1s")
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		return fmt.Errorf("k6 inspect failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
 	a.preparedRun, a.entry = run.RunID, entry
 	return nil
 }
@@ -153,7 +168,7 @@ func (a *Adapter) BuildCommand(ctx context.Context, run agent.RunContext) (agent
 	if run.RunID == "" || a.preparedRun != run.RunID {
 		return agent.Command{}, fmt.Errorf("run %q has not been prepared", run.RunID)
 	}
-	return agent.Command{Command: "/usr/local/bin/k6", Args: []string{"run", "--no-usage-report", "--out", "csv=" + run.ResultFile, a.entry}, Dir: run.Workspace.Inputs, Env: []string{"K6_CSV_SAVE_INTERVAL=1s"}}, nil
+	return agent.Command{Command: a.executable, Args: []string{"run", "--no-usage-report", "--out", "csv=" + run.ResultFile, a.entry}, Dir: run.Workspace.Inputs, Env: []string{"K6_CSV_SAVE_INTERVAL=1s"}}, nil
 }
 
 func writeAtomic(ctx context.Context, destination, content string) error {
