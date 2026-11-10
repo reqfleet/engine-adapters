@@ -199,7 +199,19 @@ export default function(){http.get('http://127.0.0.1:18080/500');sleep(0.1);}`)
 	running("1001")
 	firstMetrics := scrape(t, client)
 	require.Contains(t, firstMetrics, `run_id="1001"`)
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	resources, err := parser.TextToMetricFamilies(strings.NewReader(firstMetrics))
+	require.NoError(t, err)
+	require.NotContains(t, resources, metricschema.CPUGauge, "the first scrape has no CPU interval")
+	require.Contains(t, resources, metricschema.MemoryGauge)
+	require.Len(t, resources[metricschema.MemoryGauge].Metric, 1)
+	require.Positive(t, resources[metricschema.MemoryGauge].Metric[0].GetGauge().GetValue())
 	terminal("1001", protocol.RunCompleted, 90*time.Second)
+	resources, err = parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
+	require.NoError(t, err)
+	require.Contains(t, resources, metricschema.CPUGauge)
+	require.Len(t, resources[metricschema.CPUGauge].Metric, 1)
+	require.Positive(t, resources[metricschema.CPUGauge].Metric[0].GetGauge().GetValue(), "the real k6 run must consume CPU")
 	original, err := os.ReadFile("/test-data/script.js")
 	require.NoError(t, err)
 	require.Equal(t, firstSource, string(original))
@@ -464,7 +476,11 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 				observed.bytes += metric.GetCounter().GetValue()
 			case metricschema.ThreadsGauge:
 				observed.vus = metric.GetGauge().GetValue()
+			case metricschema.CPUGauge:
+				require.NotContains(t, labels, metricschema.LabelRequest)
+				require.GreaterOrEqual(t, metric.GetGauge().GetValue(), float64(0))
 			case metricschema.MemoryGauge:
+				require.NotContains(t, labels, metricschema.LabelRequest)
 				require.Positive(t, metric.GetGauge().GetValue())
 			}
 		}

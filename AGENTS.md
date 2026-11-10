@@ -69,17 +69,17 @@ Dependency proof used by CI:
 
 ```sh
 GOWORK=off go list -deps -test -json ./... | jq -e -s 'all(.[]; (.ImportPath | startswith("github.com/reqfleet/shibuya") | not))'
-GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.4.0") and all(.[]; .Replace == null)'
+GOWORK=off go list -m -json all | jq -e -s 'any(.[]; .Path == "github.com/reqfleet/engine-sdk" and .Version == "v0.5.0") and all(.[]; .Replace == null)'
 ```
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.4.0`. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.0`. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.4.0 \
-  -t k6-adapter:sdk-v0.4.0 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.0 \
+  -t k6-adapter:sdk-v0.5.0 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
@@ -164,4 +164,4 @@ Do not fill unspecified Shibuya releases or digests with presumed compatibility.
 
 ## Licensing
 
-Adapter code is Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The public SDK harness and cgroup code are attributed adaptations. The OCI image also distributes the selected unmodified k6 release, a separate AGPLv3 program; its license and corresponding upstream source archive are included under `/usr/share/licenses/engine-adapters/`, with SDK transitive notices. Review upstream and transitive licenses before redistributing. Publication maintainers must preserve corresponding-source availability and notices for all shipped versions.
+Adapter code is Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The public SDK harness is an attributed adaptation; resource sampling uses the SDK's public `containerstats` package. The OCI image also distributes the selected unmodified k6 release, a separate AGPLv3 program; its license and corresponding upstream source archive are included under `/usr/share/licenses/engine-adapters/`, with SDK transitive notices. Review upstream and transitive licenses before redistributing. Publication maintainers must preserve corresponding-source availability and notices for all shipped versions.

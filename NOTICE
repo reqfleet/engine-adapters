@@ -4,7 +4,6 @@ Licensed under the Apache License, Version 2.0; see LICENSE.
 
 conformance/peer_test.go and conformance/runtime_test.go adapt the public
 engine-sdk v0.3.0 examples/preparing-adapter/conformance_test.go harness.
-k6/metrics/resources.go adapts engine-sdk v0.3.0 internal/containerstats/cgroup.go.
 These files are modified for the independent k6 adapter.
 Source: https://github.com/reqfleet/engine-sdk/tree/v0.3.0
 

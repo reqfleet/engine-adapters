@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [v0.4.0](https://github.com/reqfleet/engine-sdk/releases/tag/v0.4.0), pinned in `go.mod`. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [v0.5.0](https://github.com/reqfleet/engine-sdk/releases/tag/v0.5.0), pinned in `go.mod`. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
@@ -102,13 +102,17 @@ Received-byte samples lack request URL attribution and remain aggregate under `l
 
 The exporter resolves required CSV header names, uses `encoding/csv` including quoted/multiline values, retains its committed offset, retries incomplete tails and processes records once under the same lock for observation and scrapes. Invalid recognized values, complete malformed records, required-column errors and post-start truncation/read errors fail instead of producing fabricated data. Readiness stays pending until a valid standard sample is available. The SDK separately handles a process that exits before readiness is polled.
 
-Collection, plan, run, agent and zone identity come from the current `RunContext`. Histogram boundaries and names follow the public SDK schema. Resource gauges use real cgroup memory and CPU-usage deltas over elapsed wall time (v2 microseconds; v1 nanoseconds). CPU is not invented before a second sample. Unavailable resources fail scrapes clearly. The listener persists after k6 exits so final CSV rows can be drained and cumulative values stay available until the next preparation. Reset clears identities, collectors, URL admission, cursor and CPU baseline together, including preparation attempts that subsequently fail settings validation. Quiet request periods do not insert fake zero concurrency. Raw CSV is disposable run-local SDK output, not permanent result storage.
+Collection, plan, run, agent and zone identity come from the current `RunContext`. Histogram boundaries and names follow the public SDK schema.
+
+Resource gauges use the SDK's `containerstats.ReadCPUUsage` and `ReadMemoryUsage`. CPU is the cumulative microsecond delta divided by elapsed wall-clock microseconds, yielding average cores consumed; no CPU gauge is emitted before a second successful sample. Memory is cgroup-accounted bytes, including cache. These measurements cover all processes in the container's cgroup, not just the k6 PID. The SDK expects that cgroup mounted at `/sys/fs/cgroup`: v2 uses `cpu.stat` and `memory.current`; v1 requires the combined `cpu,cpuacct/cpuacct.usage` and `memory/memory.usage_in_bytes` paths. V1 CPU nanoseconds are truncated to microseconds by the SDK. Unavailable resources fail scrapes clearly without advancing the CPU baseline; no host or process fallback is used.
+
+The listener persists after k6 exits so final CSV rows can be drained and cumulative values stay available until the next preparation. Reset clears identities, collectors, URL admission, cursor and CPU baseline together, including preparation attempts that subsequently fail settings validation. Quiet request periods do not insert fake zero concurrency. Raw CSV is disposable run-local SDK output, not permanent result storage.
 
 ## Container and operational failures
 
 `../Makefile` builds `k6/Dockerfile`'s `runtime` target. The default engine is v2.3.0; `K6_VERSION` and its matching `K6_CHECKSUMS_SHA256` build argument select another release. Official archives are verified against the selected release's checksum file, itself checked against the pinned digest. The image includes that release's source and license. See [build configuration](../AGENTS.md#configuring-the-k6-version). Both Linux amd64 and arm64 are supported. The CA-equipped runtime executes as UID/GID **65532**, with writable `/test-data` and `/shibuya-agent/{test-conf,test-result,run-tmp}` and `AGENT_ROOT=/shibuya-agent`.
 
-`ENGINE_SDK_VERSION` selects the SDK compiled into the image, its bundled notices and image metadata; the default is v0.4.0. Image-only overrides do not change the checkout's dependency files. See [SDK build configuration](../AGENTS.md#configuring-the-engine-sdk-version).
+`ENGINE_SDK_VERSION` selects the SDK compiled into the image, its bundled notices and image metadata; the default is v0.5.0. Image-only overrides do not change the checkout's dependency files. See [SDK build configuration](../AGENTS.md#configuring-the-engine-sdk-version).
 
 The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA/authentication and lifecycle. Supply existing coordinator settings/credentials at deployment; none are baked into the image. Do not loosen scheduler security settings to run the adapter. The harness root process is a test-only privileged-port requirement; it explicitly starts the adapter non-root.
 

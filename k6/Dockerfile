@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 ARG K6_VERSION=v2.3.0
-ARG ENGINE_SDK_VERSION=v0.4.0
+ARG ENGINE_SDK_VERSION=v0.5.0
 FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm AS build
 ARG TARGETOS
 ARG TARGETARCH
