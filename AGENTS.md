@@ -30,6 +30,13 @@ k6 CSV rows are independent metric samples, not complete request records:
 - VUs, CPU and memory remain agent-level metrics, not request-labelled measurements.
 - Do not route independent VU/byte samples through an SDK conversion that unconditionally creates a request count and latency observation. Preserve the semantics when changing ingestion APIs.
 
+## Use SDK-owned container resource reporting
+
+- All adapters that report container CPU or memory MUST use `github.com/reqfleet/engine-sdk/containerstats`: `ReadCPUUsage` and `ReadMemoryUsage`. Do not copy SDK internals or implement adapter-local cgroup readers.
+- `ReadCPUUsage` returns cumulative microseconds for both cgroup versions, not a percentage or core count. Divide its delta by elapsed wall-clock microseconds to report average CPU cores. Omit CPU until two successful samples exist, reset the baseline for each run, and do not advance it on resource-read failures.
+- `ReadMemoryUsage` returns cgroup-accounted bytes, including cache. Both readers measure all processes in the container's cgroup, not just the engine PID. Keep resource metrics agent-level, without request labels.
+- Propagate unavailable-resource errors as scrape failures; never fabricate zero usage or add host/process fallbacks. Follow the SDK's supported mount layout and document its limitations. See [the resource reporting contract](k6/README.md#normalization-and-run-lifecycle).
+
 ## Use SDK-owned configuration and HTTP serving
 
 - Resolve deployment options once with `agent.LoadAgentServerOptions` and use `AgentServerOptions.LabelsUsageLimit` for the exporter. Do not add adapter-local environment parsing.
