@@ -46,6 +46,7 @@ Use your fork as `origin` if you lack push access, and target `reqfleet/engine-a
 
 - First, tag @iandyh in a PR comment to request review.
 - CI currently runs k6 unit/race tests and real-engine Docker conformance. Address failed checks and review feedback; include checks and release wiring for any new adapter.
+- Integration testing with the Reqfleet control plane (Shibuya) is required before rollout and will be performed by the Reqfleet team. Coordinate this testing with them; adapter container conformance does not replace it.
 - After merge, release-please can open or update a component release PR. Selection is path-based: shared SDK changes need compatibility metadata under each affected adapter, not just `go.mod`. Documentation-only changes need not produce a release.
 - Merging the release PR creates the component tag/release; release-gated tests run against that exact SHA before image publication. Bot release PRs do not automatically get PR CI with the current `GITHUB_TOKEN`; manually pushing a tag does not publish.
 - Check publication success and the immutable digest in the workflow summary. Publication is not deployment: an operator must approve the image and deploy compatible Shibuya admission/UI/chart changes, then run a deployment smoke.
