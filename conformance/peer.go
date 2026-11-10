@@ -1,11 +1,12 @@
 //go:build integration && linux
 
 // Adapted from engine-sdk v0.3.0 examples/preparing-adapter/conformance_test.go.
-// Copyright reqfleet contributors. Apache-2.0; modified for the k6 HTTP harness.
+// Copyright reqfleet contributors. Apache-2.0; modified for real adapter processes.
 package conformance
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -38,7 +39,7 @@ const (
 
 func proofPayload(verb, runID, filename string, settings json.RawMessage) protocol.Payload {
 	message := &protocol.EngineMessage{Verb: verb, RunID: runID, TestFile: filename}
-	if verb == protocol.VerbStart {
+	if verb == protocol.VerbStart || verb == protocol.VerbPrepare {
 		message.RunConfigs = map[string]protocol.RunSpec{"7": {Settings: settings}}
 	} else if verb == protocol.VerbStop {
 		message.StopReason = protocol.StopCanceled
@@ -47,7 +48,11 @@ func proofPayload(verb, runID, filename string, settings json.RawMessage) protoc
 }
 
 func proofProgress(client *http.Client, runID string) (protocol.RunStatus, error) {
-	request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/progress?run_id="+runID, nil)
+	return proofProgressContext(context.Background(), client, runID)
+}
+
+func proofProgressContext(ctx context.Context, client *http.Client, runID string) (protocol.RunStatus, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:8080/progress?run_id="+runID, nil)
 	if err != nil {
 		return protocol.RunStatus{}, err
 	}
@@ -79,28 +84,6 @@ func awaitProofEvent(t *testing.T, event <-chan struct{}, description string) {
 	case <-time.After(proofWait):
 		t.Fatalf("timed out waiting for %s", description)
 	}
-}
-
-type proofRequest struct {
-	Path string
-	Plan string
-}
-
-type proofRequests struct {
-	mu       sync.Mutex
-	requests []proofRequest
-}
-
-func (p *proofRequests) record(path, plan string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.requests = append(p.requests, proofRequest{Path: path, Plan: plan})
-}
-
-func (p *proofRequests) snapshot() []proofRequest {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]proofRequest(nil), p.requests...)
 }
 
 type proofLog struct {
@@ -183,12 +166,19 @@ func (p *proofPeer) awaitSubscription(t *testing.T) {
 }
 
 func (p *proofPeer) send(payload protocol.Payload) error {
+	return p.sendBefore(payload, time.Now().Add(time.Second))
+}
+
+func (p *proofPeer) sendBefore(payload protocol.Payload, deadline time.Time) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.connection == nil {
 		return fmt.Errorf("adapter has not connected to command peer")
 	}
-	if err := p.connection.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+	if writeDeadline := time.Now().Add(time.Second); writeDeadline.Before(deadline) {
+		deadline = writeDeadline
+	}
+	if err := p.connection.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 	return json.NewEncoder(p.connection).Encode(payload)

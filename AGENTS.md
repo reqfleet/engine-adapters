@@ -67,10 +67,10 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 Prerequisites: Go **1.26.10**, Docker with Linux containers, and public HTTPS access to Go modules, Debian packages, and the k6 release. There is one module, no workspace, private dependency, Shibuya checkout, or `replace` directive.
 
-Build targets belong to each adapter's directory. From the repository root, use `make -C k6` for the k6 adapter; inside `k6/`, use `make` directly. Go builds and unit tests are scoped to that adapter, while Docker builds keep the repository root as their context for the shared module, conformance harness and licenses.
+Build targets belong to each adapter's directory. From the repository root, use `make -C k6` for the k6 adapter; inside `k6/`, use `make` directly. Go builds are scoped to that adapter; its unit target also runs the shared conformance validator tests. Docker builds keep the repository root as their context for the shared module, conformance harness and licenses.
 
 ```sh
-make -C k6 test-unit       # go test -race -count=1 ./... inside k6/
+make -C k6 test-unit       # adapter and shared conformance validator, with race detection
 make -C k6 test-conformance
 make -C k6 image IMAGE=k6-adapter:local
 # Or run both test targets:
@@ -82,6 +82,34 @@ make -C k6 test
 Do **not** invoke the integration test binary directly on your machine: it owns fixed ports and `/test-data`. Conformance takes longer than a minute because it proves natural completion, not just startup. Ordinary unit tests require no k6 binary. The harness is opt-in through the `integration` build tag inside its container. Source delivery is not evidence of successful execution: record actual test output and an immutable digest before claiming a tested release.
 
 The initial reference was exercised on Linux arm64 and Linux amd64 (under QEMU), using real k6 container conformance. Its Shibuya integration was exercised in Kind with two agents, two then three VUs per agent, shared CSV split/copy, mixed Replay logs, natural completion, Stop, failed startup, cancellation and same-pod recovery. That integration used a modified Shibuya checkout based on `44e1381b7ad31b0172aadba107e583663e16c74b`, **not a released compatibility guarantee**. Select a Shibuya release containing the static k6 admission/UI/chart changes and repeat the deployment smoke before production rollout.
+
+### Reusable adapter conformance
+
+The shared `conformance` Go package supplies container lifecycle checks and normalized `shibuya-v1` metric assertions. The first consumer is `k6/conformance`; keep engine-specific plans, raw-output parsing and scheduling/error checks there. New adapters should reuse this package and supply their own engine-native fixtures.
+
+`conformance.Contract` takes `Executable`, `Artifacts` (filename to content), optional `DataArtifacts` (SDK artifact URL path to content), a controlled `Target` handler, `LabelLimit`, `Basic`, `Budgets` and an optional `Scenarios` callback. `BasicScenarios` supplies `Complete` and `Reuse` fixtures (`File` and JSON `Settings`), `CompletionTimeout`, and `AssertMetrics(t, runtime, runID)`. That oracle reads native output under `runtime.Root` and calls `conformance.AssertMetrics` with expected identity, per-label outcomes/latencies, bytes, concurrency and resource availability. It returns a resource-independent `MetricsSnapshot` for retention comparisons. `BudgetScenario` supplies a fixture, label limit, minimum request count and exact expected request/byte labels. Use the k6 consumer for a complete runnable example.
+
+The shared lifecycle sequence covers natural completion, retained repeated scrapes, duplicate starts, stale stops, reused-run cancellation, blocked artifact download cancellation and recovery. A completion fixture may finish before the first progress poll; cancellation scenarios still require an observable running state. The runtime also checks bearer rejection and the adapter's UID/GID. Adapter callbacks use `Runtime.Start`, `Running`, `Stop`, `Terminal`, `Scrape` and the other exported helpers for additional scenarios.
+
+Each scenario launches the adapter through a dedicated Linux child-subreaper process. This supervisor owns engine descendants across separate process groups and reaps exited adopted descendants while the adapter is still running. After graceful Stop, cleanup forcibly terminates remaining descendants within a bounded interval, including children orphaned by an adapter exit. Unconfirmed cleanup terminates the container suite before another scenario can inherit those processes. The supervisor remains root; the adapter and workloads retain UID/GID 65532.
+
+Cleanup must stop the admitted active run even when a later overlapping Start was rejected; an attempted run ID must not displace the active run's graceful cancellation and finalization. Use one graceful-cleanup deadline across all Stop writes and progress requests, then enter bounded supervisor teardown even if the adapter is unresponsive.
+
+Build the shared runtime regression binary from `./conformance` with `-tags=integration` alongside the adapter-local test binary. The k6 container runs the shared binary first, then its real-engine suite; both must succeed. Shared runtime regressions exercise an SDK-based short workload, unsuccessful terminal states and cleanup after an unresponsive or exited adapter while an unrelated sibling process remains alive.
+
+Prepare regressions must send the nested Prepare verb with its per-agent assignment and exercise a dependency artifact and preparation hook. Prove cancellation while the adapter is still alive, before forced teardown; a closed download connection after killing the adapter is insufficient evidence.
+
+- Add an adapter-local integration test calling `conformance.Run(t, contract)`. Supply the real executable, artifact contents, settings and controlled target behavior. The shared runtime supplies TLS coordinator/artifact peers, authenticated scrapes and a non-root child process.
+- Provide successful-completion and reuse fixtures plus source-derived metric expectations. Exercise both successful and failed outcomes, exact request counts, received-byte attribution, concurrency, latency units and histogram buckets. The shared metric validator accepts normalized output from either SDK request-event ingestion or producer-owned exposition.
+- Optional `shibuya_latency_llm_resp_milliseconds` observations use `RequestExpectation.LLMResponseLatenciesMS` and the SDK's separate wide histogram bounds. Use the reserved lowercase `llm_resp` label, or `others`/`_other_` for folded observations; arbitrary request URLs are not LLM response labels. The snapshot exposes `LLMResponseLatency`. Keep ordinary `LatenciesMS` independent: a nil slice requires that histogram to be absent; a non-nil empty slice expects an explicit zero-observation histogram.
+- Supply label-budget fixtures with repeated labels and distinct query variants where relevant. Run positive overflow and zero-budget cases against the real adapter. Preserve the adapter's declared byte attribution when folding request labels.
+- Keep additional engine-specific checks for parser failures, native error mappings, scheduling, CSV assignment, hooks and unsupported options in the adapter's scenario callback and unit tests.
+- State the producer's run-retention policy in its fixtures. SDK result-file registries can retain prior-run series; validate current-run values independently and explicitly allow only known prior identities. Retained series must remain unique per metric family and complete label set. Histograms must have the complete profile's bucket bounds, cumulative counts and `+Inf` count matching the sample count; zero observations require a zero sum. Request labels must be shorter than 1024 bytes in current and retained series. For exporters that reset their collectors, require old-run series to disappear. Final request snapshots exclude changing CPU/memory gauges when checking repeated scrapes.
+- Histogram component samples (`_bucket`, `_count`, `_sum`) must each be unique by complete label set, regardless of label ordering. Before typed parsing, reject base-family samples, require `le` only on buckets, validate each component's schema labels, and require raw bucket/count values to be finite nonnegative integers below `2^64`. These checks apply to current and retained runs and prevent the parser from discarding malformed samples or converting out-of-range counts.
+- Build the adapter-local test package with `go test -c -tags=integration` in the Dockerfile and run that binary only in its disposable `conformance` target. Keep the existing isolation: no host mounts, published ports or external network; root harness, UID/GID 65532 adapter.
+- Include shared validator unit tests in each consumer's unit target and wire container conformance into PR and release CI. Shared harness changes require exercising every consumer.
+
+The suite verifies adapter behavior through the public SDK protocol and `/metrics`. Coordinate Shibuya admission, UI and deployment verification with the Reqfleet team separately. Report executed checks and engine versions; a fixture definition alone supplies no runtime evidence.
 
 ### Configuring the engine SDK version
 
