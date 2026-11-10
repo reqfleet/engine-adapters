@@ -33,6 +33,8 @@ func init() {
 		run = runFixtureWorkload
 	case "--runtime-fixture-descendant":
 		run = runFixtureDescendant
+	case "--runtime-fixture-orphan":
+		run = runFixtureOrphan
 	default:
 		return
 	}
@@ -132,6 +134,22 @@ func runFixtureWorkload() error {
 		return nil
 	case "failed":
 		return fmt.Errorf("intentional workload failure after a real request")
+	case "orphan":
+		self, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		for index := range 3 {
+			child := exec.Command(self, "--runtime-fixture-orphan", strconv.Itoa(index), strconv.Itoa(os.Getpid()))
+			child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+			// Do not hold the SDK's workload output pipes open after its exit.
+			if err := child.Start(); err != nil {
+				return err
+			}
+			// Exit without waiting so the live adapter's supervisor adopts them.
+			_ = child.Process.Release()
+		}
+		return nil
 	case "cleanup":
 		self, err := os.Executable()
 		if err != nil {
@@ -171,6 +189,35 @@ func runFixtureDescendant() error {
 			return err
 		}
 		connection.Close()
+	}
+}
+
+func runFixtureOrphan() error {
+	name := "orphan-" + os.Args[2]
+	if err := writeFixturePID(name + ".pid"); err != nil {
+		return err
+	}
+	parent, err := strconv.Atoi(os.Args[3])
+	if err != nil {
+		return err
+	}
+	for os.Getppid() == parent {
+		time.Sleep(10 * time.Millisecond)
+	}
+	root := os.Getenv("AGENT_ROOT")
+	if err := os.WriteFile(filepath.Join(root, name+".parent"), []byte(strconv.Itoa(os.Getppid())), 0600); err != nil {
+		return err
+	}
+	// The test releases these real processes only after proving adoption.
+	for {
+		_, err := os.Stat(filepath.Join(root, "orphan.exit"))
+		if err == nil {
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

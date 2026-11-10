@@ -249,3 +249,64 @@ func TestRuntimeCleanupOwnsSeparateProcessGroups(t *testing.T) {
 		})
 	}
 }
+
+func TestRuntimeReapsOrphansWhileAdapterLives(t *testing.T) {
+	requireRuntimeContainer(t)
+	var cleanupPIDs []int
+	var cleanupStarted time.Time
+	t.Run("scenario", func(t *testing.T) {
+		contract := fixtureContract(t, "orphan")
+		runtime := startRuntime(t, contract)
+		adapter := readFixturePID(t, runtime.Root, "adapter.pid")
+		runtime.Start(t, "8901", Fixture{File: "complete.txt"})
+		runtime.Terminal(t, "8901", protocol.RunCompleted, 10*time.Second)
+		runtime.AwaitRequests(t, "8901", 1)
+
+		adapterStatus, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", adapter))
+		require.NoError(t, err)
+		var orphans []int
+		for index := range 3 {
+			name := fmt.Sprintf("orphan-%d", index)
+			pid := readFixturePID(t, runtime.Root, name+".pid")
+			parent := readFixturePID(t, runtime.Root, name+".parent")
+			require.Contains(t, string(adapterStatus), fmt.Sprintf("PPid:\t%d\n", parent), "orphan must be adopted by the adapter's supervisor")
+			require.NoError(t, syscall.Kill(pid, 0), "orphan must still be alive before release")
+			orphans = append(orphans, pid)
+		}
+		require.NoError(t, os.WriteFile(filepath.Join(runtime.Root, "orphan.exit"), nil, 0644))
+		for _, pid := range orphans {
+			require.Eventually(t, func() bool {
+				return syscall.Kill(pid, 0) == syscall.ESRCH
+			}, processCleanupWait, 10*time.Millisecond, "orphan %d must be reaped before adapter cleanup", pid)
+		}
+		select {
+		case <-runtime.done:
+			t.Fatal("reaping an adopted child was mistaken for adapter exit")
+		default:
+		}
+		require.NoError(t, syscall.Kill(adapter, 0), "adapter must survive adopted child exits")
+
+		// The same SDK adapter must still launch a real workload. Leave its
+		// separate-session descendant for the normal runtime cleanup to own.
+		runtime.Start(t, "8902", Fixture{File: "cleanup.txt"})
+		runtime.Running(t, "8902")
+		runtime.AwaitRequests(t, "8902", 1)
+		cleanupPIDs = []int{
+			adapter,
+			readFixturePID(t, runtime.Root, "engine.pid"),
+			readFixturePID(t, runtime.Root, "descendant.pid"),
+		}
+		connection, err := net.DialTimeout("tcp", "127.0.0.1:18081", time.Second)
+		require.NoError(t, err)
+		connection.Close()
+		cleanupStarted = time.Now()
+	})
+	require.Len(t, cleanupPIDs, 3)
+	require.Less(t, time.Since(cleanupStarted), proofWait+processCleanupWait+10*time.Second, "normal cleanup must remain bounded")
+	for _, pid := range cleanupPIDs {
+		require.ErrorIs(t, syscall.Kill(pid, 0), syscall.ESRCH, "scenario process %d survived cleanup", pid)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:18081")
+	require.NoError(t, err, "normal cleanup must release the descendant listener")
+	listener.Close()
+}

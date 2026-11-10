@@ -455,3 +455,211 @@ func TestMetricValidationLLMRejectsInvalidCurrentMeasurements(t *testing.T) {
 		require.ErrorContains(t, err, "invalid expected latency")
 	}
 }
+
+func TestMetricValidationDuplicateSeriesAcrossIdentities(t *testing.T) {
+	for _, retained := range []bool{false, true} {
+		for _, reordered := range []bool{false, true} {
+			for _, family := range []string{
+				metricschema.RequestLatency, metricschema.LLMResponseLatency, metricschema.StatusCounter,
+				metricschema.EgressBytesCounter, metricschema.ThreadsGauge, metricschema.CPUGauge, metricschema.MemoryGauge,
+			} {
+				t.Run(fmt.Sprintf("%s/retained=%t/reordered=%t", family, retained, reordered), func(t *testing.T) {
+					text, expected := metricFixture()
+					text += latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "/a?x=1", []float64{100})
+					request := expected.Requests["/a?x=1"]
+					request.LLMResponseLatenciesMS = []float64{100}
+					expected.Requests["/a?x=1"] = request
+					var selected strings.Builder
+					for _, line := range strings.Split(text, "\n") {
+						if strings.HasPrefix(line, family+"{") || strings.HasPrefix(line, family+"_") {
+							selected.WriteString(line + "\n")
+						}
+					}
+					series := selected.String()
+					require.NotEmpty(t, series)
+					if retained {
+						prior := expected.Identity
+						prior.RunID = "prior"
+						expected.AllowedPriorIdentities = []MetricIdentity{prior}
+						series = strings.ReplaceAll(series, `run_id="current"`, `run_id="prior"`)
+						text += series
+					}
+					_, err := validateMetrics(text, expected)
+					require.NoError(t, err, "one series per complete identity is valid")
+					if reordered {
+						series = strings.ReplaceAll(series, `collection_id="collection",plan_id="plan"`, `plan_id="plan",collection_id="collection"`)
+					}
+					_, err = validateMetrics(text+series, expected)
+					require.Error(t, err, "duplicate series must fail regardless of label order or retention")
+				})
+			}
+		}
+	}
+}
+
+func TestMetricValidationDistinctRetainedSeries(t *testing.T) {
+	text, expected := metricFixture()
+	text += latencyMetricFixture(metricschema.LLMResponseLatency, metricTestIdentity, "/a?x=1", []float64{100})
+	request := expected.Requests["/a?x=1"]
+	request.LLMResponseLatenciesMS = []float64{100}
+	expected.Requests["/a?x=1"] = request
+	current, err := validateMetrics(text, expected)
+	require.NoError(t, err)
+	var samples strings.Builder
+	for _, line := range strings.Split(text, "\n") {
+		if line != "" && !strings.HasPrefix(line, "#") {
+			samples.WriteString(line + "\n")
+		}
+	}
+	prior := expected.Identity
+	prior.RunID = "prior"
+	identities := []MetricIdentity{prior, prior, prior, prior, prior, prior}
+	identities[1].CollectionID = "other collection"
+	identities[2].PlanID = "other plan"
+	identities[3].RunID = "another prior run"
+	identities[4].EngineNo = "8"
+	identities[5].Zone = "other zone"
+	expected.AllowedPriorIdentities = identities
+	for _, identity := range identities {
+		labels := fmt.Sprintf("collection_id=%q,plan_id=%q,run_id=%q,engine_no=%q,zone=%q",
+			identity.CollectionID, identity.PlanID, identity.RunID, identity.EngineNo, identity.Zone)
+		text += strings.ReplaceAll(samples.String(), metricTestIdentity, labels)
+		// The same request label may have independent statuses, including a
+		// status that happens to equal another request's label.
+		text += fmt.Sprintf("%s{%s,label=\"/a?x=1\",status=\"/a?x=2\"} 2\n", metricschema.StatusCounter, labels)
+		text += fmt.Sprintf("%s{%s,label=\"/a?x=2\",status=\"/a?x=1\"} 2\n", metricschema.StatusCounter, labels)
+		text += fmt.Sprintf("%s{%s,label=\"other request\",status=\"200\"} 2\n", metricschema.StatusCounter, labels)
+	}
+	got, err := validateMetrics(text, expected)
+	require.NoError(t, err, "family, full identity, request and status all distinguish series")
+	require.Equal(t, current, got)
+}
+
+func TestMetricValidationZeroCountHistogramSum(t *testing.T) {
+	for _, family := range []string{metricschema.RequestLatency, metricschema.LLMResponseLatency} {
+		for _, retained := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/retained=%t", family, retained), func(t *testing.T) {
+				_, fixture := metricFixture()
+				expected := MetricsExpectation{Identity: fixture.Identity}
+				identity := metricTestIdentity
+				if retained {
+					prior := expected.Identity
+					prior.RunID = "prior"
+					expected.AllowedPriorIdentities = []MetricIdentity{prior}
+					identity = strings.ReplaceAll(identity, `run_id="current"`, `run_id="prior"`)
+				} else {
+					request := RequestExpectation{LatenciesMS: []float64{}}
+					if family == metricschema.LLMResponseLatency {
+						request = RequestExpectation{LLMResponseLatenciesMS: []float64{}}
+					}
+					expected.Requests = map[string]RequestExpectation{"zero": request}
+				}
+				text := latencyMetricFixture(family, identity, "zero", nil)
+				_, err := validateMetrics(text, expected)
+				require.NoError(t, err, "a genuinely empty histogram is valid")
+				sumLine := fmt.Sprintf("%s_sum{%s,label=\"zero\"} 0\n", family, identity)
+				require.Contains(t, text, sumLine)
+				for _, sum := range []float64{math.SmallestNonzeroFloat64, 0.0000001, 1} {
+					badSum := fmt.Sprintf("%s_sum{%s,label=\"zero\"} %g\n", family, identity, sum)
+					_, err := validateMetrics(strings.Replace(text, sumLine, badSum, 1), expected)
+					require.ErrorContains(t, err, "zero-count histogram has nonzero sum", "sum %g", sum)
+				}
+			})
+		}
+	}
+}
+
+func TestMetricValidationRequestLabelByteLimit(t *testing.T) {
+	labels := []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{"ASCII 1023", strings.Repeat("x", 1023), true},
+		{"ASCII 1024", strings.Repeat("x", 1024), false},
+		{"ASCII 1025", strings.Repeat("x", 1025), false},
+		{"Unicode 1023", strings.Repeat("界", 341), true},
+		{"Unicode 1024", strings.Repeat("界", 341) + "x", false},
+		{"Unicode 1025", strings.Repeat("界", 341) + "é", false},
+	}
+	for _, family := range []string{
+		metricschema.RequestLatency, metricschema.LLMResponseLatency, metricschema.StatusCounter, metricschema.EgressBytesCounter,
+	} {
+		for _, retained := range []bool{false, true} {
+			for _, label := range labels {
+				t.Run(fmt.Sprintf("%s/retained=%t/%s", family, retained, label.name), func(t *testing.T) {
+					_, fixture := metricFixture()
+					expected := MetricsExpectation{Identity: fixture.Identity}
+					identity := metricTestIdentity
+					if retained {
+						prior := expected.Identity
+						prior.RunID = "prior"
+						expected.AllowedPriorIdentities = []MetricIdentity{prior}
+						identity = strings.ReplaceAll(identity, `run_id="current"`, `run_id="prior"`)
+					}
+					var text string
+					request := RequestExpectation{}
+					switch family {
+					case metricschema.RequestLatency:
+						request.LatenciesMS = []float64{1}
+						text = latencyMetricFixture(family, identity, label.value, request.LatenciesMS)
+					case metricschema.LLMResponseLatency:
+						request.LLMResponseLatenciesMS = []float64{100}
+						text = latencyMetricFixture(family, identity, label.value, request.LLMResponseLatenciesMS)
+					case metricschema.StatusCounter:
+						request.Statuses = map[string]uint64{"200": 1}
+						text = fmt.Sprintf("# TYPE %s counter\n%s{%s,label=%q,status=\"200\"} 1\n", family, family, identity, label.value)
+					case metricschema.EgressBytesCounter:
+						text = fmt.Sprintf("# TYPE %s counter\n%s{%s,label=%q} 1\n", family, family, identity, label.value)
+					}
+					if !retained {
+						if family == metricschema.EgressBytesCounter {
+							expected.Bytes = map[string]float64{label.value: 1}
+						} else {
+							expected.Requests = map[string]RequestExpectation{label.value: request}
+						}
+					}
+					snapshot, err := validateMetrics(text, expected)
+					if !label.valid {
+						require.ErrorContains(t, err, "request label length")
+						return
+					}
+					require.NoError(t, err)
+					if retained {
+						require.Empty(t, snapshot.Requests)
+						require.Empty(t, snapshot.Bytes)
+					} else if family == metricschema.EgressBytesCounter {
+						require.Equal(t, map[string]float64{label.value: 1}, snapshot.Bytes)
+					} else {
+						require.Len(t, snapshot.Requests, 1)
+						require.Contains(t, snapshot.Requests, label.value, "accepted labels retain every emitted byte")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMetricValidationResourceIdentityLabelsHaveNoRequestByteLimit(t *testing.T) {
+	for _, retained := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retained=%t", retained), func(t *testing.T) {
+			_, fixture := metricFixture()
+			expected := MetricsExpectation{Identity: fixture.Identity}
+			identity := expected.Identity
+			identity.Zone = strings.Repeat("界", 400)
+			if retained {
+				identity.RunID = "prior"
+				expected.AllowedPriorIdentities = []MetricIdentity{identity}
+			} else {
+				expected.Identity = identity
+				expected.Resources = ResourceExpectation{CPU: MeasurementRequired, Memory: MeasurementRequired}
+			}
+			labels := fmt.Sprintf("collection_id=%q,plan_id=%q,run_id=%q,engine_no=%q,zone=%q",
+				identity.CollectionID, identity.PlanID, identity.RunID, identity.EngineNo, identity.Zone)
+			text := fmt.Sprintf("# TYPE %s gauge\n%s{%s} 0.25\n# TYPE %s gauge\n%s{%s} 4096\n",
+				metricschema.CPUGauge, metricschema.CPUGauge, labels, metricschema.MemoryGauge, metricschema.MemoryGauge, labels)
+			_, err := validateMetrics(text, expected)
+			require.NoError(t, err)
+		})
+	}
+}

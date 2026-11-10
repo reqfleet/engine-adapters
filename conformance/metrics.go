@@ -90,6 +90,12 @@ type MetricsSnapshot struct {
 	Concurrency *float64
 }
 
+type metricSeriesIdentity struct {
+	MetricIdentity
+	Request string
+	Status  string
+}
+
 // AssertMetrics checks the shibuya-v1 request metrics contract for either an SDK
 // result-event producer or a native normalized producer. Non-shibuya collectors
 // are ignored. Counter counts and histogram bounds are exact; sums and byte
@@ -153,10 +159,11 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 		if len(family.Metric) == 0 {
 			return snapshot, fmt.Errorf("%s: empty metric family", name)
 		}
+		seenSeries := make(map[metricSeriesIdentity]struct{}, len(family.Metric))
 		for _, metric := range family.Metric {
 			labels, err := validateMetricLabels(metric, labelNames, identity)
+			prior := false
 			if err != nil {
-				prior := false
 				for _, allowed := range expected.AllowedPriorIdentities {
 					priorIdentity := map[string]string{
 						metricschema.LabelCollectionID: allowed.CollectionID,
@@ -165,14 +172,31 @@ func validateMetrics(exposition string, expected MetricsExpectation) (MetricsSna
 						metricschema.LabelEngineNo:     allowed.EngineNo,
 						metricschema.LabelZone:         allowed.Zone,
 					}
-					if _, priorErr := validateMetricLabels(metric, labelNames, priorIdentity); priorErr == nil {
-						prior = true
+					if priorLabels, priorErr := validateMetricLabels(metric, labelNames, priorIdentity); priorErr == nil {
+						labels, prior = priorLabels, true
 						break
 					}
 				}
 				if !prior {
 					return snapshot, fmt.Errorf("%s: %w", name, err)
 				}
+			}
+			key := metricSeriesIdentity{
+				MetricIdentity: MetricIdentity{
+					CollectionID: labels[metricschema.LabelCollectionID],
+					PlanID:       labels[metricschema.LabelPlanID],
+					RunID:        labels[metricschema.LabelRunID],
+					EngineNo:     labels[metricschema.LabelEngineNo],
+					Zone:         labels[metricschema.LabelZone],
+				},
+				Request: labels[metricschema.LabelRequest],
+				Status:  labels[metricschema.LabelStatus],
+			}
+			if _, duplicate := seenSeries[key]; duplicate {
+				return snapshot, fmt.Errorf("%s: duplicate series", name)
+			}
+			seenSeries[key] = struct{}{}
+			if prior {
 				if err := validateRetainedValues(metric, kind, bounds); err != nil {
 					return snapshot, fmt.Errorf("%s retained series: %w", name, err)
 				}
@@ -309,6 +333,9 @@ func validateMetricLabels(metric *dto.Metric, names []string, identity map[strin
 			return nil, fmt.Errorf("missing schema label %q", name)
 		}
 	}
+	if length := len(labels[metricschema.LabelRequest]); length >= 1024 {
+		return nil, fmt.Errorf("request label length %d bytes, want less than 1024", length)
+	}
 	for name, want := range identity {
 		if labels[name] != want {
 			return nil, fmt.Errorf("identity %s=%q, want %q", name, labels[name], want)
@@ -358,6 +385,9 @@ func validateLatencyStructure(histogram *dto.Histogram, bounds []float64) (*Late
 	}
 	if !finiteNonnegative(histogram.GetSampleSum()) {
 		return nil, fmt.Errorf("invalid histogram sum %g", histogram.GetSampleSum())
+	}
+	if histogram.GetSampleCount() == 0 && histogram.GetSampleSum() != 0 {
+		return nil, fmt.Errorf("zero-count histogram has nonzero sum %g", histogram.GetSampleSum())
 	}
 	if len(histogram.Bucket) != len(bounds) {
 		return nil, fmt.Errorf("bucket count %d, want %d", len(histogram.Bucket), len(bounds))

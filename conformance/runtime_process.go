@@ -158,14 +158,30 @@ func superviseRuntime(executable string) error {
 		case <-stop:
 			return killRuntimeChildren()
 		case <-ticker.C:
-			var status syscall.WaitStatus
-			pid, err := syscall.Wait4(child.Process.Pid, &status, syscall.WNOHANG, nil)
-			if err != nil && !errors.Is(err, syscall.EINTR) {
-				return errors.Join(err, killRuntimeChildren())
-			}
-			if pid == child.Process.Pid {
-				_ = encoder.Encode(true)
-				return killRuntimeChildren()
+			// Reap adopted descendants while the adapter is still serving. Only
+			// the adapter's own exit ends the scenario; no Cmd.Wait competes
+			// with this loop or with the subsequent cleanup.
+			for {
+				select {
+				case <-stop:
+					return killRuntimeChildren()
+				default:
+				}
+				var status syscall.WaitStatus
+				pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
+				if errors.Is(err, syscall.EINTR) {
+					continue
+				}
+				if err != nil {
+					return errors.Join(err, killRuntimeChildren())
+				}
+				if pid == child.Process.Pid {
+					_ = encoder.Encode(true)
+					return killRuntimeChildren()
+				}
+				if pid == 0 {
+					break
+				}
 			}
 		}
 	}
