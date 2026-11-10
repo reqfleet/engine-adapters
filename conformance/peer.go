@@ -1,7 +1,7 @@
 //go:build integration && linux
 
 // Adapted from engine-sdk v0.3.0 examples/preparing-adapter/conformance_test.go.
-// Copyright reqfleet contributors. Apache-2.0; modified for the k6 HTTP harness.
+// Copyright reqfleet contributors. Apache-2.0; modified for real adapter processes.
 package conformance
 
 import (
@@ -79,28 +79,6 @@ func awaitProofEvent(t *testing.T, event <-chan struct{}, description string) {
 	case <-time.After(proofWait):
 		t.Fatalf("timed out waiting for %s", description)
 	}
-}
-
-type proofRequest struct {
-	Path string
-	Plan string
-}
-
-type proofRequests struct {
-	mu       sync.Mutex
-	requests []proofRequest
-}
-
-func (p *proofRequests) record(path, plan string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.requests = append(p.requests, proofRequest{Path: path, Plan: plan})
-}
-
-func (p *proofRequests) snapshot() []proofRequest {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]proofRequest(nil), p.requests...)
 }
 
 type proofLog struct {

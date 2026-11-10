@@ -2,7 +2,7 @@
 
 // Protocol harness adapted from engine-sdk v0.3.0 preparing-adapter example.
 // Copyright reqfleet contributors. Apache-2.0; modified for real k6 HTTP runs.
-package conformance
+package conformance_test
 
 import (
 	"encoding/csv"
@@ -11,37 +11,33 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
-	"syscall"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	"github.com/reqfleet/engine-adapters/conformance"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// Fixed privileged ports and /test-data belong ONLY to the disposable image.
-// The adapter itself runs as the production UID/GID 65532, not harness root.
+const (
+	proofCollection = conformance.CollectionID
+	proofPlan       = conformance.PlanID
+	proofWait       = conformance.Wait
+)
+
 func TestPublicK6Runtime(t *testing.T) {
-	require.Zero(t, os.Geteuid(), "use make -C k6 test-conformance from the repository root")
-	_, err := os.Stat("/.dockerenv")
-	require.NoError(t, err)
-	startProofDNS(t)
-	certificate, ca := proofCertificate(t)
-	peer := newProofPeer(t, certificate)
 	requests := &proofRequests{}
 	inflight := make(chan struct{}, 1)
 	inflightEnded := make(chan struct{}, 1)
-	startProofHTTP(t, "127.0.0.1:18080", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	target := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.record(r.URL.Path, r.Header.Get("X-Revision"))
 		if strings.HasPrefix(r.URL.Path, "/data") {
 			assert.Equal(t, "row-a|row-b", r.Header.Get("X-Data"))
@@ -68,12 +64,9 @@ func TestPublicK6Runtime(t *testing.T) {
 			w.WriteHeader(500)
 		}
 		_, _ = io.WriteString(w, "real k6 conformance response\n")
-	}), nil)
-	blockedDownload := make(chan struct{}, 1)
-	endedDownload := make(chan struct{}, 1)
-	var downloads atomic.Int64
+	})
 	artifacts := map[string]string{}
-	add := func(name, body string) { artifacts[proofArtifactPath(t, name)] = body }
+	add := func(name, body string) { artifacts[name] = body }
 	firstSource := httpScript("first", true)
 	add("first.js", firstSource)
 	add("second.js", httpScript("second", false))
@@ -95,117 +88,58 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	add("missing.js", "export const options = {};")
 	add("syntax.js", "export default function(")
 	add("tags.js", "export const options={systemTags:'status'};export default function(){}")
-	dataPath, err := protocol.EngineDataPath(proofCollection, proofPlan, "rows.csv", "7")
-	require.NoError(t, err)
-	artifacts[path.Join(protocol.ArtifactPathPrefix, dataPath)] = "row-a\nrow-b\n"
-	startProofHTTP(t, "127.0.0.1:443", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !assert.Equal(t, "Bearer "+proofKey, r.Header.Get("Authorization")) {
-			http.Error(w, "unauthorized", 401)
-			return
-		}
-		downloads.Add(1)
-		if r.URL.Path == proofArtifactPath(t, "blocked.js") {
-			select {
-			case blockedDownload <- struct{}{}:
-			default:
-			}
-			<-r.Context().Done()
-			select {
-			case endedDownload <- struct{}{}:
-			default:
-			}
-			return
-		}
-		body, ok := artifacts[r.URL.Path]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		_, _ = io.WriteString(w, body)
-	}), &certificate)
-
-	root, err := os.MkdirTemp("/tmp", "k6-conformance-")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	require.NoError(t, os.Chown(root, 65532, 65532))
-	var logs proofLog
-	child := exec.Command("/usr/local/bin/k6-adapter")
-	child.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65532, Gid: 65532}}
-	// Exercise SDK-owned parsing with a signed, non-default label limit.
-	child.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + root, "AGENT_ROOT=" + root, "engine_name=engine-proof-plan-local-0", "offset=7", "coordinator_ip=127.0.0.1", "coordinator_ca_cert=" + ca, "collection_id=" + proofCollection, "plan_id=" + proofPlan, "zone=local", "api_key=" + proofKey, "label_limit=+4"}
-	child.Stdout, child.Stderr = &logs, &logs
-	require.NoError(t, child.Start())
-	done := make(chan struct{})
-	go func() { _ = child.Wait(); close(done) }()
-	client := &http.Client{Timeout: 3 * time.Second}
-	t.Cleanup(client.CloseIdleConnections)
-	active := ""
-	t.Cleanup(func() {
-		if active != "" {
-			_ = peer.send(proofPayload(protocol.VerbStop, active, "", nil))
-			deadline := time.Now().Add(proofWait)
-			for time.Now().Before(deadline) {
-				status, e := proofProgress(client, active)
-				if e == nil && status.State.Terminal() {
-					break
-				}
-				time.Sleep(25 * time.Millisecond)
-			}
-		}
-		_ = child.Process.Kill()
-		<-done
-		if t.Failed() {
-			t.Logf("adapter output:\n%s", logs.String())
-		}
+	add("labels.js", `import http from 'k6/http'; import {sleep} from 'k6';
+export default function(){for(const path of ['/200','/200','/200?item=a','/200?item=b','/500','/overflow','/overflow?item=c'])http.get('http://127.0.0.1:18080'+path);sleep(0.2);}`)
+	settings := json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)
+	fixture := conformance.Fixture{File: "labels.js", Settings: settings}
+	conformance.Run(t, conformance.Contract{
+		Executable:    "/usr/local/bin/k6-adapter",
+		Artifacts:     artifacts,
+		DataArtifacts: map[string]string{conformance.DataArtifactPath(t, "rows.csv"): "row-a\nrow-b\n"},
+		Target:        target,
+		LabelLimit:    4,
+		Basic: conformance.BasicScenarios{
+			Complete:          conformance.Fixture{File: "first.js", Settings: settings},
+			Reuse:             conformance.Fixture{File: "second.js", Settings: settings},
+			CompletionTimeout: 90 * time.Second,
+			AssertMetrics: func(t *testing.T, runtime *conformance.Runtime, run string) conformance.MetricsSnapshot {
+				_, snapshot := compareCSVSnapshot(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit)
+				return snapshot
+			},
+		},
+		Budgets: []conformance.BudgetScenario{
+			{Name: "overflow", LabelLimit: 4, Fixture: fixture, MinimumRequests: 14,
+				RequestLabels: []string{conformance.TargetURL + "/200", conformance.TargetURL + "/200?item=a", conformance.TargetURL + "/200?item=b", conformance.TargetURL + "/500", "others"}, ByteLabels: []string{"k6"}},
+			{Name: "zero", LabelLimit: 0, Fixture: fixture, MinimumRequests: 14,
+				RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
+		},
+		Scenarios: func(t *testing.T, runtime *conformance.Runtime) {
+			runK6Scenarios(t, runtime, requests, inflight, inflightEnded, firstSource)
+		},
 	})
-	peer.awaitSubscription(t)
-	require.Eventually(t, func() bool {
-		response, e := client.Get("http://127.0.0.1:8080/healthz")
-		if e != nil {
-			return false
-		}
-		defer response.Body.Close()
-		return response.StatusCode == 200
-	}, proofWait, 25*time.Millisecond)
-	processStatus, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", child.Process.Pid))
-	require.NoError(t, err)
-	require.Contains(t, string(processStatus), "Uid:\t65532\t65532\t65532\t65532")
+}
+
+func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofRequests, inflight, inflightEnded <-chan struct{}, firstSource string) {
+	client, root := runtime.Client, runtime.Root
 	start := func(id, file, vus string, mode protocol.PartitionMode) protocol.Payload {
 		t.Helper()
-		settings, e := json.Marshal(map[string]string{"plan_name": "conformance", "concurrency": vus, "duration": "1", "rampup": "0"})
-		require.NoError(t, e)
-		payload := proofPayload(protocol.VerbStart, id, file, settings)
+		settings, err := json.Marshal(map[string]string{"plan_name": "conformance", "concurrency": vus, "duration": "1", "rampup": "0"})
+		require.NoError(t, err)
+		payload := conformance.Payload(protocol.VerbStart, id, file, settings)
 		if mode != "" {
 			message := payload.PlanMessage[proofPlan]
 			message.DataFiles = map[string]struct{}{"rows.csv": {}}
 			message.RunConfigs["7"] = protocol.RunSpec{Settings: settings, Artifacts: map[string]protocol.ArtifactAssignment{"rows.csv": {Mode: mode, ShardIndex: 0, ShardCount: 2}}}
 		}
-		active = id
-		require.NoError(t, peer.send(payload))
+		runtime.Send(t, payload)
 		return payload
 	}
 	terminal := func(id string, want protocol.RunState, timeout time.Duration) protocol.RunStatus {
 		t.Helper()
-		var status protocol.RunStatus
-		require.Eventually(t, func() bool {
-			var e error
-			status, e = proofProgress(client, id)
-			return e == nil && status.State.Terminal()
-		}, timeout, 50*time.Millisecond, "run %s failed to finish; logs=%s", id, logs.String())
-		require.Equal(t, want, status.State, "%+v; logs=%s", status, logs.String())
-		return status
+		return runtime.Terminal(t, id, want, timeout)
 	}
-	running := func(id string) {
-		t.Helper()
-		require.Eventually(t, func() bool {
-			status, e := proofProgress(client, id)
-			return e == nil && status.State == protocol.RunRunning
-		}, proofWait, 50*time.Millisecond, "logs=%s", logs.String())
-	}
-	stop := func(id string) {
-		t.Helper()
-		require.NoError(t, peer.send(proofPayload(protocol.VerbStop, id, "", nil)))
-	}
+	running := func(id string) { t.Helper(); runtime.Running(t, id) }
+	stop := func(id string) { t.Helper(); runtime.Stop(t, id) }
 	csvPath := filepath.Join(root, "test-result", "k6.csv")
 	first := start("1001", "first.js", "2", "")
 	running("1001")
@@ -246,18 +180,18 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	seen := requests.snapshot()
 	require.Contains(t, seen, proofRequest{Path: "/setup", Plan: "first"})
 	require.Contains(t, seen, proofRequest{Path: "/teardown", Plan: "first"})
-	before := downloads.Load()
+	before := runtime.Downloads()
 	requestCount := len(seen)
-	require.NoError(t, peer.send(first))
+	runtime.Send(t, first)
 	stop("1999")
 	terminal("1999", protocol.RunCanceled, proofWait)
-	require.Equal(t, before, downloads.Load())
+	require.Equal(t, before, runtime.Downloads())
 	require.Len(t, requests.snapshot(), requestCount, "duplicate start must not execute")
 
 	start("1002", "second.js", "1", "")
 	running("1002")
 	stop("1001") // stale stop must not cancel this run
-	require.Never(t, func() bool { status, e := proofProgress(client, "1002"); return e == nil && status.State.Terminal() }, 400*time.Millisecond, 25*time.Millisecond)
+	require.Never(t, func() bool { status, e := runtime.Progress("1002"); return e == nil && status.State.Terminal() }, 400*time.Millisecond, 25*time.Millisecond)
 	stop("1002")
 	terminal("1002", protocol.RunCanceled, proofWait)
 	secondTotals := compareCSV(t, client, csvPath, "1002")
@@ -276,11 +210,11 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	require.Equal(t, protocol.FailureStartup, status.FailurePhase)
 	require.Contains(t, status.ErrorMessage, "concurrency")
 	require.NoFileExists(t, filepath.Join(root, "run-tmp", "entry.js"))
-	start("1004", "blocked.js", "1", "")
-	awaitProofEvent(t, blockedDownload, "artifact download")
+	start("1004", runtime.BlockedFile(), "1", "")
+	runtime.AwaitDownload(t)
 	stop("1004")
 	terminal("1004", protocol.RunCanceled, proofWait)
-	awaitProofEvent(t, endedDownload, "download cancellation")
+	runtime.AwaitDownloadCancellation(t)
 	start("1005", "inflight.js", "1", "")
 	awaitProofEvent(t, inflight, "in-flight request")
 	stop("1005")
@@ -290,17 +224,17 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	status = terminal("1006", protocol.RunFailed, 90*time.Second)
 	require.NotZero(t, status.ExitCode)
 	for index, key := range []string{"scenarios", "vus", "duration", "iterations", "stages", "executionSegment", "executionSegmentSequence", "missing", "syntax", "tags"} {
-		logOffset := len(logs.String())
+		logOffset := len(runtime.Logs())
 		id := strconv.Itoa(1100 + index)
 		start(id, key+".js", "1", "")
 		status = terminal(id, protocol.RunFailed, proofWait)
 		require.NotZero(t, status.ExitCode)
 		if index < 7 {
-			require.Contains(t, logs.String()[logOffset:], "k6 scheduling options are managed by the collection")
+			require.Contains(t, runtime.Logs()[logOffset:], "k6 scheduling options are managed by the collection")
 		}
 	}
-	require.Contains(t, logs.String(), "k6 plan must export a default function")
-	require.Contains(t, logs.String(), "k6 options.systemTags must be an array")
+	require.Contains(t, runtime.Logs(), "k6 plan must export a default function")
+	require.Contains(t, runtime.Logs(), "k6 options.systemTags must be an array")
 	for index, mode := range []protocol.PartitionMode{protocol.PartitionNative, protocol.PartitionReplicated, protocol.PartitionMaterialized} {
 		id := strconv.Itoa(1200 + index)
 		start(id, "data.js", "1", mode)
@@ -361,8 +295,8 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	// Exercise positive ramp-up through the actual engine, not generated source.
 	rampSettings, err := json.Marshal(map[string]string{"concurrency": "3", "duration": "1", "rampup": "3"})
 	require.NoError(t, err)
-	active = "1300"
-	require.NoError(t, peer.send(proofPayload(protocol.VerbStart, active, "second.js", rampSettings)))
+	active := "1300"
+	runtime.Send(t, conformance.Payload(protocol.VerbStart, active, "second.js", rampSettings))
 	running(active)
 	require.Eventually(t, func() bool {
 		parser := expfmt.NewTextParser(model.UTF8Validation)
@@ -382,11 +316,7 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	stop(active)
 	terminal(active, protocol.RunCanceled, proofWait)
 	compareCSV(t, client, csvPath, "1300")
-	select {
-	case <-done:
-		t.Fatalf("agent exited instead of recovering: %s", logs.String())
-	default:
-	}
+	runtime.AssertAlive(t)
 }
 
 func httpScript(revision string, hooks bool) string {
@@ -420,19 +350,16 @@ type requestTotals struct {
 
 func scrape(t *testing.T, client *http.Client) string {
 	t.Helper()
-	request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/metrics", nil)
-	require.NoError(t, err)
-	request.Header.Set("Authorization", "Bearer "+proofKey)
-	response, err := client.Do(request)
-	require.NoError(t, err)
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	require.NoError(t, err)
-	require.Equal(t, 200, response.StatusCode, string(body))
-	return string(body)
+	return conformance.Scrape(t, client)
 }
 
 func compareCSV(t *testing.T, client *http.Client, filename, run string) totals {
+	t.Helper()
+	observed, _ := compareCSVSnapshot(t, client, filename, run, 4)
+	return observed
+}
+
+func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string, labelLimit int) (totals, conformance.MetricsSnapshot) {
 	t.Helper()
 	file, err := os.Open(filename)
 	require.NoError(t, err)
@@ -449,6 +376,7 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 	}
 	expected := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}}
 	durations := map[string][]float64{}
+	admitted := map[string]bool{}
 	for {
 		row, e := reader.Read()
 		if e == io.EOF {
@@ -462,6 +390,13 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 			url := row[columns["url"]]
 			require.NotEmpty(t, url, "duration rows must retain their request URL")
 			require.Equal(t, "GET", row[columns["method"]], "existing system tags must be preserved")
+			if !admitted[url] {
+				if len(admitted) < labelLimit {
+					admitted[url] = true
+				} else {
+					url = "others"
+				}
+			}
 			if expected.requests[url] == nil {
 				expected.requests[url] = &requestTotals{status: map[string]float64{}}
 			}
@@ -493,75 +428,69 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 		}
 	}
 	require.Positive(t, expected.count)
-	parser := expfmt.NewTextParser(model.UTF8Validation)
-	families, err := parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
-	require.NoError(t, err)
-	observed := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}}
-	for name, family := range families {
-		for _, metric := range family.Metric {
-			labels := map[string]string{}
-			for _, label := range metric.Label {
-				labels[label.GetName()] = label.GetValue()
-			}
-			if !strings.HasPrefix(name, "shibuya_") {
-				continue
-			}
-			require.Equal(t, run, labels[metricschema.LabelRunID])
-			require.Equal(t, "7", labels[metricschema.LabelEngineNo])
-			require.Equal(t, proofCollection, labels[metricschema.LabelCollectionID])
-			require.Equal(t, proofPlan, labels[metricschema.LabelPlanID])
-			require.Equal(t, "local", labels[metricschema.LabelZone])
-			label := labels[metricschema.LabelRequest]
-			if name == metricschema.RequestLatency || name == metricschema.StatusCounter {
-				require.Contains(t, expected.requests, label, "request metrics must use a CSV URL, not k6 or a name tag")
-				if observed.requests[label] == nil {
-					observed.requests[label] = &requestTotals{status: map[string]float64{}}
-				}
-			}
-			switch name {
-			case metricschema.RequestLatency:
-				observed.count += metric.GetHistogram().GetSampleCount()
-				observed.sum += metric.GetHistogram().GetSampleSum()
-				request := observed.requests[label]
-				request.count += metric.GetHistogram().GetSampleCount()
-				request.sum += metric.GetHistogram().GetSampleSum()
-				for _, bucket := range metric.GetHistogram().Bucket {
-					var count uint64
-					for _, duration := range durations[label] {
-						if duration <= bucket.GetUpperBound() {
-							count++
-						}
-					}
-					require.Equal(t, count, bucket.GetCumulativeCount(), "URL %s, bucket %g", label, bucket.GetUpperBound())
-				}
-			case metricschema.StatusCounter:
-				observed.status[labels[metricschema.LabelStatus]] += metric.GetCounter().GetValue()
-				observed.requests[label].status[labels[metricschema.LabelStatus]] += metric.GetCounter().GetValue()
-			case metricschema.EgressBytesCounter:
-				require.Equal(t, "k6", label, "received bytes must remain aggregate, not per URL")
-				observed.bytes += metric.GetCounter().GetValue()
-			case metricschema.ThreadsGauge:
-				observed.vus = metric.GetGauge().GetValue()
-			case metricschema.CPUGauge:
-				require.NotContains(t, labels, metricschema.LabelRequest)
-				require.GreaterOrEqual(t, metric.GetGauge().GetValue(), float64(0))
-			case metricschema.MemoryGauge:
-				require.NotContains(t, labels, metricschema.LabelRequest)
-				require.Positive(t, metric.GetGauge().GetValue())
-			}
+	requests := make(map[string]conformance.RequestExpectation, len(expected.requests))
+	for label, request := range expected.requests {
+		statuses := make(map[string]uint64, len(request.status))
+		for status, count := range request.status {
+			statuses[status] = uint64(count)
 		}
+		requests[label] = conformance.RequestExpectation{Statuses: statuses, LatenciesMS: durations[label]}
 	}
-	require.Equal(t, expected.count, observed.count)
-	require.InDelta(t, expected.sum, observed.sum, 0.000001)
-	require.Equal(t, expected.status, observed.status)
-	require.InDelta(t, expected.bytes, observed.bytes, 0.000001)
-	require.Equal(t, expected.vus, observed.vus)
-	require.Len(t, observed.requests, len(expected.requests))
-	for url, request := range expected.requests {
-		require.Contains(t, observed.requests, url)
-		require.Equal(t, request.count, observed.requests[url].count, "URL %s", url)
-		require.InDelta(t, request.sum, observed.requests[url].sum, 0.000001, "URL %s", url)
-		require.Equal(t, request.status, observed.requests[url].status, "URL %s", url)
+	byteLabel := "k6"
+	if labelLimit == 0 {
+		byteLabel = "others"
 	}
-	return observed
+	snapshot := conformance.AssertMetrics(t, scrape(t, client), conformance.MetricsExpectation{
+		Identity:    conformance.MetricIdentity{CollectionID: proofCollection, PlanID: proofPlan, RunID: run, EngineNo: "7", Zone: "local"},
+		Requests:    requests,
+		Bytes:       map[string]float64{byteLabel: expected.bytes},
+		Concurrency: &expected.vus,
+		Resources:   conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
+	})
+	observed := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}, vus: *snapshot.Concurrency}
+	for label, request := range snapshot.Requests {
+		value := &requestTotals{count: request.Latency.Count, sum: request.Latency.Sum, status: map[string]float64{}}
+		observed.count += value.count
+		observed.sum += value.sum
+		for status, count := range request.Statuses {
+			value.status[status] = float64(count)
+			observed.status[status] += float64(count)
+		}
+		observed.requests[label] = value
+	}
+	for _, bytes := range snapshot.Bytes {
+		observed.bytes += bytes
+	}
+	return observed, snapshot
+}
+
+type proofRequest struct {
+	Path string
+	Plan string
+}
+
+type proofRequests struct {
+	mu       sync.Mutex
+	requests []proofRequest
+}
+
+func (p *proofRequests) record(path, plan string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.requests = append(p.requests, proofRequest{Path: path, Plan: plan})
+}
+
+func (p *proofRequests) snapshot() []proofRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]proofRequest(nil), p.requests...)
+}
+
+func awaitProofEvent(t *testing.T, event <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-event:
+	case <-time.After(proofWait):
+		t.Fatalf("timed out waiting for %s", description)
+	}
 }

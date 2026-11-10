@@ -144,3 +144,5 @@ The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA
 - Updated image: roll out compatible configuration, then purge/relaunch collections. Rollback follows the same process using the previous tested tuple/digest.
 
 Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, selected SDK version, selected k6 version, metrics shibuya-v1)` tuple and live smoke results before production use.
+
+The adapter's `k6/conformance` tests consume the shared `conformance` package. Its container suite exercises SDK lifecycle and authenticated serving, validates normalized metrics against real k6 CSV output, and runs positive-overflow and zero-label-budget scenarios. k6-specific hooks, scheduling, assignment and transport-error cases remain in the adapter's tests. `make -C k6 test-unit` also runs the shared metrics validator's unit tests. See [the reusable suite contract](../AGENTS.md#reusable-adapter-conformance) when adding another adapter.

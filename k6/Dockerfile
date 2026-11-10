@@ -14,7 +14,7 @@ COPY . .
 RUN go get "github.com/reqfleet/engine-sdk@${ENGINE_SDK_VERSION}" && \
     test "$(go list -m -f '{{.Version}}' github.com/reqfleet/engine-sdk)" = "$ENGINE_SDK_VERSION"
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o /out/k6-adapter ./k6/cmd/agent && \
-    GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance ./conformance
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance ./k6/conformance
 # Keep SDK transitive license notices with the executable distribution.
 RUN cp "$(go list -m -f '{{.Dir}}' github.com/reqfleet/engine-sdk)/THIRD_PARTY_NOTICES" /out/SDK_THIRD_PARTY_NOTICES
 
