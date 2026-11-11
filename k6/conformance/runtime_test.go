@@ -260,8 +260,11 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 	} {
 		t.Run("pinned-engine/"+failure.file, func(t *testing.T) {
 			id := strconv.Itoa(1150 + index)
-			start(id, failure.file, "1", "")
-			status := terminal(id, protocol.RunFailed, proofWait)
+			runtime.Start(t, id, conformance.Fixture{
+				File:     failure.file,
+				Settings: json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`),
+			})
+			status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
 			require.Equal(t, protocol.FailureStartup, status.FailurePhase)
 			require.Contains(t, status.ErrorMessage, failure.diagnostic)
 			t.Logf("%s: %s", failure.file, status.ErrorMessage)
