@@ -152,8 +152,8 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	if err := a.check(ctx, run, nil, "inspect", entry); err != nil {
 		return err
 	}
-	// With resolution disabled, inspect accepts unsatisfied "use k6"
-	// constraints. Ask the pinned engine to check them; never parse JS here.
+	// With resolution disabled, inspect skips version constraints.
+	// Use k6's dependency checker to validate them.
 	var output bytes.Buffer
 	if err := a.check(ctx, run, &output, "deps", "--json", entry); err != nil {
 		return err
@@ -175,10 +175,7 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	return nil
 }
 
-func (a *Adapter) BuildCommand(ctx context.Context, run agent.RunContext) (agent.Command, error) {
-	if err := ctx.Err(); err != nil {
-		return agent.Command{}, err
-	}
+func (a *Adapter) BuildCommand(_ context.Context, run agent.RunContext) (agent.Command, error) {
 	if run.RunID == "" || a.preparedRun != run.RunID {
 		return agent.Command{}, fmt.Errorf("run %q has not been prepared", run.RunID)
 	}

@@ -96,8 +96,6 @@ func TestCancellationAndAssignmentFailures(t *testing.T) {
 	require.ErrorIs(t, a.BeforeStart(ctx, run), context.Canceled)
 	require.Equal(t, []string{run.RunID}, r.resets)
 	require.NoFileExists(t, filepath.Join(run.Workspace.Temp, "entry.js"))
-	_, err := a.BuildCommand(ctx, run)
-	require.ErrorIs(t, err, context.Canceled)
 	for _, mode := range []protocol.PartitionMode{protocol.PartitionNative, "", "unknown"} {
 		run.Artifacts = map[string]protocol.ArtifactAssignment{"data.csv": {Mode: mode}}
 		require.ErrorContains(t, a.BeforeStart(context.Background(), run), "partition mode")
