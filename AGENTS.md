@@ -27,11 +27,11 @@
 
 For the k6 adapter, group request metrics by the CSV `url` value, subject to the byte limit and admission policy below:
 
-- Use the URL as `label` for latency histograms and status counters. Repeated labels accumulate together; distinct values remain separate within the label budget unless byte-limit truncation makes their prefixes identical.
+- Use the URL as `label` for latency histograms and status counters. Repeated valid labels accumulate together; distinct values remain separate within the label budget.
 - Do not collapse request metrics under an engine-wide `k6` label. Missing URL attribution for received bytes is not a reason to discard URL attribution from latency or status metrics.
-- Do not substitute the CSV `name` column, normalize paths, or remove query strings apart from byte-limit truncation. k6 can rewrite the `url` tag when a script uses custom name/grouping options; do not invent a discarded original URL.
-- Preserve emitted values shorter than 1024 bytes exactly. Truncate longer URLs or grouping names to their longest complete UTF-8 prefix of at most 1023 bytes before admission. Identical resulting prefixes intentionally share metrics and one slot; never split a multibyte character or retain oversized originals in admission state.
-- Apply the same label admission decision to latency and status. Admit the first `label_limit` distinct resulting labels per run, keep admitted labels stable, and fold additional labels into `others`. A zero limit folds all request labels into `others`.
+- Do not substitute the CSV `name` column, normalize paths, truncate values, or remove query strings. k6 can rewrite the `url` tag when a script uses custom name/grouping options; do not invent a discarded original URL.
+- Validate request labels with the SDK's `agent.ShibuyaMetric.LabelIsValid()`. Preserve valid values exactly. Drop an oversized `http_req_duration` sample, including both its latency observation and status count, before admission without failing the run. Labels of 1024 bytes or more must not consume slots, enter overflow, or merge into shorter prefixes. This applies equally to URLs and grouping names; independent byte and VU samples remain unaffected.
+- Apply the same label admission decision to latency and status. Admit the first `label_limit` distinct valid labels per run, keep admitted labels stable, and fold additional valid labels into `others`. A zero limit folds all valid request labels into `others`; it does not bypass label validation.
 - Bound admission state by the label limit and clear it on every run reset, together with metric collectors. Keep run, plan, collection, agent and zone identity in their own schema labels.
 
 ## Preserve metric attribution boundaries
@@ -62,7 +62,7 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 - Retain both `url` and `status` in k6 `systemTags`, including when a plan supplies an explicit tag list; preserve the other requested tags.
 - Parse CSV with `encoding/csv`, locate required columns by name, and reject missing URL columns or empty URLs on HTTP duration samples. Non-request samples may have empty URL fields.
-- Regression coverage must distinguish multiple URLs, repeated requests to one URL, query-string variants, and URL versus name columns. Cover UTF-8-safe byte-limit truncation, custom grouping names, intentional prefix merging, overflow, zero budget, reset, independent status counts, and aggregate-only bytes.
+- Regression coverage must distinguish multiple URLs, repeated requests to one URL, query-string variants, and URL versus name columns. Cover ASCII and multibyte byte-length boundaries, oversized-sample rejection before admission, custom grouping names, no prefix merging, overflow, zero budget, reset, independent status counts, and aggregate-only bytes.
 - For metrics behavior changes, run `make -C k6 test-unit` and container-only `make -C k6 test-conformance` from the repository root, plus a live smoke when adding behavior not exercised by conformance. Never run the integration binary directly on the host; it owns fixed ports and `/test-data`.
 - Keep [the metrics documentation](k6/README.md#url-grouped-request-metrics), exporter tests, and live conformance assertions aligned with these semantics.
 

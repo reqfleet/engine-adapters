@@ -19,7 +19,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
@@ -98,20 +97,20 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	add("extension-directive.js", extensionDirectivePlan)
 	add("labels.js", `import http from 'k6/http'; import {sleep} from 'k6';
 export default function(){for(const path of ['/200','/200','/200?item=a','/200?item=b','/500','/overflow','/overflow?item=c'])http.get('http://127.0.0.1:18080'+path);sleep(0.2);}`)
-	// Oversized URLs and custom names intentionally share truncated prefixes.
+	// Oversized URLs and custom names must not merge into their valid prefixes.
 	boundaryPrefix := conformance.TargetURL + "/200?padding="
 	boundaryURL := boundaryPrefix + strings.Repeat("a", 1023-len(boundaryPrefix))
 	groupedPrefix := "group/" + strings.Repeat("界", 338) + "ab"
 	add("long-labels.js", fmt.Sprintf(`import http from 'k6/http'; import {sleep} from 'k6';
 const urls=[%q,%q,%q,%q,%q];
-const names=[%q,%q];
+const names=[%q,%q,%q];
 export default function(){
   for(const url of urls)http.get(url);
   for(const name of names)http.get(%q,{tags:{name}});
   sleep(0.2);
 }`,
 		boundaryURL+"b", boundaryURL+"bc", boundaryURL, boundaryURL, conformance.TargetURL+"/500",
-		groupedPrefix+"界", groupedPrefix+"界suffix", conformance.TargetURL+"/200"))
+		groupedPrefix+"界", groupedPrefix+"界suffix", groupedPrefix, conformance.TargetURL+"/200"))
 	settings := json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)
 	fixture := conformance.Fixture{File: "labels.js", Settings: settings}
 	longLabels := conformance.Fixture{File: "long-labels.js", Settings: settings}
@@ -445,9 +444,8 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 			url := row[columns["url"]]
 			require.NotEmpty(t, url, "duration rows must retain their request URL")
 			require.Equal(t, "GET", row[columns["method"]], "existing system tags must be preserved")
-			for len(url) >= 1024 {
-				_, size := utf8.DecodeLastRuneInString(url)
-				url = url[:len(url)-size]
+			if len(url) >= 1024 {
+				continue
 			}
 			if !admitted[url] {
 				if len(admitted) < labelLimit {
