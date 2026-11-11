@@ -95,8 +95,9 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	add("extension.js", extensionPlan)
 	add("engine-version.js", incompatiblePlan)
 	add("extension-directive.js", extensionDirectivePlan)
+	// An existing overflow name must not take one of the four named slots.
 	add("labels.js", `import http from 'k6/http'; import {sleep} from 'k6';
-export default function(){for(const path of ['/200','/200','/200?item=a','/200?item=b','/500','/overflow','/overflow?item=c'])http.get('http://127.0.0.1:18080'+path);sleep(0.2);}`)
+export default function(){http.get('http://127.0.0.1:18080/200',{tags:{name:'others'}});for(const path of ['/200','/200','/200?item=a','/200?item=b','/500','/overflow','/overflow?item=c'])http.get('http://127.0.0.1:18080'+path);sleep(0.2);}`)
 	// Oversized URLs and custom names must not merge into their valid prefixes.
 	boundaryPrefix := conformance.TargetURL + "/200?padding="
 	boundaryURL := boundaryPrefix + strings.Repeat("a", 1023-len(boundaryPrefix))
@@ -447,7 +448,7 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 			if len(url) >= 1024 {
 				continue
 			}
-			if !admitted[url] {
+			if url != "others" && !admitted[url] {
 				if len(admitted) < labelLimit {
 					admitted[url] = true
 				} else {

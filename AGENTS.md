@@ -31,7 +31,7 @@ For the k6 adapter, group request metrics by the CSV `url` value, subject to the
 - Do not collapse request metrics under an engine-wide `k6` label. Missing URL attribution for received bytes is not a reason to discard URL attribution from latency or status metrics.
 - Do not substitute the CSV `name` column, normalize paths, truncate values, or remove query strings. k6 can rewrite the `url` tag when a script uses custom name/grouping options; do not invent a discarded original URL.
 - Validate request labels with the SDK's `agent.ShibuyaMetric.LabelIsValid()`. Preserve valid values exactly. Drop an oversized `http_req_duration` sample, including both its latency observation and status count, before admission without failing the run. Labels of 1024 bytes or more must not consume slots, enter overflow, or merge into shorter prefixes. This applies equally to URLs and grouping names; independent byte and VU samples remain unaffected.
-- Apply the same label admission decision to latency and status. Admit the first `label_limit` distinct valid labels per run, keep admitted labels stable, and fold additional valid labels into `others`. A zero limit folds all valid request labels into `others`; it does not bypass label validation.
+- Apply the same label admission decision to latency and status with the SDK's `metricschema.AdmitRequestLabel`; use `metricschema.OverflowLabel` instead of an adapter-local overflow string. Admit the first `label_limit` distinct valid named labels per run, keep admitted labels stable, and fold additional valid labels into `others`. The reserved overflow name never consumes a slot. A zero limit folds all valid request labels into `others`; it does not bypass label validation.
 - Bound admission state by the label limit and clear it on every run reset, together with metric collectors. Keep run, plan, collection, agent and zone identity in their own schema labels.
 
 ## Preserve metric attribution boundaries
@@ -118,12 +118,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.0`. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261111232624-bb2a942bd45d`, the SDK commit providing shared request-label admission. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.0 \
-  -t k6-adapter:sdk-v0.5.0 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261111232624-bb2a942bd45d \
+  -t k6-adapter:sdk-bb2a942 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
