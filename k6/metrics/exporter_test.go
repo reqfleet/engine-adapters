@@ -17,6 +17,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	"github.com/reqfleet/engine-adapters/conformance"
 	"github.com/reqfleet/engine-sdk/agent"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
@@ -292,6 +293,72 @@ func TestZeroURLBudgetAggregatesRequestsAndBytesSeparately(t *testing.T) {
 	appendCSV(t, run, "http_req_duration,5,200,\n")
 	_, err := e.Observe(context.Background(), run)
 	require.Error(t, err, "a zero budget does not make request URLs optional")
+}
+
+func TestURLByteLimitPreservesCountsAndAdmission(t *testing.T) {
+	for _, encoding := range []struct {
+		name, character string
+	}{
+		{"ASCII", "a"},
+		{"UTF8", "界"},
+	} {
+		for _, budget := range []int{1, 0} {
+			t.Run(fmt.Sprintf("%s/budget=%d", encoding.name, budget), func(t *testing.T) {
+				e, run := fixture(t, budget)
+				for _, revision := range []string{"first", "second"} {
+					// A different boundary URL must claim the slot after reset.
+					prefix := "https://example.test/" + revision + "/"
+					padding := 1023 - len(prefix)
+					valid := prefix + strings.Repeat(encoding.character, padding/len(encoding.character)) +
+						strings.Repeat("a", padding%len(encoding.character))
+					atLimit, overLimit := valid+"b", valid+"bc"
+					run.RunID = revision
+					e.Reset(run)
+					putCSV(t, run, csvHeader+fmt.Sprintf(
+						"data_received,10,,\n"+
+							"vus,2,,\n"+
+							"http_req_duration,1,200,%s\n"+
+							"http_req_duration,2,500,%s\n"+
+							"http_req_duration,3,201,%s\n"+
+							"http_req_duration,4,200,https://example.test/overflow\n"+
+							"http_req_duration,5,500,%s\n"+
+							"http_req_duration,6,200,%s\n"+
+							"http_req_duration,7,500,%s\n"+
+							"http_req_duration,8,200,https://example.test/overflow\n"+
+							"data_received,5,,\n",
+						atLimit, overLimit, valid, atLimit, overLimit, valid))
+					state, err := e.Observe(context.Background(), run)
+					require.NoError(t, err)
+					require.Equal(t, protocol.ObservationReady, state)
+					requests := map[string]conformance.RequestExpectation{
+						valid:    {Statuses: map[string]uint64{"201": 1, "500": 1}, LatenciesMS: []float64{3, 7}},
+						"others": {Statuses: map[string]uint64{"200": 4, "500": 2}, LatenciesMS: []float64{1, 2, 4, 5, 6, 8}},
+					}
+					byteLabel := "k6"
+					if budget == 0 {
+						requests = map[string]conformance.RequestExpectation{
+							"others": {Statuses: map[string]uint64{"200": 4, "201": 1, "500": 3}, LatenciesMS: []float64{1, 2, 3, 4, 5, 6, 7, 8}},
+						}
+						byteLabel = "others"
+					}
+					concurrency := float64(2)
+					expected := conformance.MetricsExpectation{
+						Identity: conformance.MetricIdentity{
+							CollectionID: run.CollectionID, PlanID: run.PlanID, RunID: run.RunID,
+							EngineNo: run.AgentID, Zone: run.Zone,
+						},
+						Requests: requests, Bytes: map[string]float64{byteLabel: 15}, Concurrency: &concurrency,
+						Resources: conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
+					}
+					for range 2 {
+						response := scrape(e)
+						require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+						conformance.AssertMetrics(t, response.Body.String(), expected)
+					}
+				}
+			})
+		}
+	}
 }
 
 func TestPartialLogicalRecordsAreRetriedExactlyOnce(t *testing.T) {

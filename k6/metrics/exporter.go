@@ -390,6 +390,11 @@ func transportErrorStatus(code uint64) string {
 }
 
 func (e *Exporter) requestLabel(url string) string {
+	// shibuya-v1 limits labels by bytes, not runes. Fold before admission so
+	// oversized URLs preserve request totals without retaining URL storage.
+	if len(url) >= 1024 {
+		return "others"
+	}
 	if label, admitted := e.urlLabels[url]; admitted {
 		return label
 	}
