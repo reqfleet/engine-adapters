@@ -1,5 +1,9 @@
 # Repository Instructions
 
+## Pull request mentions
+
+- Check the PR author's username before tagging `@iandyh`. Only tag `@iandyh` when the PR author is not `andyh`; never tag `@iandyh` on a PR authored by `andyh`.
+
 ## Release management
 
 - Use release-please to manage releases and generate changelog updates.
