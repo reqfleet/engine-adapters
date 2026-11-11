@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -390,6 +391,17 @@ func transportErrorStatus(code uint64) string {
 }
 
 func (e *Exporter) requestLabel(url string) string {
+	// k6's CSV url tag may already be a plan-defined name/grouping value,
+	// rather than the requested URL. The original URL is unavailable here.
+	// shibuya-v1 requires fewer than 1024 bytes. Preserve a UTF-8-safe prefix
+	// before admission; distinct values with the same prefix share metrics.
+	if len(url) >= 1024 {
+		end := 1023
+		for end > 0 && !utf8.RuneStart(url[end]) {
+			end--
+		}
+		url = url[:end]
+	}
 	if label, admitted := e.urlLabels[url]; admitted {
 		return label
 	}
