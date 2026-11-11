@@ -6,6 +6,8 @@ Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), 
 
 Upload a single bundled JavaScript HTTP test with a default function. Optional named `setup` and `teardown` functions are forwarded, including setup data. Native imports such as `k6/http`, `k6` and `k6/data` remain native imports. Bundle third-party JavaScript helpers into the primary `.js` before uploading; extra modules, arbitrary directory archives, browser/gRPC reporting and uploaded dependency manifests are not supported. Custom `handleSummary` is deliberately not forwarded: results use the adapter's CSV-normalization path.
 
+Plans run only on the checksum-pinned k6 binary packaged in the image. Automatic extension resolution is disabled for inspection, dependency checking and workload execution, even if the deployment sets `K6_AUTO_EXTENSION_RESOLUTION=true`. Unsupported `k6/x/...` imports and `"use k6 ..."` requirements that need a different engine or extension fail preparation with readable diagnostics; the adapter never provisions a replacement binary. Compatible engine constraints remain supported. Select and verify a different engine at image build time, not through an uploaded plan; custom-binary support requires a separate provenance, licensing and conformance contract.
+
 [Minimal HTTP example](testdata/http.js):
 
 ```js
@@ -38,9 +40,11 @@ The three numeric settings are required. Missing, null, nonstring, negative, sig
 
 Collection scheduling owns these options: `scenarios`, `vus`, `duration`, `iterations`, `stages`, `executionSegment`, `executionSegmentSequence`. Presence of any on uploaded `options`, even null, fails inside k6 with `k6 scheduling options are managed by the collection`. A missing default function fails with `k6 plan must export a default function`. Other options, including native threshold selectors, are retained. If `options.systemTags` is explicit, it must be an array; the wrapper adds missing `status`, `url` and `error_code` tags without discarding other tags. Default k6 tags remain unchanged when it is absent.
 
-The adapter creates `Workspace.Temp/entry.js` atomically and leaves `/test-data/script.js` byte-for-byte original. Preparation respects cancellation and invalidates previously prepared run IDs. Only that successfully prepared run ID may build a command.
+The adapter creates `Workspace.Temp/entry.js` atomically and leaves `/test-data/script.js` byte-for-byte original. Preparation respects cancellation and invalidates previously prepared run IDs. Only that successfully prepared run ID may build a command. Command construction does not launch a process; the SDK checks cancellation immediately before launch.
 
 Before marking the run prepared, `BeforeStart` executes `/usr/local/bin/k6 inspect <generated-entry-path>` in `Workspace.Inputs`. Inspection errors, including k6's syntax diagnostics and source location, are returned through the SDK startup failure to the control plane rather than only logged. Cancellation terminates inspection. Inspection evaluates init code (again when the actual run starts), but does not execute setup, VU iterations or teardown; plans must allow repeated init evaluation.
+
+After inspection, `/usr/local/bin/k6 deps --json <generated-entry-path>` checks whether the packaged binary satisfies the plan's dependencies. This separate check is necessary because k6 skips version-constraint enforcement during inspection when automatic resolution is disabled. A custom-build requirement, dependency-check error or missing compatibility result fails preparation. Image overrides must support this dependency-check command and JSON contract; unsupported versions fail closed rather than silently ignoring requirements.
 
 Inspection stdout is discarded. Stderr capture is limited to its final 16 KiB while excess output is drained; oversized diagnostics include a truncation marker. This bounds memory and error payloads while retaining the final diagnostic after verbose init logging.
 
@@ -50,7 +54,7 @@ Command execution is direct, not shell interpolation:
 /usr/local/bin/k6 run --no-usage-report --out csv=<run.ResultFile> <generated-entry-path>
 ```
 
-Working directory is `Workspace.Inputs`; `K6_CSV_SAVE_INTERVAL=1s` is explicit. The SDK owns process groups, wait/reap, cancellation, SIGTERM and the default ten-second escalation timeout. Nonzero k6 exits, including threshold failures, remain failures rather than being reported as successful load tests. No second process supervisor runs here.
+Working directory is `Workspace.Inputs`; `K6_CSV_SAVE_INTERVAL=1s` and `K6_AUTO_EXTENSION_RESOLUTION=false` are explicit for all three invocations. The SDK owns process groups, wait/reap, cancellation, SIGTERM and the default ten-second escalation timeout. Nonzero k6 exits, including threshold failures, remain failures rather than being reported as successful load tests. No second process supervisor runs here.
 
 ## CSV inputs
 
@@ -154,5 +158,7 @@ The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA
 Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, selected SDK version, selected k6 version, metrics shibuya-v1)` tuple and live smoke results before production use.
 
 The adapter's `k6/conformance` tests consume the shared `conformance` package. Its container suite exercises SDK lifecycle and authenticated serving, validates normalized metrics against real k6 CSV output, and runs positive-overflow, zero-label-budget and 1023/1024/1025-byte URL scenarios, including custom Unicode grouping names, intentional prefix merging and unchanged aggregate-only bytes. k6-specific hooks, scheduling, assignment and transport-error cases remain in the adapter's tests. `make -C k6 test-unit` also runs the shared metrics validator's unit tests and validates exporter exposition for ASCII and multibyte UTF-8 URL boundaries, truncation within a multibyte character, repeated samples, positive/zero budgets and reset. See [the reusable suite contract](../AGENTS.md#reusable-adapter-conformance) when adding another adapter.
+
+Pinned-engine regressions use a controlled local build-service peer inside the network-isolated container. Positive controls prove that unsupported imports and engine/extension requirements can provision and execute the peer's marker executable without the adapter policy. Adapter runs must make zero provisioning/download requests and never execute that replacement, including with a conflicting inherited resolution setting. Unsupported-plan cases report protocol and terminal-state failures through their own subtests. A post-preparation source mutation independently exercises the workload invocation's guard; ordinary HTTP plans and compatible version constraints still pass the real-engine lifecycle and metrics checks.
 
 The container target first runs shared runtime regressions with a small SDK-based workload, covering completion before the first progress poll, reaping exited orphans while the adapter remains active, and cleanup of descendants in separate process groups/sessions. It then runs the real k6 suite. The shared validator's unit tests cover retained-series uniqueness, histogram invariants, request-label byte limits and optional LLM response histograms; k6 itself continues to report the HTTP metrics described above.

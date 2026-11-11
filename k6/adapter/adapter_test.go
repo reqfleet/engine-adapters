@@ -66,7 +66,7 @@ func TestPreparationAndCommand(t *testing.T) {
 	r := &reporter{}
 	a := New(r)
 	a.executable = filepath.Join(t.TempDir(), "k6")
-	require.NoError(t, os.WriteFile(a.executable, []byte("#!/bin/sh\nexit 0\n"), 0700))
+	require.NoError(t, os.WriteFile(a.executable, []byte("#!/bin/sh\nprintf '{\"customBuildRequired\":false}\\n'\n"), 0700))
 	_, err := a.BuildCommand(context.Background(), run)
 	require.Error(t, err)
 	run.Artifacts = map[string]protocol.ArtifactAssignment{"copy.csv": {Mode: protocol.PartitionReplicated}, "split.csv": {Mode: protocol.PartitionMaterialized}}
@@ -96,8 +96,6 @@ func TestCancellationAndAssignmentFailures(t *testing.T) {
 	require.ErrorIs(t, a.BeforeStart(ctx, run), context.Canceled)
 	require.Equal(t, []string{run.RunID}, r.resets)
 	require.NoFileExists(t, filepath.Join(run.Workspace.Temp, "entry.js"))
-	_, err := a.BuildCommand(ctx, run)
-	require.ErrorIs(t, err, context.Canceled)
 	for _, mode := range []protocol.PartitionMode{protocol.PartitionNative, "", "unknown"} {
 		run.Artifacts = map[string]protocol.ArtifactAssignment{"data.csv": {Mode: mode}}
 		require.ErrorContains(t, a.BeforeStart(context.Background(), run), "partition mode")

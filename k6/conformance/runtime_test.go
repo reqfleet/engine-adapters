@@ -37,6 +37,7 @@ const (
 )
 
 func TestPublicK6Runtime(t *testing.T) {
+	provisioning := newProvisioningPeer(t)
 	requests := &proofRequests{}
 	inflight := make(chan struct{}, 1)
 	inflightEnded := make(chan struct{}, 1)
@@ -70,7 +71,7 @@ func TestPublicK6Runtime(t *testing.T) {
 	})
 	artifacts := map[string]string{}
 	add := func(name, body string) { artifacts[name] = body }
-	firstSource := httpScript("first", true)
+	firstSource := "\"use k6 >= 2.0.0 < 3.0.0\";\n" + httpScript("first", true)
 	add("first.js", firstSource)
 	add("second.js", httpScript("second", false))
 	add("threshold.js", `import http from 'k6/http'; import {sleep} from 'k6';
@@ -92,6 +93,9 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 	add("syntax.js", "export default function(")
 	add("tags.js", "export const options={systemTags:'status'};export default function(){}")
 	add("verbose.js", `console.log("x".repeat(1024*1024)); throw new Error("verbose init failure"); export default function(){}`)
+	add("extension.js", extensionPlan)
+	add("engine-version.js", incompatiblePlan)
+	add("extension-directive.js", extensionDirectivePlan)
 	add("labels.js", `import http from 'k6/http'; import {sleep} from 'k6';
 export default function(){for(const path of ['/200','/200','/200?item=a','/200?item=b','/500','/overflow','/overflow?item=c'])http.get('http://127.0.0.1:18080'+path);sleep(0.2);}`)
 	// Oversized URLs and custom names intentionally share truncated prefixes.
@@ -112,7 +116,7 @@ export default function(){
 	fixture := conformance.Fixture{File: "labels.js", Settings: settings}
 	longLabels := conformance.Fixture{File: "long-labels.js", Settings: settings}
 	conformance.Run(t, conformance.Contract{
-		Executable:    "/usr/local/bin/k6-adapter",
+		Executable:    provisioning.adapterLauncher(t),
 		Artifacts:     artifacts,
 		DataArtifacts: map[string]string{conformance.DataArtifactPath(t, "rows.csv"): "row-a\nrow-b\n"},
 		Target:        target,
@@ -138,8 +142,10 @@ export default function(){
 		},
 		Scenarios: func(t *testing.T, runtime *conformance.Runtime) {
 			runK6Scenarios(t, runtime, requests, inflight, inflightEnded, firstSource)
+			provisioning.assertUnused(t, runtime.Root)
 		},
 	})
+	require.Zero(t, provisioning.requests.Load())
 }
 
 func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofRequests, inflight, inflightEnded <-chan struct{}, firstSource string) {
@@ -266,6 +272,23 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 		default:
 			require.Contains(t, status.ErrorMessage, "k6 scheduling options are managed by the collection")
 		}
+	}
+	for index, failure := range []struct{ file, diagnostic string }{
+		{"extension.js", "k6/x/faker"},
+		{"engine-version.js", "k6:>999.0.0"},
+		{"extension-directive.js", "k6/x/faker:>=1.0.0"},
+	} {
+		t.Run("pinned-engine/"+failure.file, func(t *testing.T) {
+			id := strconv.Itoa(1150 + index)
+			runtime.Start(t, id, conformance.Fixture{
+				File:     failure.file,
+				Settings: json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`),
+			})
+			status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
+			require.Equal(t, protocol.FailureStartup, status.FailurePhase)
+			require.Contains(t, status.ErrorMessage, failure.diagnostic)
+			t.Logf("%s: %s", failure.file, status.ErrorMessage)
+		})
 	}
 	for index, mode := range []protocol.PartitionMode{protocol.PartitionNative, protocol.PartitionReplicated, protocol.PartitionMaterialized} {
 		id := strconv.Itoa(1200 + index)
