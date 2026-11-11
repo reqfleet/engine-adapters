@@ -295,7 +295,7 @@ func TestZeroURLBudgetAggregatesRequestsAndBytesSeparately(t *testing.T) {
 	require.Error(t, err, "a zero budget does not make request URLs optional")
 }
 
-func TestURLByteLimitPreservesCountsAndAdmission(t *testing.T) {
+func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 	for _, encoding := range []struct {
 		name, character string
 	}{
@@ -312,14 +312,20 @@ func TestURLByteLimitPreservesCountsAndAdmission(t *testing.T) {
 					valid := prefix + strings.Repeat(encoding.character, padding/len(encoding.character)) +
 						strings.Repeat("a", padding%len(encoding.character))
 					atLimit, overLimit := valid+"b", valid+"bc"
-					// Distinct oversized values intentionally share the valid prefix.
+					// Oversized values must not merge into their valid prefix.
 					run.RunID = revision
 					e.Reset(run)
 					putCSV(t, run, csvHeader+fmt.Sprintf(
+						"http_req_duration,1,200,%s\n"+
+							"http_req_duration,2,500,%s\n",
+						atLimit, overLimit))
+					state, err := e.Observe(context.Background(), run)
+					require.NoError(t, err)
+					require.Equal(t, protocol.ObservationPending, state)
+					require.Equal(t, http.StatusServiceUnavailable, scrape(e).Code)
+					appendCSV(t, run, fmt.Sprintf(
 						"data_received,10,,\n"+
 							"vus,2,,\n"+
-							"http_req_duration,1,200,%s\n"+
-							"http_req_duration,2,500,%s\n"+
 							"http_req_duration,3,201,%s\n"+
 							"http_req_duration,4,200,https://example.test/overflow\n"+
 							"http_req_duration,5,500,%s\n"+
@@ -327,18 +333,18 @@ func TestURLByteLimitPreservesCountsAndAdmission(t *testing.T) {
 							"http_req_duration,7,500,%s\n"+
 							"http_req_duration,8,200,https://example.test/overflow\n"+
 							"data_received,5,,\n",
-						atLimit, overLimit, valid, atLimit, overLimit, valid))
-					state, err := e.Observe(context.Background(), run)
+						valid, atLimit, overLimit, valid))
+					state, err = e.Observe(context.Background(), run)
 					require.NoError(t, err)
 					require.Equal(t, protocol.ObservationReady, state)
 					requests := map[string]conformance.RequestExpectation{
-						valid:    {Statuses: map[string]uint64{"200": 2, "201": 1, "500": 3}, LatenciesMS: []float64{1, 2, 3, 5, 6, 7}},
+						valid:    {Statuses: map[string]uint64{"201": 1, "500": 1}, LatenciesMS: []float64{3, 7}},
 						"others": {Statuses: map[string]uint64{"200": 2}, LatenciesMS: []float64{4, 8}},
 					}
 					byteLabel := "k6"
 					if budget == 0 {
 						requests = map[string]conformance.RequestExpectation{
-							"others": {Statuses: map[string]uint64{"200": 4, "201": 1, "500": 3}, LatenciesMS: []float64{1, 2, 3, 4, 5, 6, 7, 8}},
+							"others": {Statuses: map[string]uint64{"200": 2, "201": 1, "500": 1}, LatenciesMS: []float64{3, 4, 7, 8}},
 						}
 						byteLabel = "others"
 					}
@@ -364,7 +370,7 @@ func TestURLByteLimitPreservesCountsAndAdmission(t *testing.T) {
 
 func TestURLByteLimitPreservesUTF8GroupingNames(t *testing.T) {
 	e, run := fixture(t, 2)
-	// A three-byte rune crosses the cutoff in 1024- and 1025-byte names.
+	// Reject 1024- and 1025-byte names rather than trimming their final rune.
 	first := strings.Repeat("界", 340) + "a"
 	second := first + "a"
 	putCSV(t, run, csvHeader+fmt.Sprintf(
@@ -381,8 +387,8 @@ func TestURLByteLimitPreservesUTF8GroupingNames(t *testing.T) {
 			EngineNo: run.AgentID, Zone: run.Zone,
 		},
 		Requests: map[string]conformance.RequestExpectation{
-			first:  {Statuses: map[string]uint64{"200": 1, "201": 1}, LatenciesMS: []float64{1, 3}},
-			second: {Statuses: map[string]uint64{"500": 1, "200": 1}, LatenciesMS: []float64{2, 4}},
+			first:  {Statuses: map[string]uint64{"201": 1}, LatenciesMS: []float64{3}},
+			second: {Statuses: map[string]uint64{"200": 1}, LatenciesMS: []float64{4}},
 		},
 		Resources: conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
 	})
