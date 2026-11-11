@@ -148,6 +148,12 @@ Before publishing an override, build the `conformance` target with the same argu
 
 ## Responsibilities and manual onboarding
 
+### Review an adapter
+
+Invoke [`review-engine-adapter`](.agents/skills/review-engine-adapter/SKILL.md) for an evidence-backed onboarding review. It starts by asking which adapter to inspect, then investigates license suitability for the intended Reqfleet use, conformance coverage and execution evidence, and the path from native engine output to normalized metrics.
+
+The review is read-only apart from disposable verification artifacts. It identifies obligations, reporting risks and missing evidence; it does not grant legal, release or deployment approval. Use [`develop-new-engine`](.agents/skills/develop-new-engine/SKILL.md) when implementation work is requested.
+
 ### Adapter author
 
 1. Use SDK callbacks (`BeforeStart`, `BuildCommand`, `Observe`) and let the SDK own downloads, run isolation, process launch/wait, cancellation and escalation. Do not implement a second supervisor.
