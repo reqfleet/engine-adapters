@@ -175,6 +175,31 @@ Run a real deployment smoke through API upload, collection creation, launch, tri
 
 Upload one bundled `.js` plus optional CSVs, choose per-agent VUs, duration in minutes, rampup seconds and engine count, then trigger and inspect URL-grouped request latency and status counts. Received bytes remain an agent/run aggregate because k6 does not attribute those samples to request URLs. Two engines with concurrency 2 produce four total VUs; the adapter never divides that assignment again. See [the detailed contract and examples](k6/README.md).
 
+## Commit and open a pull request
+
+Create a topic branch, run the new adapter's unit and container conformance targets, and document the metric mapping and actual test results. Stage only intended files. For example, for a new engine named `myengine` (replace it with your engine's name):
+
+```sh
+git switch -c feat/myengine-adapter
+# Implement and verify the adapter, including CI and release wiring.
+git add myengine/
+# Also stage the specific shared module, CI and release configuration files you changed.
+git diff --cached
+git commit -m "feat(myengine): add engine adapter"
+git push -u origin HEAD
+gh pr create --base main --title "feat(myengine): add engine adapter" \
+  --body "Describe the change, metrics contract, verification results and compatibility limits."
+```
+
+Use your fork as `origin` if you lack push access, and target `reqfleet/engine-adapters:main`. Follow the Conventional Commit rules in [Releases and compatibility](#releases-and-compatibility), and keep the PR title conventional for squash merges. Do not manually bump versions or edit changelogs.
+
+After opening the PR:
+
+- First, tag @iandyh in a PR comment to request review.
+- Address failed CI checks and review feedback; include unit/race tests, real-engine container conformance and release wiring for any new adapter.
+- Coordinate required Shibuya integration testing with the Reqfleet team before rollout; adapter container conformance does not replace it.
+- Follow [Releases and compatibility](#releases-and-compatibility) for release PRs and publication. Check publication success and the immutable digest in the workflow summary, then follow the [operator rollout requirements](#operator).
+
 ## Releases and compatibility
 
 PR CI runs race/unit tests and Docker conformance. On each push to `main`, [the release workflow](.github/workflows/publish.yml) runs release-please using [the component configuration](release-please-config.json) and [the version manifest](.release-please-manifest.json). Each adapter has its own version and release PR; there is no repository-wide adapter version or coupling to upstream engine versions.
