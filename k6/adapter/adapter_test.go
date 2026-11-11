@@ -66,7 +66,7 @@ func TestPreparationAndCommand(t *testing.T) {
 	r := &reporter{}
 	a := New(r)
 	a.executable = filepath.Join(t.TempDir(), "k6")
-	require.NoError(t, os.WriteFile(a.executable, []byte("#!/bin/sh\nexit 0\n"), 0700))
+	require.NoError(t, os.WriteFile(a.executable, []byte("#!/bin/sh\nprintf '{\"customBuildRequired\":false}\\n'\n"), 0700))
 	_, err := a.BuildCommand(context.Background(), run)
 	require.Error(t, err)
 	run.Artifacts = map[string]protocol.ArtifactAssignment{"copy.csv": {Mode: protocol.PartitionReplicated}, "split.csv": {Mode: protocol.PartitionMaterialized}}

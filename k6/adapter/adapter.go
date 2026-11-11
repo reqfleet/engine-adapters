@@ -2,9 +2,11 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -147,24 +149,27 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	if err := writeAtomic(ctx, entry, content); err != nil {
 		return fmt.Errorf("prepare k6 wrapper: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, a.executable, "inspect", entry)
-	cmd.Dir = run.Workspace.Inputs
-	cmd.Env = append(os.Environ(), "K6_CSV_SAVE_INTERVAL=1s")
-	var stderr inspectionStderr
-	cmd.Stderr = &stderr
-	// A nil Stdout discards inspect's options JSON without buffering it.
-	err = cmd.Run()
-	// CommandContext can return "signal: killed" on cancellation; preserve the
-	// context error rather than reporting it as a plan inspection failure.
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if err := a.check(ctx, run, nil, "inspect", entry); err != nil {
+		return err
 	}
-	if err != nil {
-		detail := strings.TrimSpace(string(stderr.data[:stderr.used]))
-		if stderr.truncated {
-			detail = "[stderr truncated; showing final 16 KiB]\n" + detail
-		}
-		return fmt.Errorf("k6 inspect failed: %w: %s", err, detail)
+	// With resolution disabled, inspect accepts unsatisfied "use k6"
+	// constraints. Ask the pinned engine to check them; never parse JS here.
+	var output bytes.Buffer
+	if err := a.check(ctx, run, &output, "deps", "--json", entry); err != nil {
+		return err
+	}
+	var dependencies struct {
+		CustomBuildRequired *bool             `json:"customBuildRequired"`
+		BuildDependencies   map[string]string `json:"buildDependencies"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &dependencies); err != nil {
+		return fmt.Errorf("k6 dependency check: %w", err)
+	}
+	if dependencies.CustomBuildRequired == nil {
+		return fmt.Errorf("k6 dependency check: missing customBuildRequired")
+	}
+	if *dependencies.CustomBuildRequired {
+		return fmt.Errorf("pinned k6 binary does not satisfy plan dependencies %v; custom binaries and automatic extension resolution are disabled", dependencies.BuildDependencies)
 	}
 	a.preparedRun, a.entry = run.RunID, entry
 	return nil
@@ -177,7 +182,34 @@ func (a *Adapter) BuildCommand(ctx context.Context, run agent.RunContext) (agent
 	if run.RunID == "" || a.preparedRun != run.RunID {
 		return agent.Command{}, fmt.Errorf("run %q has not been prepared", run.RunID)
 	}
-	return agent.Command{Command: a.executable, Args: []string{"run", "--no-usage-report", "--out", "csv=" + run.ResultFile, a.entry}, Dir: run.Workspace.Inputs, Env: []string{"K6_CSV_SAVE_INTERVAL=1s"}}, nil
+	return agent.Command{Command: a.executable, Args: []string{"run", "--no-usage-report", "--out", "csv=" + run.ResultFile, a.entry}, Dir: run.Workspace.Inputs, Env: engineEnv()}, nil
+}
+
+func engineEnv() []string {
+	return []string{"K6_CSV_SAVE_INTERVAL=1s", "K6_AUTO_EXTENSION_RESOLUTION=false"}
+}
+
+func (a *Adapter) check(ctx context.Context, run agent.RunContext, stdout io.Writer, args ...string) error {
+	cmd := exec.CommandContext(ctx, a.executable, args...)
+	cmd.Dir = run.Workspace.Inputs
+	cmd.Env = append(os.Environ(), engineEnv()...)
+	cmd.Stdout = stdout
+	var stderr inspectionStderr
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	// CommandContext can return "signal: killed" on cancellation; preserve the
+	// context error rather than reporting it as a plan validation failure.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		detail := strings.TrimSpace(string(stderr.data[:stderr.used]))
+		if stderr.truncated {
+			detail = "[stderr truncated; showing final 16 KiB]\n" + detail
+		}
+		return fmt.Errorf("k6 %s failed: %w: %s", args[0], err, detail)
+	}
+	return nil
 }
 
 const inspectionStderrLimit = 16 * 1024
