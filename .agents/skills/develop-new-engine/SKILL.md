@@ -104,6 +104,7 @@ k6 writes CSV **independent metric samples**, so it uses an adapter-owned parser
 4. In `BuildCommand`, require the prepared run ID and return an `agent.Command` using an executable and argument vector, appropriate directory and explicit environment overrides. Do not interpolate uploaded values into a shell command.
 5. Implement `Observe` using genuine engine readiness/progress evidence and propagate errors. The SDK owns downloads, workspace isolation, launch, process groups, wait/reap, cancellation, stop escalation and run serialization. Do not add a second process supervisor or turn nonzero engine exits into success.
 6. Produce a non-root Linux image with writable SDK workspace paths, verified engine downloads, required CA certificates, source/license obligations and SDK notices. Use adapter-directory build targets with repository-root Docker context.
+7. You MUST create an adapter-local `Makefile` to manage the build process, following `k6/Makefile` conventions. Provide targets for building the adapter, building its runtime image, unit/race tests (`test-unit`), container-only conformance (`test-conformance`), and both test suites (`test`). Scope Go commands to the adapter and shared conformance tests; keep the repository root as Docker's build context. Document invocation as `make -C <adapter> <target>` from the repository root, or `make <target>` inside the adapter directory.
 
 ## 5. Verify and deliver
 
@@ -122,7 +123,7 @@ Cover these observable behaviors:
 - Unit conversions, compatible histogram buckets/sums/counts, unchanged repeated scrapes, final retained totals, no duplicate ingestion and truthful unavailable values.
 - Natural completion, Stop, cancellation during preparation, duplicate starts, stale stops, failed startup/settings, failed preparation reset, reused-process recovery, non-root execution and assignment modes. Exercise the actual `/metrics` surface and authentication with real lifecycle peers.
 
-Run the adapter's scoped unit/race target and container-only conformance target. For k6 metric changes specifically, run `make -C k6 test-unit` and `make -C k6 test-conformance` from the repository root. Never run the integration binary directly on the host: it owns fixed ports and `/test-data`. Add a live smoke for behavior conformance does not exercise. Container conformance alone does not prove Shibuya onboarding or deployment compatibility.
+Run `make -C <adapter> test-unit` and `make -C <adapter> test-conformance` from the repository root, replacing `<adapter>` with the adapter directory. For k6 metric changes specifically, run `make -C k6 test-unit` and `make -C k6 test-conformance`. Never run the integration binary directly on the host: it owns fixed ports and `/test-data`. Add a live smoke for behavior conformance does not exercise. Container conformance alone does not prove Shibuya onboarding or deployment compatibility.
 
 Keep the adapter README's mappings, limitations and compatibility metadata aligned with implementation. Release-please owns changelogs and versions; do not edit them manually. Add a component and gated conformance/publication jobs for the new adapter, without releasing unrelated images. For shared SDK updates, include compatibility metadata under each affected adapter directory and verify each affected adapter.
 
