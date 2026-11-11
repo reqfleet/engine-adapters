@@ -312,6 +312,7 @@ func TestURLByteLimitPreservesCountsAndAdmission(t *testing.T) {
 					valid := prefix + strings.Repeat(encoding.character, padding/len(encoding.character)) +
 						strings.Repeat("a", padding%len(encoding.character))
 					atLimit, overLimit := valid+"b", valid+"bc"
+					// Distinct oversized values intentionally share the valid prefix.
 					run.RunID = revision
 					e.Reset(run)
 					putCSV(t, run, csvHeader+fmt.Sprintf(
@@ -331,8 +332,8 @@ func TestURLByteLimitPreservesCountsAndAdmission(t *testing.T) {
 					require.NoError(t, err)
 					require.Equal(t, protocol.ObservationReady, state)
 					requests := map[string]conformance.RequestExpectation{
-						valid:    {Statuses: map[string]uint64{"201": 1, "500": 1}, LatenciesMS: []float64{3, 7}},
-						"others": {Statuses: map[string]uint64{"200": 4, "500": 2}, LatenciesMS: []float64{1, 2, 4, 5, 6, 8}},
+						valid:    {Statuses: map[string]uint64{"200": 2, "201": 1, "500": 3}, LatenciesMS: []float64{1, 2, 3, 5, 6, 7}},
+						"others": {Statuses: map[string]uint64{"200": 2}, LatenciesMS: []float64{4, 8}},
 					}
 					byteLabel := "k6"
 					if budget == 0 {
@@ -359,6 +360,32 @@ func TestURLByteLimitPreservesCountsAndAdmission(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestURLByteLimitPreservesUTF8GroupingNames(t *testing.T) {
+	e, run := fixture(t, 2)
+	// A three-byte rune crosses the cutoff in 1024- and 1025-byte names.
+	first := strings.Repeat("界", 340) + "a"
+	second := first + "a"
+	putCSV(t, run, csvHeader+fmt.Sprintf(
+		"http_req_duration,1,200,%s界\n"+
+			"http_req_duration,2,500,%s界\n"+
+			"http_req_duration,3,201,%s\n"+
+			"http_req_duration,4,200,%s\n",
+		first, second, first, second))
+	response := scrape(e)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	conformance.AssertMetrics(t, response.Body.String(), conformance.MetricsExpectation{
+		Identity: conformance.MetricIdentity{
+			CollectionID: run.CollectionID, PlanID: run.PlanID, RunID: run.RunID,
+			EngineNo: run.AgentID, Zone: run.Zone,
+		},
+		Requests: map[string]conformance.RequestExpectation{
+			first:  {Statuses: map[string]uint64{"200": 1, "201": 1}, LatenciesMS: []float64{1, 3}},
+			second: {Statuses: map[string]uint64{"500": 1, "200": 1}, LatenciesMS: []float64{2, 4}},
+		},
+		Resources: conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
+	})
 }
 
 func TestPartialLogicalRecordsAreRetriedExactlyOnce(t *testing.T) {
