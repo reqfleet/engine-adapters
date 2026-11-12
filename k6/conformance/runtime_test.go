@@ -177,16 +177,17 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	resources, err := parser.TextToMetricFamilies(strings.NewReader(firstMetrics))
 	require.NoError(t, err)
-	require.NotContains(t, resources, metricschema.CPUGauge, "the first scrape has no CPU interval")
-	require.Contains(t, resources, metricschema.MemoryGauge)
-	require.Len(t, resources[metricschema.MemoryGauge].Metric, 1)
-	require.Positive(t, resources[metricschema.MemoryGauge].Metric[0].GetGauge().GetValue())
+	require.NotContains(t, resources, metricschema.CPUGauge, "the first scrape only establishes a baseline")
+	require.NotContains(t, resources, metricschema.MemoryGauge, "baseline attempts omit both resources")
 	terminal("1001", protocol.RunCompleted, 90*time.Second)
 	resources, err = parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
 	require.NoError(t, err)
 	require.Contains(t, resources, metricschema.CPUGauge)
 	require.Len(t, resources[metricschema.CPUGauge].Metric, 1)
 	require.Positive(t, resources[metricschema.CPUGauge].Metric[0].GetGauge().GetValue(), "the real k6 run must consume CPU")
+	require.Contains(t, resources, metricschema.MemoryGauge)
+	require.Len(t, resources[metricschema.MemoryGauge].Metric, 1)
+	require.Positive(t, resources[metricschema.MemoryGauge].Metric[0].GetGauge().GetValue())
 	original, err := os.ReadFile("/test-data/script.js")
 	require.NoError(t, err)
 	require.Equal(t, firstSource, string(original))
@@ -498,12 +499,15 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 	if labelLimit == 0 {
 		byteLabel = "others"
 	}
+	// A new run's first scrape establishes the baseline; require a complete
+	// resource sample on the following scrape, even for short completed runs.
+	scrape(t, client)
 	snapshot := conformance.AssertMetrics(t, scrape(t, client), conformance.MetricsExpectation{
 		Identity:    conformance.MetricIdentity{CollectionID: proofCollection, PlanID: proofPlan, RunID: run, EngineNo: "7", Zone: "local"},
 		Requests:    requests,
 		Bytes:       map[string]float64{byteLabel: expected.bytes},
 		Concurrency: &expected.vus,
-		Resources:   conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
+		Resources:   conformance.ResourceExpectation{CPU: conformance.MeasurementRequired, Memory: conformance.MeasurementRequired},
 	})
 	observed := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}, vus: *snapshot.Concurrency}
 	// Stable addition order keeps retained-scrape comparisons deterministic.

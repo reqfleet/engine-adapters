@@ -33,7 +33,7 @@ import (
 )
 
 type resourceSampler interface {
-	Sample() (resources.Sample, error)
+	Sample() (resources.Sample, bool, error)
 	Reset()
 }
 
@@ -389,16 +389,17 @@ func transportErrorStatus(code uint64) string {
 }
 
 func (e *Exporter) reportEngineMetrics() error {
-	sample, err := e.resources.Sample()
+	sample, ok, err := e.resources.Sample()
 	if err != nil {
 		return err
 	}
 	run := e.run
-	if sample.CPUValid {
-		e.cpu.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(sample.CPUCores)
-	} else {
+	if !ok {
 		e.cpu.DeleteLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID)
+		e.memory.DeleteLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID)
+		return nil
 	}
+	e.cpu.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(sample.CPUCores)
 	e.memory.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(float64(sample.MemoryBytes))
 	return nil
 }

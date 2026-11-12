@@ -35,18 +35,22 @@ type fixedResources struct {
 
 func (r *fixedResources) Reset() { r.started = false }
 
-func (r *fixedResources) Sample() (resources.Sample, error) {
-	sample := r.sample
-	sample.CPUValid = sample.CPUValid && r.started
-	r.started = true
-	return sample, r.err
+func (r *fixedResources) Sample() (resources.Sample, bool, error) {
+	if r.err != nil {
+		return resources.Sample{}, false, r.err
+	}
+	if !r.started {
+		r.started = true
+		return resources.Sample{}, false, nil
+	}
+	return r.sample, true, nil
 }
 
 func fixture(t *testing.T, budget int) (*Exporter, agent.RunContext) {
 	t.Helper()
 	e, err := New(budget)
 	require.NoError(t, err)
-	e.resources = &fixedResources{sample: resources.Sample{CPUValid: true, MemoryBytes: 4096}}
+	e.resources = &fixedResources{sample: resources.Sample{MemoryBytes: 4096}}
 	run := agent.RunContext{RunID: "run-one", CollectionID: "collection", PlanID: "plan", AgentID: "agent-2", Zone: "zone-a", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
 	e.Reset(run)
 	return e, run
@@ -165,7 +169,7 @@ func TestExactIndependentSampleMapping(t *testing.T) {
 	assert.Equal(t, float64(200), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
 	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.NotContains(t, all, metricschema.CPUGauge, "a single CPU sample has no rate")
-	assert.Equal(t, float64(4096), single(t, all, metricschema.MemoryGauge).GetGauge().GetValue())
+	assert.NotContains(t, all, metricschema.MemoryGauge)
 	for range 3 {
 		next := families(t, e)
 		assert.Equal(t, all[metricschema.RequestLatency], next[metricschema.RequestLatency])
@@ -368,12 +372,13 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 							EngineNo: run.AgentID, Zone: run.Zone,
 						},
 						Requests: requests, Bytes: map[string]float64{byteLabel: 15}, Concurrency: &concurrency,
-						Resources: conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
+						Resources: conformance.ResourceExpectation{CPU: conformance.MeasurementAbsent, Memory: conformance.MeasurementAbsent},
 					}
 					for range 2 {
 						response := scrape(e)
 						require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 						conformance.AssertMetrics(t, response.Body.String(), expected)
+						expected.Resources = conformance.ResourceExpectation{CPU: conformance.MeasurementRequired, Memory: conformance.MeasurementRequired}
 					}
 				}
 			})
@@ -403,7 +408,7 @@ func TestURLByteLimitPreservesUTF8GroupingNames(t *testing.T) {
 			first:  {Statuses: map[string]uint64{"201": 1}, LatenciesMS: []float64{3}},
 			second: {Statuses: map[string]uint64{"200": 1}, LatenciesMS: []float64{4}},
 		},
-		Resources: conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
+		Resources: conformance.ResourceExpectation{CPU: conformance.MeasurementAbsent, Memory: conformance.MeasurementAbsent},
 	})
 }
 
@@ -574,6 +579,7 @@ func TestResetClearsIdentityCountersCursorAndCPU(t *testing.T) {
 	assert.Equal(t, float64(30), hist.GetHistogram().GetSampleSum())
 	assert.Equal(t, map[string]string{"collection_id": "new-collection", "plan_id": "new-plan", "run_id": "new-run", "engine_no": "new-agent", "zone": "new-zone", "label": "others"}, metricLabels(hist))
 	assert.NotContains(t, all, metricschema.CPUGauge)
+	assert.NotContains(t, all, metricschema.MemoryGauge)
 	assert.NotContains(t, all, metricschema.EgressBytesCounter)
 	assert.NotContains(t, all, metricschema.ThreadsGauge)
 	assert.Equal(t, "500", metricLabels(single(t, all, metricschema.StatusCounter))["status"])
@@ -606,21 +612,23 @@ func TestResourceScrapesOmitStaleRatesAndRecoverFromErrors(t *testing.T) {
 	e, run := fixture(t, 10)
 	putCSV(t, run, csvHeader+"vus,0,,\n")
 	resources := &fixedResources{sample: resources.Sample{
-		CPUCores: 0.5, CPUValid: true, MemoryBytes: 8192,
+		CPUCores: 0.5, MemoryBytes: 8192,
 	}}
 	e.resources = resources
 	first := families(t, e)
 	assert.NotContains(t, first, metricschema.CPUGauge)
-	assert.Equal(t, float64(8192), single(t, first, metricschema.MemoryGauge).GetGauge().GetValue())
+	assert.NotContains(t, first, metricschema.MemoryGauge)
 	all := families(t, e)
 	metric := single(t, all, metricschema.CPUGauge)
 	assert.Equal(t, 0.5, metric.GetGauge().GetValue())
 	assert.Equal(t, map[string]string{"collection_id": "collection", "plan_id": "plan", "run_id": "run-one", "engine_no": "agent-2", "zone": "zone-a"}, metricLabels(metric))
+	assert.Equal(t, float64(8192), single(t, all, metricschema.MemoryGauge).GetGauge().GetValue())
 
-	// A sampler rebaseline omits CPU, rather than republishing the previous rate.
-	resources.sample.CPUValid = false
-	assert.NotContains(t, families(t, e), metricschema.CPUGauge)
-	resources.sample.CPUValid = true
+	// Rebaselining omits both resources instead of republishing stale values.
+	resources.Reset()
+	baseline := families(t, e)
+	assert.NotContains(t, baseline, metricschema.CPUGauge)
+	assert.NotContains(t, baseline, metricschema.MemoryGauge)
 	resources.sample.CPUCores = 0
 	assert.Zero(t, single(t, families(t, e), metricschema.CPUGauge).GetGauge().GetValue(), "valid zero usage remains reportable")
 
