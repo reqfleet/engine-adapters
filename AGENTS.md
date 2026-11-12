@@ -118,12 +118,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112102207-fdab398e20b2`, a pinned SDK development snapshot providing per-agent canonical collectors, `CustomIngestMetrics` scheduling and final post-exit draining. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112114559-33e885795900`, a pinned SDK main snapshot providing per-agent canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining and ingestion-failure propagation across exit and scheduled completion. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112102207-fdab398e20b2 \
-  -t k6-adapter:sdk-fdab398 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112114559-33e885795900 \
+  -t k6-adapter:sdk-33e8857 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.

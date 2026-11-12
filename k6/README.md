@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [development snapshot fdab398](https://github.com/reqfleet/engine-sdk/commit/fdab398e20b2), pinned in `go.mod` as `v0.5.1-0.20261112102207-fdab398e20b2` for SDK-owned metric collectors and custom ingestion. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [main snapshot 33e8857](https://github.com/reqfleet/engine-sdk/commit/33e8857959007ca6361c1422213c3dd9833f66fa), pinned in `go.mod` as `v0.5.1-0.20261112114559-33e885795900` for SDK-owned metric collectors and custom ingestion. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
@@ -135,11 +135,13 @@ The exporter resolves required CSV header names, uses `encoding/csv` including q
 
 Collection, plan, run, agent and zone identity come from the current `RunContext`. The SDK registry defines the ordinary histogram with `metricschema.RequestLatencyBuckets()`. Shared conformance validation uses the canonical boundary helpers, with independent fixed-profile fixtures guarding against schema drift. k6 reports only the ordinary HTTP histogram; `ObserveRequest` does not reinterpret a grouping value such as `llm_resp` as an LLM measurement.
 
-The SDK samples container resources in a background loop after launch and every five seconds, with a final attempt after joining live monitors. The k6 exporter owns no resource sampler or gauges. The SDK resets its CPU baseline and assigns resource identity on successful launch, retaining completed values without further reads after exit. First use, a run reset or a decreasing counter omits both CPU and memory until a complete sample is available. A resource read error warns and skips the update, preserving last-good values without failing HTTP or the workload. See the SDK's [resource metrics contract](https://github.com/reqfleet/engine-sdk/blob/fdab398e20b2/agent/metrics.md#runtime-resource-metrics) for sampling and recovery semantics.
+The SDK samples container resources in a background loop after launch and every five seconds, with a final attempt after joining live monitors. The k6 exporter owns no resource sampler or gauges. The SDK resets its CPU baseline and assigns resource identity on successful launch, retaining completed values without further reads after exit. First use, a run reset or a decreasing counter omits both CPU and memory until a complete sample is available. A resource read error warns and skips the update, preserving last-good values without failing HTTP or the workload. See the SDK's [resource metrics contract](https://github.com/reqfleet/engine-sdk/blob/33e8857959007ca6361c1422213c3dd9833f66fa/agent/metrics.md#runtime-resource-metrics) for sampling and recovery semantics.
 
 Memory is cgroup-accounted bytes, including cache. Both resources measure all processes in the container's cgroup, not just the k6 PID. The SDK expects that cgroup mounted at `/sys/fs/cgroup`: v2 uses `cpu.stat` and `memory.current`; v1 requires the combined `cpu,cpuacct/cpuacct.usage` and `memory/memory.usage_in_bytes` paths. V1 CPU nanoseconds are truncated to microseconds by the SDK. No host or process fallback is used.
 
 The SDK joins live callbacks and processes, then gives `Collect` a fresh two-second context to drain final CSV rows before releasing the workspace. Cumulative values remain available until the next preparation; post-exit scrapes do not read CSV again. Under the callback state lock, exporter Reset clears its identity, URL admission and cursor, and calls `MetricsRegistry.Reset()` to clear SDK collectors, collection errors and resource identity/baseline. This includes preparation attempts that subsequently fail settings validation. Quiet request periods do not insert fake zero concurrency. Raw CSV is disposable run-local SDK output, not permanent result storage.
+
+Accepted collection errors remain run failures across concurrent process exit. Final-drain errors or an expired deadline also fail the run, including after coordinator-requested scheduled completion; a successful process exit or stop cannot hide incomplete metrics.
 
 ## Container and operational failures
 
