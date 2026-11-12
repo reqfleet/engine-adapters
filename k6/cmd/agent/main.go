@@ -19,7 +19,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	options.CollectMetrics = exporter.Collect
+	options.CustomIngestMetrics = exporter.Collect
 	options = adapter.New(exporter).Options(options)
 	if err := agent.NewAgentServer(options).Run(); err != nil {
 		log.Fatal(err)

@@ -55,7 +55,7 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 - Resolve deployment options once with `agent.LoadAgentServerOptions` and use `AgentServerOptions.LabelsUsageLimit` for the exporter. Do not add adapter-local environment parsing.
 - Preserve resolved options when adding adapter callbacks. Start with `agent.NewAgentServer`, not `MakeAgentServer`, which would resolve environment values again.
-- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. Set `CollectMetrics` to the exporter's collection callback; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, collection scheduling and exposition.
+- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. Set `CustomIngestMetrics` to the exporter's ingestion callback for engine samples that do not fit `MetricParser`'s complete-request event model; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, ingestion scheduling and exposition.
 - Keep CSV parsing, normalization and URL admission in the exporter. Collect with the callback context, synchronizing adapter state with observation. The SDK joins live callbacks/processes before a final collection call with a fresh two-second deadline. Call `registry.Reset()` together with parser/admission reset in `BeforeStart`. HTTP only gathers stored metrics; do not wrap it to drain output or sample resources.
 
 ## Preserve and verify the contract
@@ -118,12 +118,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112080843-fd0f76c550a9`, a pinned SDK development snapshot providing per-agent canonical collectors, background collection and final post-exit draining. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112102207-fdab398e20b2`, a pinned SDK development snapshot providing per-agent canonical collectors, `CustomIngestMetrics` scheduling and final post-exit draining. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112080843-fd0f76c550a9 \
-  -t k6-adapter:sdk-fd0f76c .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112102207-fdab398e20b2 \
+  -t k6-adapter:sdk-fdab398 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
