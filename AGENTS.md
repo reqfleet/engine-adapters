@@ -2,7 +2,8 @@
 
 ## Pull request mentions
 
-- Check the PR author's username before tagging `@iandyh`. Only tag `@iandyh` when the PR author is not `andyh`; never tag `@iandyh` on a PR authored by `andyh`.
+- Before requesting review, read the actual PR author's login with `gh pr view "$PR" --repo "$REPO" --json author --jq '.author.login'`; do not infer authorship from the current CLI user.
+- Compare logins case-insensitively. Never tag `@iandyh` on a PR authored by `andyh` or `iandyh`. Only post the review-request comment when the author is known and is neither excluded login; if the lookup fails or returns no login, skip the mention.
 
 ## Release management
 
@@ -206,7 +207,7 @@ Use your fork as `origin` if you lack push access, and target `reqfleet/engine-a
 
 After opening the PR:
 
-- First, tag @iandyh in a PR comment to request review.
+- First, apply the [pull request mention policy](#pull-request-mentions) before posting a review-request comment; skip the comment for excluded authors.
 - Address failed CI checks and review feedback; include unit/race tests, real-engine container conformance and release wiring for any new adapter.
 - Coordinate required Shibuya integration testing with the Reqfleet team before rollout; adapter container conformance does not replace it.
 - Follow [Releases and compatibility](#releases-and-compatibility) for release PRs and publication. Check publication success and the immutable digest in the workflow summary, then follow the [operator rollout requirements](#operator).
