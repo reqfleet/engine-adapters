@@ -175,18 +175,15 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 	firstMetrics := scrape(t, client)
 	require.Contains(t, firstMetrics, `run_id="1001"`)
 	parser := expfmt.NewTextParser(model.UTF8Validation)
-	resources, err := parser.TextToMetricFamilies(strings.NewReader(firstMetrics))
-	require.NoError(t, err)
-	require.NotContains(t, resources, metricschema.CPUGauge, "the first scrape has no CPU interval")
-	require.Contains(t, resources, metricschema.MemoryGauge)
-	require.Len(t, resources[metricschema.MemoryGauge].Metric, 1)
-	require.Positive(t, resources[metricschema.MemoryGauge].Metric[0].GetGauge().GetValue())
 	terminal("1001", protocol.RunCompleted, 90*time.Second)
-	resources, err = parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
+	resources, err := parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
 	require.NoError(t, err)
 	require.Contains(t, resources, metricschema.CPUGauge)
 	require.Len(t, resources[metricschema.CPUGauge].Metric, 1)
 	require.Positive(t, resources[metricschema.CPUGauge].Metric[0].GetGauge().GetValue(), "the real k6 run must consume CPU")
+	require.Contains(t, resources, metricschema.MemoryGauge)
+	require.Len(t, resources[metricschema.MemoryGauge].Metric, 1)
+	require.Positive(t, resources[metricschema.MemoryGauge].Metric[0].GetGauge().GetValue())
 	original, err := os.ReadFile("/test-data/script.js")
 	require.NoError(t, err)
 	require.Equal(t, firstSource, string(original))
@@ -503,7 +500,7 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 		Requests:    requests,
 		Bytes:       map[string]float64{byteLabel: expected.bytes},
 		Concurrency: &expected.vus,
-		Resources:   conformance.ResourceExpectation{Memory: conformance.MeasurementRequired},
+		Resources:   conformance.ResourceExpectation{CPU: conformance.MeasurementRequired, Memory: conformance.MeasurementRequired},
 	})
 	observed := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}, vus: *snapshot.Concurrency}
 	// Stable addition order keeps retained-scrape comparisons deterministic.

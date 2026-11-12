@@ -42,21 +42,21 @@ k6 CSV rows are independent metric samples, not complete request records:
 - Standard `data_received` samples lack request URL attribution. Keep received bytes aggregate under `label="k6"` (`others` when the label limit is zero). They must not consume URL admission slots or produce per-URL byte series.
 - Per-URL bandwidth is unavailable, not zero. Never assign bytes to requests by row order, matching timestamps, or copying totals to every URL.
 - VUs, CPU and memory remain agent-level metrics, not request-labelled measurements.
-- Do not route independent VU/byte samples through an SDK conversion that unconditionally creates a request count and latency observation. Preserve the semantics when changing ingestion APIs.
+- Record independent samples through SDK `MetricsRegistry.ObserveRequest`, `AddReceivedBytes`, and `SetConcurrency`. Do not route VU/byte samples through `RecordEvent` or `MetricParser`, which also create request counts and latency observations.
 
 ## Use SDK-owned container resource reporting
 
-- All adapters that report container CPU or memory MUST use `github.com/reqfleet/engine-sdk/containerstats`: `ReadCPUUsage` and `ReadMemoryUsage`. Do not copy SDK internals or implement adapter-local cgroup readers.
-- `ReadCPUUsage` returns cumulative microseconds for both cgroup versions, not a percentage or core count. Divide its delta by elapsed wall-clock microseconds to report average CPU cores. Omit CPU until two successful samples exist, reset the baseline for each run, and do not advance it on resource-read failures.
-- `ReadMemoryUsage` returns cgroup-accounted bytes, including cache. Both readers measure all processes in the container's cgroup, not just the engine PID. Keep resource metrics agent-level, without request labels.
-- Propagate unavailable-resource errors as scrape failures; never fabricate zero usage or add host/process fallbacks. Follow the SDK's supported mount layout and document its limitations. See [the resource reporting contract](k6/README.md#normalization-and-run-lifecycle).
+- Adapters using the SDK registry MUST NOT define duplicate collectors, instantiate a resource sampler, or maintain CPU baselines. The SDK owns the canonical metrics and resource collection; `resources` owns sampling policy and `containerstats` owns raw cgroup reads.
+- The SDK samples resources after launch, every five seconds and once after live monitors finish, then retains completed values without further reads. Baseline-only attempts omit both CPU and memory; complete samples publish both. Resource read failures warn and skip the update, retaining last-good values without failing HTTP or the workload.
+- CPU is average cores over the actual monotonic interval. Memory is cgroup-accounted bytes, including cache. Both measure all processes in the container's cgroup, not just the engine PID. Never add host/process fallbacks or fabricate zero usage.
+- Standalone native exporters remain responsible for their complete exposition and may use `resources.Sampler` directly. Native handler/URL modes do not also collect unused SDK resources. See [the resource reporting contract](k6/README.md#normalization-and-run-lifecycle).
 
 ## Use SDK-owned configuration and HTTP serving
 
 - Resolve deployment options once with `agent.LoadAgentServerOptions` and use `AgentServerOptions.LabelsUsageLimit` for the exporter. Do not add adapter-local environment parsing.
 - Preserve resolved options when adding adapter callbacks. Start with `agent.NewAgentServer`, not `MakeAgentServer`, which would resolve environment values again.
-- Pass the exporter as `AgentServerOptions.MetricsHandler` with `NativeMetricsSchema: shibuya-v1`. Let the SDK own the listener and bearer authentication; do not add a loopback metrics server or configure `MetricsURL` alongside the handler.
-- Keep CSV parsing, metric normalization, URL admission and run reset in the exporter. SDK HTTP serving does not change the attribution boundaries above.
+- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. Set `CustomIngestMetrics` to the exporter's ingestion callback for engine samples that do not fit `MetricParser`'s complete-request event model; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, ingestion scheduling and exposition.
+- Keep CSV parsing, normalization and URL admission in the exporter. Collect with the callback context, synchronizing adapter state with observation. The SDK joins live callbacks/processes before a final collection call with a fresh two-second deadline. Call `registry.Reset()` together with parser/admission reset in `BeforeStart`. HTTP only gathers stored metrics; do not wrap it to drain output or sample resources.
 
 ## Preserve and verify the contract
 
@@ -118,12 +118,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112045356-22f33598bc07`, a pinned SDK main snapshot providing shared request-name admission and canonical histogram boundaries. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112114559-33e885795900`, a pinned SDK main snapshot providing per-agent canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining and ingestion-failure propagation across exit and scheduled completion. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112045356-22f33598bc07 \
-  -t k6-adapter:sdk-22f3359 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112114559-33e885795900 \
+  -t k6-adapter:sdk-33e8857 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
@@ -159,7 +159,7 @@ The review is read-only apart from disposable verification artifacts. It identif
 
 1. Use SDK callbacks (`BeforeStart`, `BuildCommand`, `Observe`) and let the SDK own downloads, run isolation, process launch/wait, cancellation and escalation. Do not implement a second supervisor.
 2. Define the primary artifact, settings units, per-agent assignment and CSV delivery rules. Bundle nonnative JavaScript dependencies before upload. The supported onboarding contract is one primary artifact plus existing CSV delivery, not arbitrary archives or dependency manifests.
-3. Normalize accurate metrics to `shibuya-v1`; document unsupported attribution instead of manufacturing request events. Use native normalized-endpoint mode when engine samples are not request events.
+3. Normalize accurate metrics to `shibuya-v1`; document unsupported attribution instead of manufacturing request events. Prefer the SDK registry's independent recording methods for independent samples. Retain native endpoint mode when the engine already supplies a complete normalized exposition.
 4. Run conformance, review licenses/provenance, then publish an independently versioned image. Record the compatibility tuple below with observed test evidence.
 
 ### Shibuya maintainer: adding the next kind
@@ -239,4 +239,4 @@ Do not fill unspecified Shibuya releases or digests with presumed compatibility.
 
 ## Licensing
 
-Adapter code is Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The public SDK harness is an attributed adaptation; resource sampling uses the SDK's public `containerstats` package. The OCI image also distributes the selected unmodified k6 release, a separate AGPLv3 program; its license and corresponding upstream source archive are included under `/usr/share/licenses/engine-adapters/`, with SDK transitive notices. Review upstream and transitive licenses before redistributing. Publication maintainers must preserve corresponding-source availability and notices for all shipped versions.
+Adapter code is Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The public SDK harness is an attributed adaptation; the SDK owns canonical collectors and container resource sampling. The OCI image also distributes the selected unmodified k6 release, a separate AGPLv3 program; its license and corresponding upstream source archive are included under `/usr/share/licenses/engine-adapters/`, with SDK transitive notices. Review upstream and transitive licenses before redistributing. Publication maintainers must preserve corresponding-source availability and notices.

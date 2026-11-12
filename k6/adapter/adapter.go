@@ -19,8 +19,8 @@ import (
 	"github.com/reqfleet/engine-sdk/protocol"
 )
 
-// Reporter is reset before preparation, including preparation that fails.
-// SDK callbacks are serialized; the reporter synchronizes concurrent scrapes.
+// Reporter coordinates run resets with readiness. The metrics exporter also
+// synchronizes these methods with its SDK-scheduled collection callback.
 type Reporter interface {
 	Reset(agent.RunContext)
 	Observe(context.Context, agent.RunContext) (protocol.Observation, error)
@@ -44,7 +44,6 @@ func (a *Adapter) Options(options agent.AgentServerOptions) agent.AgentServerOpt
 	options.BeforeStart = a.BeforeStart
 	options.BuildCommand = a.BuildCommand
 	options.Observe = a.reporter.Observe
-	options.NativeMetricsSchema = agent.MetricsSchemaShibuyaV1
 	return options
 }
 
