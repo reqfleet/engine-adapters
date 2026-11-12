@@ -2,9 +2,9 @@ engine-adapters
 Copyright reqfleet contributors
 Licensed under the Apache License, Version 2.0; see LICENSE.
 
-conformance/peer_test.go and conformance/runtime_test.go adapt the public
-engine-sdk v0.3.0 examples/preparing-adapter/conformance_test.go harness.
-These files are modified for the independent k6 adapter.
+k6/conformance/runtime_test.go adapts the public engine-sdk v0.3.0
+examples/preparing-adapter/conformance_test.go harness.
+This file is modified for the independent k6 adapter.
 Source: https://github.com/reqfleet/engine-sdk/tree/v0.3.0
 
 Upstream engine-sdk notice:

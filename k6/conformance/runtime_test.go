@@ -22,7 +22,7 @@ import (
 
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
-	"github.com/reqfleet/engine-adapters/conformance"
+	"github.com/reqfleet/engine-sdk/conformance"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
 	"github.com/stretchr/testify/assert"

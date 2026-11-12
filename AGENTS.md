@@ -72,7 +72,7 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 Prerequisites: Go **1.26.10**, Docker with Linux containers, and public HTTPS access to Go modules, Debian packages, and the k6 release. There is one module, no workspace, private dependency, Shibuya checkout, or `replace` directive.
 
-Build targets belong to each adapter's directory. From the repository root, use `make -C k6` for the k6 adapter; inside `k6/`, use `make` directly. Go builds are scoped to that adapter; its unit target also runs the shared conformance validator tests. Docker builds keep the repository root as their context for the shared module, conformance harness and licenses.
+Build targets belong to each adapter's directory. From the repository root, use `make -C k6` for the k6 adapter; inside `k6/`, use `make` directly. Go builds are scoped to that adapter; its unit target also runs the SDK conformance validator tests. Docker builds keep the repository root as their context for the shared module and licenses; the harness comes from the pinned SDK dependency.
 
 ```sh
 make -C k6 test-unit       # adapter and shared conformance validator, with race detection
@@ -90,7 +90,7 @@ The initial reference was exercised on Linux arm64 and Linux amd64 (under QEMU),
 
 ### Reusable adapter conformance
 
-The shared `conformance` Go package supplies container lifecycle checks and normalized `shibuya-v1` metric assertions. The first consumer is `k6/conformance`; keep engine-specific plans, raw-output parsing and scheduling/error checks there. New adapters should reuse this package and supply their own engine-native fixtures.
+The optional public [`github.com/reqfleet/engine-sdk/conformance`](https://pkg.go.dev/github.com/reqfleet/engine-sdk/conformance) package supplies container lifecycle checks and normalized `shibuya-v1` metric assertions. The first consumer is `k6/conformance`; keep engine-specific plans, raw-output parsing and scheduling/error checks there. New adapters should import the SDK toolkit and supply their own engine-native fixtures. Do not restore an adapter-local generic harness.
 
 `conformance.Contract` takes `Executable`, `Artifacts` (filename to content), optional `DataArtifacts` (SDK artifact URL path to content), a controlled `Target` handler, `LabelLimit`, `Basic`, `Budgets` and an optional `Scenarios` callback. `BasicScenarios` supplies `Complete` and `Reuse` fixtures (`File` and JSON `Settings`), `CompletionTimeout`, and `AssertMetrics(t, runtime, runID)`. That oracle reads native output under `runtime.Root` and calls `conformance.AssertMetrics` with expected identity, per-label outcomes/latencies, bytes, concurrency and resource availability. It returns a resource-independent `MetricsSnapshot` for retention comparisons. `BudgetScenario` supplies a fixture, label limit, minimum request count and exact expected request/byte labels. Use the k6 consumer for a complete runnable example.
 
@@ -100,7 +100,7 @@ Each scenario launches the adapter through a dedicated Linux child-subreaper pro
 
 Cleanup must stop the admitted active run even when a later overlapping Start was rejected; an attempted run ID must not displace the active run's graceful cancellation and finalization. Use one graceful-cleanup deadline across all Stop writes and progress requests, then enter bounded supervisor teardown even if the adapter is unresponsive.
 
-Build the shared runtime regression binary from `./conformance` with `-tags=integration` alongside the adapter-local test binary. The k6 container runs the shared binary first, then its real-engine suite; both must succeed. Shared runtime regressions exercise an SDK-based short workload, unsuccessful terminal states and cleanup after an unresponsive or exited adapter while an unrelated sibling process remains alive.
+Build the shared runtime regression binary with `go test -c -tags=integration github.com/reqfleet/engine-sdk/conformance` alongside the adapter-local test binary. The k6 container runs the shared binary first, then its real-engine suite; both must succeed. Shared runtime regressions exercise an SDK-based short workload, unsuccessful terminal states and cleanup after an unresponsive or exited adapter while an unrelated sibling process remains alive.
 
 Prepare regressions must send the nested Prepare verb with its per-agent assignment and exercise a dependency artifact and preparation hook. Prove cancellation while the adapter is still alive, before forced teardown; a closed download connection after killing the adapter is insufficient evidence.
 
@@ -112,18 +112,18 @@ Prepare regressions must send the nested Prepare verb with its per-agent assignm
 - State the producer's run-retention policy in its fixtures. SDK result-file registries can retain prior-run series; validate current-run values independently and explicitly allow only known prior identities. Retained series must remain unique per metric family and complete label set. Histograms must have the complete profile's bucket bounds, cumulative counts and `+Inf` count matching the sample count; zero observations require a zero sum. Request labels must be shorter than 1024 bytes in current and retained series. For exporters that reset their collectors, require old-run series to disappear. Final request snapshots exclude changing CPU/memory gauges when checking repeated scrapes.
 - Histogram component samples (`_bucket`, `_count`, `_sum`) must each be unique by complete label set, regardless of label ordering. Before typed parsing, reject base-family samples, require `le` only on buckets, validate each component's schema labels, and require raw bucket/count values to be finite nonnegative integers below `2^64`. These checks apply to current and retained runs and prevent the parser from discarding malformed samples or converting out-of-range counts.
 - Build the adapter-local test package with `go test -c -tags=integration` in the Dockerfile and run that binary only in its disposable `conformance` target. Keep the existing isolation: no host mounts, published ports or external network; root harness, UID/GID 65532 adapter.
-- Include shared validator unit tests in each consumer's unit target and wire container conformance into PR and release CI. Shared harness changes require exercising every consumer.
+- Include SDK validator unit tests (`go test github.com/reqfleet/engine-sdk/conformance`) in each consumer's unit target and wire container conformance into PR and release CI. SDK toolkit upgrades require exercising every consumer.
 
 The suite verifies adapter behavior through the public SDK protocol and `/metrics`. Coordinate Shibuya admission, UI and deployment verification with the Reqfleet team separately. Report executed checks and engine versions; a fixture definition alone supplies no runtime evidence.
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112114559-33e885795900`, a pinned SDK main snapshot providing per-agent canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining and ingestion-failure propagation across exit and scheduled completion. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112124056-0c5af67d92e8`, a pinned SDK snapshot providing the public conformance toolkit alongside per-agent canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining and ingestion-failure propagation. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112114559-33e885795900 \
-  -t k6-adapter:sdk-33e8857 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112124056-0c5af67d92e8 \
+  -t k6-adapter:sdk-0c5af67 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.

@@ -110,11 +110,11 @@ k6 writes CSV **independent metric samples**, so it uses an adapter-owned parser
 
 Turn the agreed mapping into behavior-focused regression coverage and container conformance, using real engine output.
 
-Use the shared `conformance` package for the adapter's container integration tests. Follow `k6/conformance` as the first consumer: supply the real adapter executable, engine-native plans, settings and source-derived metric expectations to `conformance.Run`. Reuse its coordinator/artifact peers, process lifecycle and authenticated scrape checks. Keep engine-specific parsing, scheduling and failure scenarios in the adapter's test package.
+Import the optional public `github.com/reqfleet/engine-sdk/conformance` toolkit for the adapter's container integration tests; do not copy a generic harness into this repository. Follow `k6/conformance` as the first consumer: supply the real adapter executable, engine-native plans, settings and source-derived metric expectations to `conformance.Run`. Reuse its coordinator/artifact peers, process lifecycle and authenticated scrape checks. Keep engine-specific parsing, scheduling and failure scenarios in the adapter's test package.
 
 Both SDK metric approaches must satisfy the shared normalized metrics assertions. Derive expected outcomes, latency observations and received bytes from real engine output or controlled fixtures. Exercise the configured label budget, including overflow and zero, and verify final snapshots across repeated scrapes. Keep parser unit tests alongside the adapter.
 
-Build the adapter-specific integration test binary with `-tags=integration` into its Dockerfile's `conformance` target. Run it using `docker run --rm --network none`, with no published ports or host mounts. Wire unit tests for the shared metrics validator and adapter into CI, and run the adapter's container conformance before publication. See the repository's development instructions for the fixture contract.
+Build both the SDK's shared regression binary (`go test -c -tags=integration github.com/reqfleet/engine-sdk/conformance`) and the adapter-specific integration binary into the Dockerfile's `conformance` target. Run both sequentially using `docker run --rm --network none`, with no published ports or host mounts. Include `go test github.com/reqfleet/engine-sdk/conformance` in the unit target, wire unit and container tests into CI, and run the adapter's container conformance before publication. See the repository's development instructions for the fixture contract.
 
 Cover these observable behaviors:
 

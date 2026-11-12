@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 ARG K6_VERSION=v2.3.0
-ARG ENGINE_SDK_VERSION=v0.5.1-0.20261112114559-33e885795900
+ARG ENGINE_SDK_VERSION=v0.5.1-0.20261112124056-0c5af67d92e8
 FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm AS build
 ARG TARGETOS
 ARG TARGETARCH
@@ -14,7 +14,7 @@ COPY . .
 RUN go get "github.com/reqfleet/engine-sdk@${ENGINE_SDK_VERSION}" && \
     test "$(go list -m -f '{{.Version}}' github.com/reqfleet/engine-sdk)" = "$ENGINE_SDK_VERSION"
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o /out/k6-adapter ./k6/cmd/agent && \
-    GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance-runtime ./conformance && \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance-runtime github.com/reqfleet/engine-sdk/conformance && \
     GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -tags=integration -o /out/conformance ./k6/conformance
 # Keep SDK transitive license notices with the executable distribution.
 RUN cp "$(go list -m -f '{{.Dir}}' github.com/reqfleet/engine-sdk)/THIRD_PARTY_NOTICES" /out/SDK_THIRD_PARTY_NOTICES
