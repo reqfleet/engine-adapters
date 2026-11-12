@@ -3,8 +3,8 @@
 // Collection reads the result file written by k6's --out csv option. CSV rows
 // are independent samples, not complete request events. The exporter updates
 // SDK-owned collectors through separate request, byte, and concurrency methods,
-// without fabricating requests for VU or byte samples. Its HTTP middleware drains
-// final output and holds the run lock through SDK sampling and gathering.
+// without fabricating requests for VU or byte samples. The SDK invokes Collect
+// during the run and once after process exit to drain final output.
 // The SDK owns metric definitions, resource sampling, exposition and authentication.
 // See ../README.md for the CSV format and sample mapping.
 package metrics
@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/http"
 	"os"
 	"strconv"
 	"sync"
@@ -27,7 +26,7 @@ import (
 )
 
 // Exporter owns CSV ingestion and admission state for one run.
-// No reader or goroutine survives a drain; Reset and scrapes share the same lock.
+// No reader or goroutine survives Collect; callbacks share the same state lock.
 type Exporter struct {
 	mu                                           sync.Mutex
 	byteLabel                                    string
@@ -81,15 +80,18 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.registry.Reset()
 }
 
-// Observe rejects callbacks from a retired run without disturbing the active run.
+// Observe reads cached readiness without collecting or changing the active run.
 func (e *Exporter) Observe(ctx context.Context, run agent.RunContext) (protocol.Observation, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.active || run.RunID != e.run.RunID || run.CollectionID != e.run.CollectionID || run.PlanID != e.run.PlanID || run.AgentID != e.run.AgentID || run.Zone != e.run.Zone || run.ResultFile != e.run.ResultFile {
+	if err := ctx.Err(); err != nil {
+		return protocol.ObservationPending, err
+	}
+	if !e.matchesRun(run) {
 		return protocol.ObservationPending, errors.New("metrics observation does not match the active run")
 	}
-	if err := e.drain(ctx); err != nil {
-		return protocol.ObservationPending, err
+	if e.failure != nil {
+		return protocol.ObservationPending, e.failure
 	}
 	if !e.ready {
 		return protocol.ObservationPending, nil
@@ -97,27 +99,21 @@ func (e *Exporter) Observe(ctx context.Context, run agent.RunContext) (protocol.
 	return protocol.ObservationReady, nil
 }
 
-// WrapHandler drains final output even after the subprocess exits and retains
-// the run lock through SDK resource sampling and exposition. Until the next Reset,
-// unchanged files retain their cumulative totals.
-func (e *Exporter) WrapHandler(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if !e.active {
-			http.Error(w, "no prepared run", http.StatusServiceUnavailable)
-			return
-		}
-		if err := e.drain(r.Context()); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if !e.ready {
-			http.Error(w, "waiting for a valid k6 sample", http.StatusServiceUnavailable)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// Collect drains complete CSV records into the SDK registry. The SDK joins live
+// calls before the final post-exit call and retains the metrics until Reset.
+func (e *Exporter) Collect(ctx context.Context, run agent.RunContext) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.matchesRun(run) {
+		return errors.New("metrics collection does not match the active run")
+	}
+	return e.drain(ctx)
+}
+
+func (e *Exporter) matchesRun(run agent.RunContext) bool {
+	return e.active && run.RunID == e.run.RunID && run.CollectionID == e.run.CollectionID &&
+		run.PlanID == e.run.PlanID && run.AgentID == e.run.AgentID &&
+		run.Zone == e.run.Zone && run.ResultFile == e.run.ResultFile
 }
 
 func (e *Exporter) fail(err error) error {

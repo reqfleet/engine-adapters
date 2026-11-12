@@ -175,12 +175,8 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 	firstMetrics := scrape(t, client)
 	require.Contains(t, firstMetrics, `run_id="1001"`)
 	parser := expfmt.NewTextParser(model.UTF8Validation)
-	resources, err := parser.TextToMetricFamilies(strings.NewReader(firstMetrics))
-	require.NoError(t, err)
-	require.NotContains(t, resources, metricschema.CPUGauge, "the first scrape only establishes a baseline")
-	require.NotContains(t, resources, metricschema.MemoryGauge, "baseline attempts omit both resources")
 	terminal("1001", protocol.RunCompleted, 90*time.Second)
-	resources, err = parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
+	resources, err := parser.TextToMetricFamilies(strings.NewReader(scrape(t, client)))
 	require.NoError(t, err)
 	require.Contains(t, resources, metricschema.CPUGauge)
 	require.Len(t, resources[metricschema.CPUGauge].Metric, 1)
@@ -499,9 +495,6 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 	if labelLimit == 0 {
 		byteLabel = "others"
 	}
-	// A new run's first scrape establishes the baseline; require a complete
-	// resource sample on the following scrape, even for short completed runs.
-	scrape(t, client)
 	snapshot := conformance.AssertMetrics(t, scrape(t, client), conformance.MetricsExpectation{
 		Identity:    conformance.MetricIdentity{CollectionID: proofCollection, PlanID: proofPlan, RunID: run, EngineNo: "7", Zone: "local"},
 		Requests:    requests,

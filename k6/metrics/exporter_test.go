@@ -51,12 +51,13 @@ func appendCSV(t *testing.T, run agent.RunContext, text string) {
 
 func scrape(e *Exporter) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
-	e.WrapHandler(promhttp.HandlerFor(e.registry, promhttp.HandlerOpts{})).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	promhttp.HandlerFor(e.registry, promhttp.HandlerOpts{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	return recorder
 }
 
-func families(t *testing.T, e *Exporter) map[string]*dto.MetricFamily {
+func collectAndGather(t *testing.T, e *Exporter) map[string]*dto.MetricFamily {
 	t.Helper()
+	require.NoError(t, e.Collect(context.Background(), e.run))
 	recorder := scrape(e)
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	parser := expfmt.NewTextParser(model.LegacyValidation)
@@ -123,10 +124,11 @@ func TestExactIndependentSampleMapping(t *testing.T) {
 		"x,500,https://example.test/items?q=one,5,another-name,http_req_duration\n"+
 		"x,,,3,,vus\nx,,,120,,data_received\nx,,,80,,data_received\n"+
 		"x,,,2,,http_reqs\nx,,,999,,data_sent\nx,,,not-a-number,,custom_metric\n")
+	require.NoError(t, e.Collect(context.Background(), run))
 	state, err := e.Observe(context.Background(), run)
 	require.NoError(t, err)
 	require.Equal(t, protocol.ObservationReady, state)
-	all := families(t, e)
+	all := collectAndGather(t, e)
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/items?q=one": {count: 3, sum: 25, statuses: map[string]float64{"200": 2, "500": 1}},
 		"https://example.test/items?q=two": {count: 1, sum: 30, statuses: map[string]float64{"500": 1}},
@@ -148,17 +150,17 @@ func TestExactIndependentSampleMapping(t *testing.T) {
 	assert.Equal(t, float64(200), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
 	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	for range 3 {
-		next := families(t, e)
+		next := collectAndGather(t, e)
 		assert.Equal(t, all[metricschema.RequestLatency], next[metricschema.RequestLatency])
 		assert.Equal(t, all[metricschema.StatusCounter], next[metricschema.StatusCounter])
 		assert.Equal(t, all[metricschema.EgressBytesCounter], next[metricschema.EgressBytesCounter])
 		assert.Equal(t, float64(3), single(t, next, metricschema.ThreadsGauge).GetGauge().GetValue())
 	}
 	appendCSV(t, run, "x,,,0,,vus\n")
-	next := families(t, e)
+	next := collectAndGather(t, e)
 	assert.Equal(t, float64(0), single(t, next, metricschema.ThreadsGauge).GetGauge().GetValue())
 	assert.Equal(t, all[metricschema.RequestLatency], next[metricschema.RequestLatency])
-	assert.Equal(t, float64(0), single(t, families(t, e), metricschema.ThreadsGauge).GetGauge().GetValue())
+	assert.Equal(t, float64(0), single(t, collectAndGather(t, e), metricschema.ThreadsGauge).GetGauge().GetValue())
 }
 
 func TestTransportFailuresKeepErrorCodesAndRequests(t *testing.T) {
@@ -178,6 +180,7 @@ func TestTransportFailuresKeepErrorCodesAndRequests(t *testing.T) {
 				"1500,http://127.0.0.1:1/,500,http_req_duration,2\n"+
 				",,,data_received,0\n"+
 				",,,vus,1\n")
+			require.NoError(t, e.Collect(context.Background(), run))
 			state, err := e.Observe(context.Background(), run)
 			require.NoError(t, err)
 			require.Equal(t, protocol.ObservationReady, state)
@@ -194,10 +197,10 @@ func TestTransportFailuresKeepErrorCodesAndRequests(t *testing.T) {
 					}},
 				}
 			}
-			all := families(t, e)
+			all := collectAndGather(t, e)
 			assertRequestMetrics(t, all, want)
 			assert.Zero(t, single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
-			assertRequestMetrics(t, families(t, e), want)
+			assertRequestMetrics(t, collectAndGather(t, e), want)
 		})
 	}
 }
@@ -208,7 +211,7 @@ func TestTransportErrorMetadataResetsWithRun(t *testing.T) {
 		"http_req_duration,0,1100,0,http://missing.invalid/\n"+
 		"http_req_duration,0,,0,http://missing.invalid/\n"+
 		"http_req_duration,0,1999,0,http://missing.invalid/\n")
-	assertRequestMetrics(t, families(t, e), map[string]requestMetrics{
+	assertRequestMetrics(t, collectAndGather(t, e), map[string]requestMetrics{
 		"http://missing.invalid/": {count: 3, sum: 0, statuses: map[string]float64{
 			"DNS lookup error (k6 1100)": 1, "Transport error (cause unavailable)": 1, "Unknown k6 error (k6 1999)": 1,
 		}},
@@ -217,7 +220,7 @@ func TestTransportErrorMetadataResetsWithRun(t *testing.T) {
 	// the failed request or reuse the previous run's column position.
 	putCSV(t, run, csvHeader+"http_req_duration,0,0,http://127.0.0.1:1/\n")
 	e.Reset(run)
-	assertRequestMetrics(t, families(t, e), map[string]requestMetrics{
+	assertRequestMetrics(t, collectAndGather(t, e), map[string]requestMetrics{
 		"http://127.0.0.1:1/": {count: 1, sum: 0, statuses: map[string]float64{"Transport error (cause unavailable)": 1}},
 	})
 }
@@ -232,7 +235,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 		"http_req_duration,20,201,https://example.test/b\n"+
 		"http_req_duration,30,500,https://example.test/c\n"+
 		"http_req_duration,40,0,https://example.test/d\n")
-	all := families(t, e)
+	all := collectAndGather(t, e)
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/a": {count: 1, sum: 10, statuses: map[string]float64{"200": 1}},
 		"https://example.test/b": {count: 1, sum: 20, statuses: map[string]float64{"201": 1}},
@@ -245,7 +248,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 			"http_req_duration,7,201,https://example.test/b\n"+
 			"http_req_duration,3,200,https://example.test/c\n"+
 			"data_received,15,,\n")
-	all = families(t, e)
+	all = collectAndGather(t, e)
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/a": {count: 2, sum: 15, statuses: map[string]float64{"200": 1, "500": 1}},
 		"https://example.test/b": {count: 2, sum: 27, statuses: map[string]float64{"201": 2}},
@@ -260,7 +263,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 		"http_req_duration,6,201,https://example.test/d\n"+
 		"http_req_duration,8,500,https://example.test/a\n")
 	e.Reset(run)
-	all = families(t, e)
+	all = collectAndGather(t, e)
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/c": {count: 1, sum: 4, statuses: map[string]float64{"200": 1}},
 		"https://example.test/d": {count: 1, sum: 6, statuses: map[string]float64{"201": 1}},
@@ -278,14 +281,14 @@ func TestZeroURLBudgetAggregatesRequestsAndBytesSeparately(t *testing.T) {
 		"http_req_duration,30,500,https://example.test/c\n"+
 		"http_req_duration,40,200,https://example.test/a\n"+
 		"data_received,8,,\n")
-	all := families(t, e)
+	all := collectAndGather(t, e)
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"others": {count: 4, sum: 100, statuses: map[string]float64{"200": 3, "500": 1}},
 	})
 	assert.Equal(t, "others", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, float64(20), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
 	appendCSV(t, run, "http_req_duration,5,200,\n")
-	_, err := e.Observe(context.Background(), run)
+	err := e.Collect(context.Background(), run)
 	require.Error(t, err, "a zero budget does not make request URLs optional")
 }
 
@@ -313,10 +316,10 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 						"http_req_duration,1,200,%s\n"+
 							"http_req_duration,2,500,%s\n",
 						atLimit, overLimit))
+					require.NoError(t, e.Collect(context.Background(), run))
 					state, err := e.Observe(context.Background(), run)
 					require.NoError(t, err)
 					require.Equal(t, protocol.ObservationPending, state)
-					require.Equal(t, http.StatusServiceUnavailable, scrape(e).Code)
 					appendCSV(t, run, fmt.Sprintf(
 						"data_received,10,,\n"+
 							"vus,2,,\n"+
@@ -328,6 +331,7 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 							"http_req_duration,8,200,https://example.test/overflow\n"+
 							"data_received,5,,\n",
 						valid, atLimit, overLimit, valid))
+					require.NoError(t, e.Collect(context.Background(), run))
 					state, err = e.Observe(context.Background(), run)
 					require.NoError(t, err)
 					require.Equal(t, protocol.ObservationReady, state)
@@ -373,6 +377,7 @@ func TestURLByteLimitPreservesUTF8GroupingNames(t *testing.T) {
 			"http_req_duration,3,201,%s\n"+
 			"http_req_duration,4,200,%s\n",
 		first, second, first, second))
+	require.NoError(t, e.Collect(context.Background(), run))
 	response := scrape(e)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	conformance.AssertMetrics(t, response.Body.String(), conformance.MetricsExpectation{
@@ -393,31 +398,33 @@ func TestPartialLogicalRecordsAreRetriedExactlyOnce(t *testing.T) {
 		t.Run(fmt.Sprintf("ending-%q", ending), func(t *testing.T) {
 			e, run := fixture(t, 10)
 			putCSV(t, run, "url,extra,status,metric_value,metric_na")
+			require.NoError(t, e.Collect(context.Background(), run))
 			state, err := e.Observe(context.Background(), run)
 			require.NoError(t, err)
 			assert.Equal(t, protocol.ObservationPending, state)
 			assert.Zero(t, e.offset)
 			appendCSV(t, run, "me"+ending+"https://example.test/partial,\"line one"+ending)
+			require.NoError(t, e.Collect(context.Background(), run))
 			state, err = e.Observe(context.Background(), run)
 			require.NoError(t, err)
 			assert.Equal(t, protocol.ObservationPending, state)
 			headerOffset := e.offset
 			appendCSV(t, run, "line two, with \"\"quote\"\"")
-			_, err = e.Observe(context.Background(), run)
+			err = e.Collect(context.Background(), run)
 			require.NoError(t, err)
 			assert.Equal(t, headerOffset, e.offset)
 			appendCSV(t, run, "\",200,12.5,http_req_duration")
-			_, err = e.Observe(context.Background(), run)
+			err = e.Collect(context.Background(), run)
 			require.NoError(t, err)
 			assert.Equal(t, headerOffset, e.offset, "unterminated last line must not be committed")
 			appendCSV(t, run, ending)
-			all := families(t, e)
+			all := collectAndGather(t, e)
 			assert.Equal(t, uint64(1), single(t, all, metricschema.RequestLatency).GetHistogram().GetSampleCount())
 			appendCSV(t, run, ",x,,1")
-			all = families(t, e)
+			all = collectAndGather(t, e)
 			assert.Equal(t, uint64(1), single(t, all, metricschema.RequestLatency).GetHistogram().GetSampleCount())
 			appendCSV(t, run, "20,data_received"+ending)
-			all = families(t, e)
+			all = collectAndGather(t, e)
 			assert.Equal(t, float64(120), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
 			assert.Equal(t, uint64(1), single(t, all, metricschema.RequestLatency).GetHistogram().GetSampleCount())
 		})
@@ -426,22 +433,23 @@ func TestPartialLogicalRecordsAreRetriedExactlyOnce(t *testing.T) {
 
 func TestPendingUnsupportedAndNonRequestSamples(t *testing.T) {
 	e, run := fixture(t, 10)
+	require.NoError(t, e.Collect(context.Background(), run))
 	state, err := e.Observe(context.Background(), run)
 	require.NoError(t, err)
 	assert.Equal(t, protocol.ObservationPending, state)
-	assert.Equal(t, http.StatusServiceUnavailable, scrape(e).Code)
 	putCSV(t, run, csvHeader+"http_reqs,12,,\ndata_sent,999,,\ncustom,nonsense,not-http,\n")
+	require.NoError(t, e.Collect(context.Background(), run))
 	state, err = e.Observe(context.Background(), run)
 	require.NoError(t, err)
 	assert.Equal(t, protocol.ObservationPending, state)
 	appendCSV(t, run, "vus,0,,\n")
-	all := families(t, e)
+	all := collectAndGather(t, e)
 	assert.NotContains(t, all, metricschema.RequestLatency)
 	assert.NotContains(t, all, metricschema.StatusCounter)
 	assert.NotContains(t, all, metricschema.EgressBytesCounter)
 	assert.Equal(t, float64(0), single(t, all, metricschema.ThreadsGauge).GetGauge().GetValue())
 	appendCSV(t, run, "data_received,42,,\n")
-	all = families(t, e)
+	all = collectAndGather(t, e)
 	assert.NotContains(t, all, metricschema.RequestLatency)
 	assert.NotContains(t, all, metricschema.StatusCounter)
 	assert.Equal(t, float64(42), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
@@ -489,18 +497,17 @@ func TestInvalidCompleteCSVIsStickyUntilReset(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e, run := fixture(t, 10)
 			putCSV(t, run, text)
-			_, err := e.Observe(context.Background(), run)
+			err := e.Collect(context.Background(), run)
 			require.Error(t, err)
-			first := err.Error()
+			first := err
 			appendCSV(t, run, "vus,3,,\n")
+			err = e.Collect(context.Background(), run)
+			require.ErrorIs(t, err, first)
 			_, err = e.Observe(context.Background(), run)
-			require.EqualError(t, err, first)
-			response := scrape(e)
-			assert.Equal(t, http.StatusInternalServerError, response.Code)
-			assert.Contains(t, response.Body.String(), first)
+			require.ErrorIs(t, err, first)
 			putCSV(t, run, csvHeader+"http_req_duration,1,200,https://example.test/\n")
 			e.Reset(run)
-			assert.Equal(t, uint64(1), single(t, families(t, e), metricschema.RequestLatency).GetHistogram().GetSampleCount())
+			assert.Equal(t, uint64(1), single(t, collectAndGather(t, e), metricschema.RequestLatency).GetHistogram().GetSampleCount())
 		})
 	}
 }
@@ -510,7 +517,7 @@ func TestFileLossTruncationAndReplacementFail(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			e, run := fixture(t, 10)
 			putCSV(t, run, csvHeader+"vus,3,,\nhttp_req_duration,12")
-			_, err := e.Observe(context.Background(), run)
+			err := e.Collect(context.Background(), run)
 			require.NoError(t, err)
 			switch action {
 			case "truncate-committed":
@@ -527,9 +534,10 @@ func TestFileLossTruncationAndReplacementFail(t *testing.T) {
 				require.NoError(t, os.Remove(run.ResultFile))
 				require.NoError(t, os.Mkdir(run.ResultFile, 0700))
 			}
-			_, err = e.Observe(context.Background(), run)
+			err = e.Collect(context.Background(), run)
 			require.Error(t, err)
-			assert.Equal(t, http.StatusInternalServerError, scrape(e).Code)
+			_, observationErr := e.Observe(context.Background(), run)
+			assert.ErrorIs(t, observationErr, err)
 		})
 	}
 }
@@ -537,7 +545,7 @@ func TestFileLossTruncationAndReplacementFail(t *testing.T) {
 func TestResetClearsIdentityCountersAndCursor(t *testing.T) {
 	e, run := fixture(t, 0)
 	putCSV(t, run, csvHeader+"http_req_duration,12.5,0,https://example.test/old\ndata_received,120,,\nvus,3,,\n")
-	old := families(t, e)
+	old := collectAndGather(t, e)
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.RequestLatency))["label"])
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.StatusCounter))["label"])
@@ -548,7 +556,9 @@ func TestResetClearsIdentityCountersAndCursor(t *testing.T) {
 	e.Reset(next)
 	_, err := e.Observe(context.Background(), run)
 	require.ErrorContains(t, err, "active run")
-	all := families(t, e)
+	err = e.Collect(context.Background(), run)
+	require.ErrorContains(t, err, "active run")
+	all := collectAndGather(t, e)
 	hist := single(t, all, metricschema.RequestLatency)
 	assert.Equal(t, uint64(1), hist.GetHistogram().GetSampleCount())
 	assert.Equal(t, float64(30), hist.GetHistogram().GetSampleSum())
@@ -563,7 +573,7 @@ func TestLabelBudgetValidationAndUnpreparedExporter(t *testing.T) {
 	require.ErrorContains(t, err, "label_limit")
 	e, err := New(10, agent.NewMetricsRegistry())
 	require.NoError(t, err)
-	assert.Equal(t, http.StatusServiceUnavailable, scrape(e).Code)
+	require.Error(t, e.Collect(context.Background(), agent.RunContext{}))
 	_, err = e.Observe(context.Background(), agent.RunContext{})
 	require.Error(t, err)
 }
@@ -575,7 +585,9 @@ func TestCanceledObservationDoesNotPoisonRun(t *testing.T) {
 	cancel()
 	_, err := e.Observe(ctx, run)
 	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, e.Collect(ctx, run), context.Canceled)
 	assert.Zero(t, e.offset)
+	require.NoError(t, e.Collect(context.Background(), run))
 	state, err := e.Observe(context.Background(), run)
 	require.NoError(t, err)
 	assert.Equal(t, protocol.ObservationReady, state)
@@ -590,10 +602,13 @@ func TestConcurrentObservationAndScrapeDoNotDoubleCount(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			if index%2 == 0 {
+			switch index % 3 {
+			case 0:
+				errorsSeen <- e.Collect(context.Background(), run)
+			case 1:
 				_, err := e.Observe(context.Background(), run)
 				errorsSeen <- err
-			} else {
+			default:
 				response := scrape(e)
 				if response.Code != http.StatusOK {
 					errorsSeen <- fmt.Errorf("scrape: %s", response.Body.String())
@@ -608,7 +623,7 @@ func TestConcurrentObservationAndScrapeDoNotDoubleCount(t *testing.T) {
 	for err := range errorsSeen {
 		require.NoError(t, err)
 	}
-	hist := single(t, families(t, e), metricschema.RequestLatency).GetHistogram()
+	hist := single(t, collectAndGather(t, e), metricschema.RequestLatency).GetHistogram()
 	assert.Equal(t, uint64(100), hist.GetSampleCount())
 	assert.Equal(t, float64(1250), hist.GetSampleSum())
 }

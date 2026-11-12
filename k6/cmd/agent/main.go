@@ -19,7 +19,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	options.WrapMetricsHandler = exporter.WrapHandler
+	options.CollectMetrics = exporter.Collect
 	options = adapter.New(exporter).Options(options)
 	if err := agent.NewAgentServer(options).Run(); err != nil {
 		log.Fatal(err)

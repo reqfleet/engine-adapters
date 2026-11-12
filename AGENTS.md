@@ -47,7 +47,7 @@ k6 CSV rows are independent metric samples, not complete request records:
 ## Use SDK-owned container resource reporting
 
 - Adapters using the SDK registry MUST NOT define duplicate collectors, instantiate a resource sampler, or maintain CPU baselines. The SDK owns the canonical metrics and resource collection; `resources` owns sampling policy and `containerstats` owns raw cgroup reads.
-- The SDK samples on registry scrapes, resets the baseline on successful launch, and retains resource identity after completion. Baseline-only attempts omit both CPU and memory; complete samples publish both. Resource read failures return HTTP 500 without partial exposition or fatal agent exit.
+- The SDK samples resources after launch, every five seconds and once after live monitors finish, then retains completed values without further reads. Baseline-only attempts omit both CPU and memory; complete samples publish both. Resource read failures warn and skip the update, retaining last-good values without failing HTTP or the workload.
 - CPU is average cores over the actual monotonic interval. Memory is cgroup-accounted bytes, including cache. Both measure all processes in the container's cgroup, not just the engine PID. Never add host/process fallbacks or fabricate zero usage.
 - Standalone native exporters remain responsible for their complete exposition and may use `resources.Sampler` directly. Native handler/URL modes do not also collect unused SDK resources. See [the resource reporting contract](k6/README.md#normalization-and-run-lifecycle).
 
@@ -55,8 +55,8 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 - Resolve deployment options once with `agent.LoadAgentServerOptions` and use `AgentServerOptions.LabelsUsageLimit` for the exporter. Do not add adapter-local environment parsing.
 - Preserve resolved options when adding adapter callbacks. Start with `agent.NewAgentServer`, not `MakeAgentServer`, which would resolve environment values again.
-- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. Set `WrapMetricsHandler` to the exporter's middleware; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, and exposition.
-- Keep CSV parsing, normalization and URL admission in the exporter. Drain with the incoming scrape context and retain the exporter lock through the SDK handler. Call `registry.Reset()` together with parser/admission reset in `BeforeStart`, under that same lock. Preserve final CSV and metrics until then.
+- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. Set `CollectMetrics` to the exporter's collection callback; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, collection scheduling and exposition.
+- Keep CSV parsing, normalization and URL admission in the exporter. Collect with the callback context, synchronizing adapter state with observation. The SDK joins live callbacks/processes before a final collection call with a fresh two-second deadline. Call `registry.Reset()` together with parser/admission reset in `BeforeStart`. HTTP only gathers stored metrics; do not wrap it to drain output or sample resources.
 
 ## Preserve and verify the contract
 
@@ -118,12 +118,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112064301-c2293c326b77`, a pinned SDK development snapshot providing per-agent canonical collectors, independent metric updates and scrape-time container resource reporting. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112074140-3fb27bf7e2dc`, a pinned SDK development snapshot providing per-agent canonical collectors, background collection and final post-exit draining. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112064301-c2293c326b77 \
-  -t k6-adapter:sdk-c2293c3 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112074140-3fb27bf7e2dc \
+  -t k6-adapter:sdk-3fb27bf .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.

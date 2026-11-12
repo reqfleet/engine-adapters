@@ -32,8 +32,8 @@ github.com/prometheus/common v0.67.5 h1:pIgK94WWlQt1WLwAC5j2ynLaBRDiinoAb86HZHTU
 github.com/prometheus/common v0.67.5/go.mod h1:SjE/0MzDEEAyrdr5Gqc6G+sXI67maCxzaT3A2+HqjUw=
 github.com/prometheus/procfs v0.16.1 h1:hZ15bTNuirocR6u0JZ6BAHHmwS1p8B4P6MRqxtzMyRg=
 github.com/prometheus/procfs v0.16.1/go.mod h1:teAbpZRB1iIAJYREa1LsoWUXykVXA1KlTmWl8x/U+Is=
-github.com/reqfleet/engine-sdk v0.5.1-0.20261112064301-c2293c326b77 h1:BPeqMbGrJZINc5BI0yatHniS0uasRHBJUSyQmYnFnOM=
-github.com/reqfleet/engine-sdk v0.5.1-0.20261112064301-c2293c326b77/go.mod h1:IhZyP1x3m9LTGqIf72aGPb5ZGTEH7iSmaedt+t+m8X4=
+github.com/reqfleet/engine-sdk v0.5.1-0.20261112074140-3fb27bf7e2dc h1:Gvd+TNGr0MSoO88aSATfo3nyrYEJ6lb0ZuSo4qoxxVc=
+github.com/reqfleet/engine-sdk v0.5.1-0.20261112074140-3fb27bf7e2dc/go.mod h1:IhZyP1x3m9LTGqIf72aGPb5ZGTEH7iSmaedt+t+m8X4=
 github.com/rogpeppe/go-internal v1.10.0 h1:TMyTOH3F/DB16zRVcYyreMH6GnZZrwQVAoYjRBZyWFQ=
 github.com/rogpeppe/go-internal v1.10.0/go.mod h1:UQnix2H7Ngw/k4C5ijL5+65zddjncjaFoBhdsK/akog=
 github.com/sirupsen/logrus v1.8.1 h1:dJKuHgqk1NNQlqoA6BTlM1Wf9DOH3NBjQyu0h9+AZZE=
