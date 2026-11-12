@@ -77,7 +77,7 @@ func New(labelLimit int) (*Exporter, error) {
 		now: time.Now,
 	}
 	if labelLimit == 0 {
-		e.byteLabel = metricschema.OverflowLabel
+		e.byteLabel = metricschema.OverflowRequestName
 	}
 	// SDK histogram bounds: 1, 2.5, then prometheus.DefBuckets in ms.
 	buckets := make([]float64, 2, len(prometheus.DefBuckets)+2)
@@ -312,9 +312,9 @@ func (e *Exporter) point(record []string) error {
 		if _, err := (agent.ShibuyaMetric{Label: url}).LabelIsValid(); err != nil {
 			return nil
 		}
-		label := metricschema.AdmitRequestLabel(url, e.urlLabels, e.labelLimit, "")
-		e.latency.WithLabelValues(run.CollectionID, label, run.RunID, run.AgentID, run.PlanID, run.Zone).Observe(value)
-		e.status.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, label, run.Zone, status).Inc()
+		requestName := metricschema.AdmitRequestName(url, e.urlLabels, e.labelLimit, "")
+		e.latency.WithLabelValues(run.CollectionID, requestName, run.RunID, run.AgentID, run.PlanID, run.Zone).Observe(value)
+		e.status.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, requestName, run.Zone, status).Inc()
 	case "vus":
 		if math.Trunc(value) != value {
 			return fmt.Errorf("invalid fractional vus sample %q", record[e.valueIndex])
