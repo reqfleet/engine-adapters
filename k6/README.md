@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [snapshot 0c5af67](https://github.com/reqfleet/engine-sdk/commit/0c5af67d92e82982c5c55e053cf0b1f8ca906678), pinned in `go.mod` as `v0.5.1-0.20261112124056-0c5af67d92e8` for SDK-owned metric collectors, custom ingestion and the optional public conformance toolkit. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [snapshot 126a81e](https://github.com/reqfleet/engine-sdk/commit/126a81e3e04d454189d66da4ee1a0aac2615133b), pinned in `go.mod` as `v0.5.1-0.20261112221055-126a81e3e04d` for SDK-owned metric collectors, custom ingestion and the optional public conformance toolkit. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
