@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [main snapshot f8c584e](https://github.com/reqfleet/engine-sdk/commit/f8c584e2d6d4), pinned in `go.mod` as `v0.5.1-0.20261112021342-f8c584e2d6d4` for the shared request-name admission API. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [main snapshot 22f3359](https://github.com/reqfleet/engine-sdk/commit/22f33598bc07), pinned in `go.mod` as `v0.5.1-0.20261112045356-22f33598bc07` for shared request-name admission and canonical histogram boundaries. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
@@ -133,7 +133,7 @@ DNS failures and refused connections can have `http_req_duration=0`: k6's reques
 
 The exporter resolves required CSV header names, uses `encoding/csv` including quoted/multiline values, retains its committed offset, retries incomplete tails and processes records once under the same lock for observation and scrapes. Invalid recognized values, complete malformed records, required-column errors and post-start truncation/read errors fail instead of producing fabricated data. Readiness stays pending until a valid standard sample is available. The SDK separately handles a process that exits before readiness is polled.
 
-Collection, plan, run, agent and zone identity come from the current `RunContext`. Histogram boundaries and names follow the public SDK schema.
+Collection, plan, run, agent and zone identity come from the current `RunContext`. The exporter constructs its ordinary histogram with `metricschema.RequestLatencyBuckets()`: caller-owned finite bounds in milliseconds, excluding the `+Inf` bucket added by Prometheus. Shared conformance validation uses the same helper and `metricschema.LLMResponseLatencyBuckets()` for optional LLM responses, appending `+Inf` once at initialization. Independent fixed-profile test fixtures guard against schema drift; k6 itself still reports only the ordinary HTTP histogram.
 
 Resource gauges use the SDK's `containerstats.ReadCPUUsage` and `ReadMemoryUsage`. CPU is the cumulative microsecond delta divided by elapsed wall-clock microseconds, yielding average cores consumed; no CPU gauge is emitted before a second successful sample. Memory is cgroup-accounted bytes, including cache. These measurements cover all processes in the container's cgroup, not just the k6 PID. The SDK expects that cgroup mounted at `/sys/fs/cgroup`: v2 uses `cpu.stat` and `memory.current`; v1 requires the combined `cpu,cpuacct/cpuacct.usage` and `memory/memory.usage_in_bytes` paths. V1 CPU nanoseconds are truncated to microseconds by the SDK. Unavailable resources fail scrapes clearly without advancing the CPU baseline; no host or process fallback is used.
 

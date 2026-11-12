@@ -399,9 +399,9 @@ func validateMetricLabels(metric *dto.Metric, names []string, identity map[strin
 	return labels, nil
 }
 
-// SDK v0.5.0 agent/metrics.go profiles, including the implicit +Inf bucket.
-var requestLatencyBounds = [...]float64{1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, math.Inf(1)}
-var llmResponseLatencyBounds = [...]float64{100, 250, 500, 1000, 2500, 5000, 7500, 10000, 15000, 20000, 30000, 45000, 60000, 90000, 120000, 180000, 300000, math.Inf(1)}
+// Exposition includes the implicit +Inf bucket omitted by collector construction.
+var requestLatencyBounds = append(metricschema.RequestLatencyBuckets(), math.Inf(1))
+var llmResponseLatencyBounds = append(metricschema.LLMResponseLatencyBuckets(), math.Inf(1))
 
 func validateLatency(histogram *dto.Histogram, observations, bounds []float64) (*LatencySnapshot, error) {
 	snapshot, err := validateLatencyStructure(histogram, bounds)

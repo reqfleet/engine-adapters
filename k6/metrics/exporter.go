@@ -79,13 +79,10 @@ func New(labelLimit int) (*Exporter, error) {
 	if labelLimit == 0 {
 		e.byteLabel = metricschema.OverflowRequestName
 	}
-	// SDK histogram bounds: 1, 2.5, then prometheus.DefBuckets in ms.
-	buckets := make([]float64, 2, len(prometheus.DefBuckets)+2)
-	buckets[0], buckets[1] = 1, 2.5
-	for _, bound := range prometheus.DefBuckets {
-		buckets = append(buckets, bound*1000)
-	}
-	e.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: metricschema.RequestLatency, Help: "HTTP request duration in milliseconds.", Buckets: buckets}, metricschema.LatencyLabels())
+	e.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: metricschema.RequestLatency, Help: "HTTP request duration in milliseconds.",
+		Buckets: metricschema.RequestLatencyBuckets(),
+	}, metricschema.LatencyLabels())
 	e.status = prometheus.NewCounterVec(prometheus.CounterOpts{Name: metricschema.StatusCounter, Help: "HTTP responses and transport failures by status."}, metricschema.StatusLabels())
 	e.bytes = prometheus.NewCounterVec(prometheus.CounterOpts{Name: metricschema.EgressBytesCounter, Help: "Received bytes reported by k6."}, metricschema.EgressLabels())
 	e.threads = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricschema.ThreadsGauge, Help: "Actual per-agent active VUs."}, metricschema.ThreadsLabels())
