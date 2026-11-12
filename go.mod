@@ -6,7 +6,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.67.5
-	github.com/reqfleet/engine-sdk v0.5.1-0.20261112051708-839d81c372ef
+	github.com/reqfleet/engine-sdk v0.5.1-0.20261112053133-dea367c0a06e
 	github.com/stretchr/testify v1.11.1
 )
 

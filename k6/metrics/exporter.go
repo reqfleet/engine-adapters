@@ -27,13 +27,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/reqfleet/engine-sdk/agent"
-	"github.com/reqfleet/engine-sdk/containerstats"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
+	"github.com/reqfleet/engine-sdk/resources"
 )
 
 type resourceSampler interface {
-	Sample() (containerstats.Sample, error)
+	Sample() (resources.Sample, error)
 	Reset()
 }
 
@@ -72,7 +72,7 @@ func New(labelLimit int) (*Exporter, error) {
 	}
 	e := &Exporter{
 		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]struct{}),
-		resources: &containerstats.Sampler{},
+		resources: &resources.Sampler{},
 	}
 	if labelLimit == 0 {
 		e.byteLabel = metricschema.OverflowRequestName

@@ -18,9 +18,9 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/reqfleet/engine-adapters/conformance"
 	"github.com/reqfleet/engine-sdk/agent"
-	"github.com/reqfleet/engine-sdk/containerstats"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
+	"github.com/reqfleet/engine-sdk/resources"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -28,14 +28,14 @@ import (
 const csvHeader = "metric_name,metric_value,status,url\n"
 
 type fixedResources struct {
-	sample  containerstats.Sample
+	sample  resources.Sample
 	err     error
 	started bool
 }
 
 func (r *fixedResources) Reset() { r.started = false }
 
-func (r *fixedResources) Sample() (containerstats.Sample, error) {
+func (r *fixedResources) Sample() (resources.Sample, error) {
 	sample := r.sample
 	sample.CPUValid = sample.CPUValid && r.started
 	r.started = true
@@ -46,7 +46,7 @@ func fixture(t *testing.T, budget int) (*Exporter, agent.RunContext) {
 	t.Helper()
 	e, err := New(budget)
 	require.NoError(t, err)
-	e.resources = &fixedResources{sample: containerstats.Sample{CPUValid: true, MemoryBytes: 4096, MemoryValid: true}}
+	e.resources = &fixedResources{sample: resources.Sample{CPUValid: true, MemoryBytes: 4096, MemoryValid: true}}
 	run := agent.RunContext{RunID: "run-one", CollectionID: "collection", PlanID: "plan", AgentID: "agent-2", Zone: "zone-a", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
 	e.Reset(run)
 	return e, run
@@ -605,7 +605,7 @@ func TestCanceledObservationDoesNotPoisonRun(t *testing.T) {
 func TestResourceScrapesOmitStaleRatesAndRecoverFromErrors(t *testing.T) {
 	e, run := fixture(t, 10)
 	putCSV(t, run, csvHeader+"vus,0,,\n")
-	resources := &fixedResources{sample: containerstats.Sample{
+	resources := &fixedResources{sample: resources.Sample{
 		CPUCores: 0.5, CPUValid: true, MemoryBytes: 8192, MemoryValid: true,
 	}}
 	e.resources = resources
