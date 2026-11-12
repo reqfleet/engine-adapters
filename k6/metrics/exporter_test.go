@@ -12,13 +12,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	"github.com/reqfleet/engine-adapters/conformance"
 	"github.com/reqfleet/engine-sdk/agent"
+	"github.com/reqfleet/engine-sdk/containerstats"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
 	"github.com/stretchr/testify/assert"
@@ -27,14 +27,26 @@ import (
 
 const csvHeader = "metric_name,metric_value,status,url\n"
 
+type fixedResources struct {
+	sample  containerstats.Sample
+	err     error
+	started bool
+}
+
+func (r *fixedResources) Reset() { r.started = false }
+
+func (r *fixedResources) Sample() (containerstats.Sample, error) {
+	sample := r.sample
+	sample.CPUValid = sample.CPUValid && r.started
+	r.started = true
+	return sample, r.err
+}
+
 func fixture(t *testing.T, budget int) (*Exporter, agent.RunContext) {
 	t.Helper()
 	e, err := New(budget)
 	require.NoError(t, err)
-	e.readCPUUsage = func() (uint64, error) { return 1_000_000, nil }
-	e.readMemoryUsage = func() (uint64, error) { return 4096, nil }
-	clock := time.Unix(100, 0)
-	e.now = func() time.Time { clock = clock.Add(time.Second); return clock }
+	e.resources = &fixedResources{sample: containerstats.Sample{CPUValid: true, MemoryBytes: 4096, MemoryValid: true}}
 	run := agent.RunContext{RunID: "run-one", CollectionID: "collection", PlanID: "plan", AgentID: "agent-2", Zone: "zone-a", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
 	e.Reset(run)
 	return e, run
@@ -590,56 +602,36 @@ func TestCanceledObservationDoesNotPoisonRun(t *testing.T) {
 	assert.Equal(t, protocol.ObservationReady, state)
 }
 
-func TestResourcesUseRealCPUIntervalsAndFailClearly(t *testing.T) {
+func TestResourceScrapesOmitStaleRatesAndRecoverFromErrors(t *testing.T) {
 	e, run := fixture(t, 10)
 	putCSV(t, run, csvHeader+"vus,0,,\n")
-	cpu := uint64(4_000_000)
-	clock := time.Unix(100, 0)
-	e.readCPUUsage = func() (uint64, error) { return cpu, nil }
-	e.readMemoryUsage = func() (uint64, error) { return 8192, nil }
-	e.now = func() time.Time { return clock }
-	assert.NotContains(t, families(t, e), metricschema.CPUGauge)
-	cpu += 1_000_000
-	clock = clock.Add(2 * time.Second)
+	resources := &fixedResources{sample: containerstats.Sample{
+		CPUCores: 0.5, CPUValid: true, MemoryBytes: 8192, MemoryValid: true,
+	}}
+	e.resources = resources
+	first := families(t, e)
+	assert.NotContains(t, first, metricschema.CPUGauge)
+	assert.Equal(t, float64(8192), single(t, first, metricschema.MemoryGauge).GetGauge().GetValue())
 	all := families(t, e)
 	metric := single(t, all, metricschema.CPUGauge)
 	assert.Equal(t, 0.5, metric.GetGauge().GetValue())
 	assert.Equal(t, map[string]string{"collection_id": "collection", "plan_id": "plan", "run_id": "run-one", "engine_no": "agent-2", "zone": "zone-a"}, metricLabels(metric))
-	assert.Equal(t, float64(8192), single(t, all, metricschema.MemoryGauge).GetGauge().GetValue())
-	clock = clock.Add(time.Second)
-	assert.Zero(t, single(t, families(t, e), metricschema.CPUGauge).GetGauge().GetValue(), "unchanged usage is a real zero")
-	cpu += 500_000
-	clock = clock.Add(500 * time.Millisecond)
-	assert.Equal(t, float64(1), single(t, families(t, e), metricschema.CPUGauge).GetGauge().GetValue(), "subsecond intervals retain their precision")
 
-	for _, resource := range []string{"CPU", "memory"} {
-		cpuReader, memoryReader := e.readCPUUsage, e.readMemoryUsage
-		unavailable := func() (uint64, error) { return 0, errors.New("unavailable") }
-		if resource == "CPU" {
-			e.readCPUUsage = unavailable
-		} else {
-			e.readMemoryUsage = unavailable
-		}
-		cpu += 1_000_000
-		clock = clock.Add(time.Second)
-		response := scrape(e)
-		assert.Equal(t, http.StatusInternalServerError, response.Code)
-		assert.Contains(t, response.Body.String(), "container resources: "+resource+" usage: unavailable")
-		assert.NotContains(t, response.Body.String(), metricschema.RequestLatency)
-		e.readCPUUsage, e.readMemoryUsage = cpuReader, memoryReader
-		clock = clock.Add(time.Second)
-		assert.Equal(t, 0.5, single(t, families(t, e), metricschema.CPUGauge).GetGauge().GetValue(), "failed reads must preserve the last successful baseline")
-	}
-	e.readCPUUsage = func() (uint64, error) { return 1, nil }
-	clock = clock.Add(time.Second)
+	// A sampler rebaseline omits CPU, rather than republishing the previous rate.
+	resources.sample.CPUValid = false
+	assert.NotContains(t, families(t, e), metricschema.CPUGauge)
+	resources.sample.CPUValid = true
+	resources.sample.CPUCores = 0
+	assert.Zero(t, single(t, families(t, e), metricschema.CPUGauge).GetGauge().GetValue(), "valid zero usage remains reportable")
+
+	resources.err = errors.New("CPU usage: unavailable")
 	response := scrape(e)
 	assert.Equal(t, http.StatusInternalServerError, response.Code)
-	assert.Contains(t, response.Body.String(), "moved backwards")
-	// A reset starts a fresh baseline even after a resource error.
-	e.Reset(run)
-	assert.NotContains(t, families(t, e), metricschema.CPUGauge)
-	response = scrape(e)
-	assert.Equal(t, http.StatusInternalServerError, response.Code, "zero elapsed time must not fabricate a rate")
+	assert.Contains(t, response.Body.String(), "container resources: CPU usage: unavailable")
+	assert.NotContains(t, response.Body.String(), metricschema.MemoryGauge, "a failed scrape must not serve partial exposition")
+	resources.err = nil
+	resources.sample.CPUCores = 0.25
+	assert.Equal(t, 0.25, single(t, families(t, e), metricschema.CPUGauge).GetGauge().GetValue())
 }
 
 func TestConcurrentObservationAndScrapeDoNotDoubleCount(t *testing.T) {

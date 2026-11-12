@@ -23,7 +23,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -32,6 +31,11 @@ import (
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
 )
+
+type resourceSampler interface {
+	Sample() (containerstats.Sample, error)
+	Reset()
+}
 
 // Exporter owns one run's cumulative metrics and the persistent scrape endpoint.
 // No reader or goroutine survives a drain; Reset and scrapes share the same lock.
@@ -50,12 +54,7 @@ type Exporter struct {
 	errorCodeIndex                               int
 	ready                                        bool
 	failure                                      error
-	readCPUUsage                                 func() (uint64, error)
-	readMemoryUsage                              func() (uint64, error)
-	now                                          func() time.Time
-	cpuBaseline                                  uint64 // cumulative microseconds
-	cpuAt                                        time.Time
-	cpuStarted                                   bool
+	resources                                    resourceSampler
 	latency                                      *prometheus.HistogramVec
 	status                                       *prometheus.CounterVec
 	bytes                                        *prometheus.CounterVec
@@ -73,8 +72,7 @@ func New(labelLimit int) (*Exporter, error) {
 	}
 	e := &Exporter{
 		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]struct{}),
-		readCPUUsage: containerstats.ReadCPUUsage, readMemoryUsage: containerstats.ReadMemoryUsage,
-		now: time.Now,
+		resources: &containerstats.Sampler{},
 	}
 	if labelLimit == 0 {
 		e.byteLabel = metricschema.OverflowRequestName
@@ -111,7 +109,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.errorCodeIndex = -1
 	clear(e.urlLabels)
 	e.ready, e.failure = false, nil
-	e.cpuBaseline, e.cpuAt, e.cpuStarted = 0, time.Time{}, false
+	e.resources.Reset()
 	e.latency.Reset()
 	e.status.Reset()
 	e.bytes.Reset()
@@ -391,25 +389,20 @@ func transportErrorStatus(code uint64) string {
 }
 
 func (e *Exporter) reportEngineMetrics() error {
-	cpuMicros, err := e.readCPUUsage()
+	sample, err := e.resources.Sample()
 	if err != nil {
-		return fmt.Errorf("CPU usage: %w", err)
+		return err
 	}
-	memoryBytes, err := e.readMemoryUsage()
-	if err != nil {
-		return fmt.Errorf("memory usage: %w", err)
-	}
-	now := e.now()
 	run := e.run
-	if e.cpuStarted {
-		elapsed := now.Sub(e.cpuAt).Seconds()
-		if elapsed <= 0 || cpuMicros < e.cpuBaseline {
-			return errors.New("CPU usage or sampling clock moved backwards")
-		}
-		cores := float64(cpuMicros-e.cpuBaseline) / 1e6 / elapsed
-		e.cpu.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(cores)
+	if sample.CPUValid {
+		e.cpu.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(sample.CPUCores)
+	} else {
+		e.cpu.DeleteLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID)
 	}
-	e.cpuBaseline, e.cpuAt, e.cpuStarted = cpuMicros, now, true
-	e.memory.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(float64(memoryBytes))
+	if sample.MemoryValid {
+		e.memory.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(float64(sample.MemoryBytes))
+	} else {
+		e.memory.DeleteLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID)
+	}
 	return nil
 }

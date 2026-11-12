@@ -46,9 +46,9 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 ## Use SDK-owned container resource reporting
 
-- All adapters that report container CPU or memory MUST use `github.com/reqfleet/engine-sdk/containerstats`: `ReadCPUUsage` and `ReadMemoryUsage`. Do not copy SDK internals or implement adapter-local cgroup readers.
-- `ReadCPUUsage` returns cumulative microseconds for both cgroup versions, not a percentage or core count. Divide its delta by elapsed wall-clock microseconds to report average CPU cores. Omit CPU until two successful samples exist, reset the baseline for each run, and do not advance it on resource-read failures.
-- `ReadMemoryUsage` returns cgroup-accounted bytes, including cache. Both readers measure all processes in the container's cgroup, not just the engine PID. Keep resource metrics agent-level, without request labels.
+- All adapters that report container CPU or memory MUST use `github.com/reqfleet/engine-sdk/containerstats.Sampler`. Do not duplicate CPU baselines, rate calculation, reset rules or cgroup readers.
+- Call `Sample` during collection and `Reset` at each run boundary, serialized with metric identity and publication. The sampler synchronizes its own state and starts no workers. Honor `CPUValid` and `MemoryValid`; omit unavailable samples and remove stale CPU gauges when the sampler rebaselines after a counter decrease.
+- `CPUCores` is average cores over the actual monotonic interval. `MemoryBytes` is cgroup-accounted memory, including cache. Both measure all processes in the container's cgroup, not just the engine PID. Keep resource metrics agent-level, without request labels.
 - Propagate unavailable-resource errors as scrape failures; never fabricate zero usage or add host/process fallbacks. Follow the SDK's supported mount layout and document its limitations. See [the resource reporting contract](k6/README.md#normalization-and-run-lifecycle).
 
 ## Use SDK-owned configuration and HTTP serving
@@ -118,12 +118,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112045356-22f33598bc07`, a pinned SDK main snapshot providing shared request-name admission and canonical histogram boundaries. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112051708-839d81c372ef`, a pinned SDK development snapshot providing shared container resource sampling, request-name admission and canonical histogram boundaries. This argument selects the SDK compiled into the adapter and conformance executable, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112045356-22f33598bc07 \
-  -t k6-adapter:sdk-22f3359 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112051708-839d81c372ef \
+  -t k6-adapter:sdk-839d81c .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
