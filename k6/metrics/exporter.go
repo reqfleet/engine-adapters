@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -40,7 +39,7 @@ type Exporter struct {
 	mu                                           sync.Mutex
 	byteLabel                                    string
 	labelLimit                                   int
-	urlLabels                                    map[string]string
+	urlLabels                                    map[string]struct{}
 	run                                          agent.RunContext
 	active                                       bool
 	offset                                       int64
@@ -73,12 +72,12 @@ func New(labelLimit int) (*Exporter, error) {
 		return nil, errors.New("label_limit must be a nonnegative integer")
 	}
 	e := &Exporter{
-		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]string),
+		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]struct{}),
 		readCPUUsage: containerstats.ReadCPUUsage, readMemoryUsage: containerstats.ReadMemoryUsage,
 		now: time.Now,
 	}
 	if labelLimit == 0 {
-		e.byteLabel = "others"
+		e.byteLabel = metricschema.OverflowRequestName
 	}
 	// SDK histogram bounds: 1, 2.5, then prometheus.DefBuckets in ms.
 	buckets := make([]float64, 2, len(prometheus.DefBuckets)+2)
@@ -313,9 +312,9 @@ func (e *Exporter) point(record []string) error {
 		if _, err := (agent.ShibuyaMetric{Label: url}).LabelIsValid(); err != nil {
 			return nil
 		}
-		label := e.requestLabel(url)
-		e.latency.WithLabelValues(run.CollectionID, label, run.RunID, run.AgentID, run.PlanID, run.Zone).Observe(value)
-		e.status.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, label, run.Zone, status).Inc()
+		requestName := metricschema.AdmitRequestName(url, e.urlLabels, e.labelLimit, "")
+		e.latency.WithLabelValues(run.CollectionID, requestName, run.RunID, run.AgentID, run.PlanID, run.Zone).Observe(value)
+		e.status.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, requestName, run.Zone, status).Inc()
 	case "vus":
 		if math.Trunc(value) != value {
 			return fmt.Errorf("invalid fractional vus sample %q", record[e.valueIndex])
@@ -392,21 +391,6 @@ func transportErrorStatus(code uint64) string {
 		description = "HTTP/2 connection error"
 	}
 	return description + " (k6 " + strconv.FormatUint(code, 10) + ")"
-}
-
-func (e *Exporter) requestLabel(url string) string {
-	// k6's CSV url tag may already be a plan-defined name/grouping value,
-	// rather than the requested URL. The original URL is unavailable here.
-	if label, admitted := e.urlLabels[url]; admitted {
-		return label
-	}
-	if len(e.urlLabels) >= e.labelLimit {
-		return "others"
-	}
-	// CSV fields share the record's storage; retain only the admitted URL.
-	url = strings.Clone(url)
-	e.urlLabels[url] = url
-	return url
 }
 
 func (e *Exporter) reportEngineMetrics() error {

@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [v0.5.0](https://github.com/reqfleet/engine-sdk/releases/tag/v0.5.0), pinned in `go.mod`. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [main snapshot f8c584e](https://github.com/reqfleet/engine-sdk/commit/f8c584e2d6d4), pinned in `go.mod` as `v0.5.1-0.20261112021342-f8c584e2d6d4` for the shared request-name admission API. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
@@ -100,7 +100,7 @@ The entrypoint resolves configuration once with `agent.LoadAgentServerOptions`, 
 
 Request labels must be **shorter than 1024 bytes**, measured in UTF-8 bytes rather than characters. The adapter validates them with the SDK's `agent.ShibuyaMetric.LabelIsValid()`. Values of 1024 bytes or more cause the entire `http_req_duration` sample to be dropped before admission: neither its latency observation nor its status count is recorded. This matches SDK result-event ingestion and applies equally to URLs and plan-defined grouping names. Oversized values are not truncated and do not merge into valid prefixes. Dropping these samples does not latch a CSV/exporter error; readiness still requires a valid standard sample. Independent received-byte and VU samples remain unaffected.
 
-The first N distinct valid labels observed in each run receive their own series; additional valid labels fold into the reserved `label="others"`. Latency and status share the same decision. Admitted labels remain stable after the budget fills. Rejected labels consume no admission slots and are not retained. A zero limit folds every valid request label into `others`, but still drops oversized samples. Reset clears the admitted label set along with the metrics.
+The exporter uses the SDK's `metricschema.AdmitRequestName` helper and `metricschema.OverflowRequestName` constant (`others`) to enforce the request-name budget. A request name identifies a request or request group and is emitted under the unchanged Prometheus `label` key. The first N distinct valid request names observed in each run receive their own series; additional valid names fold into `label="others"`. A source name already equal to `others` does not consume a slot. Latency and status share the same decision. Admitted names remain stable after the budget fills. Rejected names consume no admission slots and are not retained. A zero limit folds every valid request name into `others`, but still drops oversized samples. Reset clears the admitted name set along with the metrics.
 
 The source value is always the CSV `url` tag. k6's [request grouping](https://grafana.com/docs/k6/latest/using-k6/http-requests/#group-urls-under-one-tag), such as a custom `tags.name` or `http.url` template, can replace the emitted `url` with a grouped value before CSV export. The same byte limit applies to that grouping value; the adapter cannot reconstruct URLs omitted by k6. To retain distinct labels, keep emitted values below 1024 bytes, avoid source grouping, and provide enough label slots.
 
@@ -143,7 +143,7 @@ The listener persists after k6 exits so final CSV rows can be drained and cumula
 
 [Makefile](Makefile) builds [Dockerfile](Dockerfile)'s `runtime` target with the repository root as its build context. The default engine is v2.3.0; `K6_VERSION` and its matching `K6_CHECKSUMS_SHA256` build argument select another release. Official archives are verified against the selected release's checksum file, itself checked against the pinned digest. The image includes that release's source and license. See [build configuration](../AGENTS.md#configuring-the-k6-version). Both Linux amd64 and arm64 are supported. The CA-equipped runtime executes as UID/GID **65532**, with writable `/test-data` and `/shibuya-agent/{test-conf,test-result,run-tmp}` and `AGENT_ROOT=/shibuya-agent`.
 
-`ENGINE_SDK_VERSION` selects the SDK compiled into the image, its bundled notices and image metadata; the default is v0.5.0. Image-only overrides do not change the checkout's dependency files. See [SDK build configuration](../AGENTS.md#configuring-the-engine-sdk-version).
+`ENGINE_SDK_VERSION` selects the SDK compiled into the image, its bundled notices and image metadata; the default matches the SDK pseudo-version above. Image-only overrides do not change the checkout's dependency files. See [SDK build configuration](../AGENTS.md#configuring-the-engine-sdk-version).
 
 The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA/authentication and lifecycle. Supply existing coordinator settings/credentials at deployment; none are baked into the image. Do not loosen scheduler security settings to run the adapter. The harness root process is a test-only privileged-port requirement; it explicitly starts the adapter non-root.
 

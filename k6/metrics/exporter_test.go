@@ -234,6 +234,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 	putCSV(t, run, csvHeader+
 		"data_received,10,,https://example.test/bytes\n"+
 		"vus,2,,https://example.test/vus\n"+
+		"http_req_duration,2,201,others\n"+
 		"http_req_duration,10,200,https://example.test/a\n"+
 		"http_req_duration,20,201,https://example.test/b\n"+
 		"http_req_duration,30,500,https://example.test/c\n"+
@@ -242,7 +243,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/a": {count: 1, sum: 10, statuses: map[string]float64{"200": 1}},
 		"https://example.test/b": {count: 1, sum: 20, statuses: map[string]float64{"201": 1}},
-		"others":                 {count: 2, sum: 70, statuses: map[string]float64{"500": 1, "Transport error (cause unavailable)": 1}},
+		"others":                 {count: 3, sum: 72, statuses: map[string]float64{"201": 1, "500": 1, "Transport error (cause unavailable)": 1}},
 	})
 	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, float64(10), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
@@ -255,7 +256,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/a": {count: 2, sum: 15, statuses: map[string]float64{"200": 1, "500": 1}},
 		"https://example.test/b": {count: 2, sum: 27, statuses: map[string]float64{"201": 2}},
-		"others":                 {count: 3, sum: 73, statuses: map[string]float64{"500": 1, "Transport error (cause unavailable)": 1, "200": 1}},
+		"others":                 {count: 4, sum: 75, statuses: map[string]float64{"201": 1, "500": 1, "Transport error (cause unavailable)": 1, "200": 1}},
 	})
 	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, float64(25), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
