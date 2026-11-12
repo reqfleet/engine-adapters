@@ -46,7 +46,7 @@ func fixture(t *testing.T, budget int) (*Exporter, agent.RunContext) {
 	t.Helper()
 	e, err := New(budget)
 	require.NoError(t, err)
-	e.resources = &fixedResources{sample: resources.Sample{CPUValid: true, MemoryBytes: 4096, MemoryValid: true}}
+	e.resources = &fixedResources{sample: resources.Sample{CPUValid: true, MemoryBytes: 4096}}
 	run := agent.RunContext{RunID: "run-one", CollectionID: "collection", PlanID: "plan", AgentID: "agent-2", Zone: "zone-a", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
 	e.Reset(run)
 	return e, run
@@ -606,7 +606,7 @@ func TestResourceScrapesOmitStaleRatesAndRecoverFromErrors(t *testing.T) {
 	e, run := fixture(t, 10)
 	putCSV(t, run, csvHeader+"vus,0,,\n")
 	resources := &fixedResources{sample: resources.Sample{
-		CPUCores: 0.5, CPUValid: true, MemoryBytes: 8192, MemoryValid: true,
+		CPUCores: 0.5, CPUValid: true, MemoryBytes: 8192,
 	}}
 	e.resources = resources
 	first := families(t, e)

@@ -399,10 +399,6 @@ func (e *Exporter) reportEngineMetrics() error {
 	} else {
 		e.cpu.DeleteLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID)
 	}
-	if sample.MemoryValid {
-		e.memory.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(float64(sample.MemoryBytes))
-	} else {
-		e.memory.DeleteLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID)
-	}
+	e.memory.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(float64(sample.MemoryBytes))
 	return nil
 }
