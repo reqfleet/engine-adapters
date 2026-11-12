@@ -6,7 +6,7 @@ CONFORMANCE_IMAGE ?= k6-adapter:conformance
 test: test-unit test-conformance
 
 test-unit:
-	GOWORK=off go test -race -count=1 ./... ../conformance
+	GOWORK=off go test -race -count=1 ./... github.com/reqfleet/engine-sdk/conformance
 
 build:
 	GOWORK=off go build ./cmd/agent
