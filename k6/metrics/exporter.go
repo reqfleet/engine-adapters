@@ -39,7 +39,7 @@ type Exporter struct {
 	mu                                           sync.Mutex
 	byteLabel                                    string
 	labelLimit                                   int
-	urlLabels                                    map[string]string
+	urlLabels                                    map[string]struct{}
 	run                                          agent.RunContext
 	active                                       bool
 	offset                                       int64
@@ -72,7 +72,7 @@ func New(labelLimit int) (*Exporter, error) {
 		return nil, errors.New("label_limit must be a nonnegative integer")
 	}
 	e := &Exporter{
-		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]string),
+		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]struct{}),
 		readCPUUsage: containerstats.ReadCPUUsage, readMemoryUsage: containerstats.ReadMemoryUsage,
 		now: time.Now,
 	}

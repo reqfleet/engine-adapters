@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [bb2a942](https://github.com/reqfleet/engine-sdk/commit/bb2a942bd45d), pinned in `go.mod` as `v0.5.1-0.20261111232624-bb2a942bd45d` for the shared request-label admission API. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [6fc1bc0](https://github.com/reqfleet/engine-sdk/commit/6fc1bc0a36e4), pinned in `go.mod` as `v0.5.1-0.20261112014749-6fc1bc0a36e4` for the shared request-label admission API. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
