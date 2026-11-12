@@ -44,7 +44,6 @@ func (a *Adapter) Options(options agent.AgentServerOptions) agent.AgentServerOpt
 	options.BeforeStart = a.BeforeStart
 	options.BuildCommand = a.BuildCommand
 	options.Observe = a.reporter.Observe
-	options.NativeMetricsSchema = agent.MetricsSchemaShibuyaV1
 	return options
 }
 

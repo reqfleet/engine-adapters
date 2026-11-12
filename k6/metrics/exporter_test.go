@@ -2,7 +2,6 @@ package metrics
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
@@ -20,37 +20,16 @@ import (
 	"github.com/reqfleet/engine-sdk/agent"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
-	"github.com/reqfleet/engine-sdk/resources"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const csvHeader = "metric_name,metric_value,status,url\n"
 
-type fixedResources struct {
-	sample  resources.Sample
-	err     error
-	started bool
-}
-
-func (r *fixedResources) Reset() { r.started = false }
-
-func (r *fixedResources) Sample() (resources.Sample, bool, error) {
-	if r.err != nil {
-		return resources.Sample{}, false, r.err
-	}
-	if !r.started {
-		r.started = true
-		return resources.Sample{}, false, nil
-	}
-	return r.sample, true, nil
-}
-
 func fixture(t *testing.T, budget int) (*Exporter, agent.RunContext) {
 	t.Helper()
-	e, err := New(budget)
+	e, err := New(budget, agent.NewMetricsRegistry())
 	require.NoError(t, err)
-	e.resources = &fixedResources{sample: resources.Sample{MemoryBytes: 4096}}
 	run := agent.RunContext{RunID: "run-one", CollectionID: "collection", PlanID: "plan", AgentID: "agent-2", Zone: "zone-a", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
 	e.Reset(run)
 	return e, run
@@ -72,7 +51,7 @@ func appendCSV(t *testing.T, run agent.RunContext, text string) {
 
 func scrape(e *Exporter) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
-	e.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	e.WrapHandler(promhttp.HandlerFor(e.registry, promhttp.HandlerOpts{})).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	return recorder
 }
 
@@ -168,8 +147,6 @@ func TestExactIndependentSampleMapping(t *testing.T) {
 	assert.Equal(t, float64(3), single(t, all, metricschema.ThreadsGauge).GetGauge().GetValue())
 	assert.Equal(t, float64(200), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
 	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
-	assert.NotContains(t, all, metricschema.CPUGauge, "a single CPU sample has no rate")
-	assert.NotContains(t, all, metricschema.MemoryGauge)
 	for range 3 {
 		next := families(t, e)
 		assert.Equal(t, all[metricschema.RequestLatency], next[metricschema.RequestLatency])
@@ -378,7 +355,6 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 						response := scrape(e)
 						require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 						conformance.AssertMetrics(t, response.Body.String(), expected)
-						expected.Resources = conformance.ResourceExpectation{CPU: conformance.MeasurementRequired, Memory: conformance.MeasurementRequired}
 					}
 				}
 			})
@@ -558,7 +534,7 @@ func TestFileLossTruncationAndReplacementFail(t *testing.T) {
 	}
 }
 
-func TestResetClearsIdentityCountersCursorAndCPU(t *testing.T) {
+func TestResetClearsIdentityCountersAndCursor(t *testing.T) {
 	e, run := fixture(t, 0)
 	putCSV(t, run, csvHeader+"http_req_duration,12.5,0,https://example.test/old\ndata_received,120,,\nvus,3,,\n")
 	old := families(t, e)
@@ -566,7 +542,6 @@ func TestResetClearsIdentityCountersCursorAndCPU(t *testing.T) {
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.StatusCounter))["label"])
 	assert.Equal(t, "Transport error (cause unavailable)", metricLabels(single(t, old, metricschema.StatusCounter))["status"])
-	assert.Contains(t, families(t, e), metricschema.CPUGauge)
 	next := run
 	next.RunID, next.CollectionID, next.PlanID, next.AgentID, next.Zone = "new-run", "new-collection", "new-plan", "new-agent", "new-zone"
 	putCSV(t, next, csvHeader+"http_req_duration,30,500,https://example.test/new\n")
@@ -578,17 +553,15 @@ func TestResetClearsIdentityCountersCursorAndCPU(t *testing.T) {
 	assert.Equal(t, uint64(1), hist.GetHistogram().GetSampleCount())
 	assert.Equal(t, float64(30), hist.GetHistogram().GetSampleSum())
 	assert.Equal(t, map[string]string{"collection_id": "new-collection", "plan_id": "new-plan", "run_id": "new-run", "engine_no": "new-agent", "zone": "new-zone", "label": "others"}, metricLabels(hist))
-	assert.NotContains(t, all, metricschema.CPUGauge)
-	assert.NotContains(t, all, metricschema.MemoryGauge)
 	assert.NotContains(t, all, metricschema.EgressBytesCounter)
 	assert.NotContains(t, all, metricschema.ThreadsGauge)
 	assert.Equal(t, "500", metricLabels(single(t, all, metricschema.StatusCounter))["status"])
 }
 
 func TestLabelBudgetValidationAndUnpreparedExporter(t *testing.T) {
-	_, err := New(-1)
+	_, err := New(-1, agent.NewMetricsRegistry())
 	require.ErrorContains(t, err, "label_limit")
-	e, err := New(10)
+	e, err := New(10, agent.NewMetricsRegistry())
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusServiceUnavailable, scrape(e).Code)
 	_, err = e.Observe(context.Background(), agent.RunContext{})
@@ -606,40 +579,6 @@ func TestCanceledObservationDoesNotPoisonRun(t *testing.T) {
 	state, err := e.Observe(context.Background(), run)
 	require.NoError(t, err)
 	assert.Equal(t, protocol.ObservationReady, state)
-}
-
-func TestResourceScrapesOmitStaleRatesAndRecoverFromErrors(t *testing.T) {
-	e, run := fixture(t, 10)
-	putCSV(t, run, csvHeader+"vus,0,,\n")
-	resources := &fixedResources{sample: resources.Sample{
-		CPUCores: 0.5, MemoryBytes: 8192,
-	}}
-	e.resources = resources
-	first := families(t, e)
-	assert.NotContains(t, first, metricschema.CPUGauge)
-	assert.NotContains(t, first, metricschema.MemoryGauge)
-	all := families(t, e)
-	metric := single(t, all, metricschema.CPUGauge)
-	assert.Equal(t, 0.5, metric.GetGauge().GetValue())
-	assert.Equal(t, map[string]string{"collection_id": "collection", "plan_id": "plan", "run_id": "run-one", "engine_no": "agent-2", "zone": "zone-a"}, metricLabels(metric))
-	assert.Equal(t, float64(8192), single(t, all, metricschema.MemoryGauge).GetGauge().GetValue())
-
-	// Rebaselining omits both resources instead of republishing stale values.
-	resources.Reset()
-	baseline := families(t, e)
-	assert.NotContains(t, baseline, metricschema.CPUGauge)
-	assert.NotContains(t, baseline, metricschema.MemoryGauge)
-	resources.sample.CPUCores = 0
-	assert.Zero(t, single(t, families(t, e), metricschema.CPUGauge).GetGauge().GetValue(), "valid zero usage remains reportable")
-
-	resources.err = errors.New("CPU usage: unavailable")
-	response := scrape(e)
-	assert.Equal(t, http.StatusInternalServerError, response.Code)
-	assert.Contains(t, response.Body.String(), "container resources: CPU usage: unavailable")
-	assert.NotContains(t, response.Body.String(), metricschema.MemoryGauge, "a failed scrape must not serve partial exposition")
-	resources.err = nil
-	resources.sample.CPUCores = 0.25
-	assert.Equal(t, 0.25, single(t, families(t, e), metricschema.CPUGauge).GetGauge().GetValue())
 }
 
 func TestConcurrentObservationAndScrapeDoNotDoubleCount(t *testing.T) {

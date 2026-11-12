@@ -1,15 +1,12 @@
 // Package metrics translates independent k6 CSV points into shibuya-v1 metrics.
 //
-// Collection reads the result file written by k6's --out csv option. The HTTP
-// endpoint serves the normalized results; it is not the collection source.
-//
-// CSV rows are independent metric samples, not complete request events. The SDK's
-// MetricParser returns a ShibuyaMetric whose ToPrometheus method updates latency,
-// status, concurrency and bytes together. Sending a vus or data_received sample
-// through that path would fabricate a request and a latency observation.
-// Instead, the exporter parses CSV directly, updates only the relevant metric
-// family for each sample, and serves the SDK's authenticated metrics route as an
-// in-process handler. See ../README.md for the CSV format and sample mapping.
+// Collection reads the result file written by k6's --out csv option. CSV rows
+// are independent samples, not complete request events. The exporter updates
+// SDK-owned collectors through separate request, byte, and concurrency methods,
+// without fabricating requests for VU or byte samples. Its HTTP middleware drains
+// final output and holds the run lock through SDK sampling and gathering.
+// The SDK owns metric definitions, resource sampling, exposition and authentication.
+// See ../README.md for the CSV format and sample mapping.
 package metrics
 
 import (
@@ -24,20 +21,12 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/reqfleet/engine-sdk/agent"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
-	"github.com/reqfleet/engine-sdk/resources"
 )
 
-type resourceSampler interface {
-	Sample() (resources.Sample, bool, error)
-	Reset()
-}
-
-// Exporter owns one run's cumulative metrics and the persistent scrape endpoint.
+// Exporter owns CSV ingestion and admission state for one run.
 // No reader or goroutine survives a drain; Reset and scrapes share the same lock.
 type Exporter struct {
 	mu                                           sync.Mutex
@@ -54,45 +43,25 @@ type Exporter struct {
 	errorCodeIndex                               int
 	ready                                        bool
 	failure                                      error
-	resources                                    resourceSampler
-	latency                                      *prometheus.HistogramVec
-	status                                       *prometheus.CounterVec
-	bytes                                        *prometheus.CounterVec
-	threads                                      *prometheus.GaugeVec
-	cpu                                          *prometheus.GaugeVec
-	memory                                       *prometheus.GaugeVec
-	handler                                      http.Handler
+	registry                                     *agent.MetricsRegistry
 }
 
-// New validates the per-run URL label budget. Additional URLs use the SDK's
-// reserved overflow label; received bytes retain a separate aggregate label.
-func New(labelLimit int) (*Exporter, error) {
+// New validates the per-run URL label budget and uses the SDK's collectors.
+// Additional URLs use the reserved overflow label; bytes keep aggregate attribution.
+func New(labelLimit int, registry *agent.MetricsRegistry) (*Exporter, error) {
 	if labelLimit < 0 {
 		return nil, errors.New("label_limit must be a nonnegative integer")
 	}
+	if registry == nil {
+		return nil, errors.New("SDK metrics registry is required")
+	}
 	e := &Exporter{
 		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]struct{}),
-		resources: &resources.Sampler{},
+		registry: registry,
 	}
 	if labelLimit == 0 {
 		e.byteLabel = metricschema.OverflowRequestName
 	}
-	e.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name: metricschema.RequestLatency, Help: "HTTP request duration in milliseconds.",
-		Buckets: metricschema.RequestLatencyBuckets(),
-	}, metricschema.LatencyLabels())
-	e.status = prometheus.NewCounterVec(prometheus.CounterOpts{Name: metricschema.StatusCounter, Help: "HTTP responses and transport failures by status."}, metricschema.StatusLabels())
-	e.bytes = prometheus.NewCounterVec(prometheus.CounterOpts{Name: metricschema.EgressBytesCounter, Help: "Received bytes reported by k6."}, metricschema.EgressLabels())
-	e.threads = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricschema.ThreadsGauge, Help: "Actual per-agent active VUs."}, metricschema.ThreadsLabels())
-	e.cpu = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricschema.CPUGauge, Help: "CPU cores consumed by the container."}, metricschema.ResourceLabels())
-	e.memory = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricschema.MemoryGauge, Help: "Container memory usage in bytes."}, metricschema.ResourceLabels())
-	registry := prometheus.NewRegistry()
-	for _, collector := range []prometheus.Collector{e.latency, e.status, e.bytes, e.threads, e.cpu, e.memory} {
-		if err := registry.Register(collector); err != nil {
-			return nil, err
-		}
-	}
-	e.handler = promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
 	return e, nil
 }
 
@@ -109,13 +78,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.errorCodeIndex = -1
 	clear(e.urlLabels)
 	e.ready, e.failure = false, nil
-	e.resources.Reset()
-	e.latency.Reset()
-	e.status.Reset()
-	e.bytes.Reset()
-	e.threads.Reset()
-	e.cpu.Reset()
-	e.memory.Reset()
+	e.registry.Reset()
 }
 
 // Observe rejects callbacks from a retired run without disturbing the active run.
@@ -134,28 +97,27 @@ func (e *Exporter) Observe(ctx context.Context, run agent.RunContext) (protocol.
 	return protocol.ObservationReady, nil
 }
 
-// ServeHTTP drains final output even after the subprocess exits. The SDK owns
-// cleanup; until the next Reset, unchanged files retain their cumulative totals.
-func (e *Exporter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if !e.active {
-		http.Error(w, "no prepared run", http.StatusServiceUnavailable)
-		return
-	}
-	if err := e.drain(r.Context()); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if !e.ready {
-		http.Error(w, "waiting for a valid k6 sample", http.StatusServiceUnavailable)
-		return
-	}
-	if err := e.reportEngineMetrics(); err != nil {
-		http.Error(w, "container resources: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	e.handler.ServeHTTP(w, r)
+// WrapHandler drains final output even after the subprocess exits and retains
+// the run lock through SDK resource sampling and exposition. Until the next Reset,
+// unchanged files retain their cumulative totals.
+func (e *Exporter) WrapHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if !e.active {
+			http.Error(w, "no prepared run", http.StatusServiceUnavailable)
+			return
+		}
+		if err := e.drain(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !e.ready {
+			http.Error(w, "waiting for a valid k6 sample", http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (e *Exporter) fail(err error) error {
@@ -275,7 +237,10 @@ func (e *Exporter) point(record []string) error {
 	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 		return fmt.Errorf("invalid %s sample %q", name, record[e.valueIndex])
 	}
-	run := e.run
+	metric := agent.ShibuyaMetric{
+		CollectionID: e.run.CollectionID, PlanID: e.run.PlanID, RunID: e.run.RunID,
+		EngineID: e.run.AgentID, Zone: e.run.Zone,
+	}
 	switch name {
 	case "http_req_duration":
 		url := record[e.urlIndex]
@@ -307,16 +272,18 @@ func (e *Exporter) point(record []string) error {
 		if _, err := (agent.ShibuyaMetric{Label: url}).LabelIsValid(); err != nil {
 			return nil
 		}
-		requestName := metricschema.AdmitRequestName(url, e.urlLabels, e.labelLimit, "")
-		e.latency.WithLabelValues(run.CollectionID, requestName, run.RunID, run.AgentID, run.PlanID, run.Zone).Observe(value)
-		e.status.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, requestName, run.Zone, status).Inc()
+		metric.Label = metricschema.AdmitRequestName(url, e.urlLabels, e.labelLimit, "")
+		metric.Status, metric.Latency = status, value
+		e.registry.ObserveRequest(metric)
 	case "vus":
 		if math.Trunc(value) != value {
 			return fmt.Errorf("invalid fractional vus sample %q", record[e.valueIndex])
 		}
-		e.threads.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, run.Zone).Set(value)
+		metric.Threads = value
+		e.registry.SetConcurrency(metric)
 	case "data_received":
-		e.bytes.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.AgentID, e.byteLabel, run.Zone).Add(value)
+		metric.Label, metric.EgressBytes = e.byteLabel, value
+		e.registry.AddReceivedBytes(metric)
 	}
 	e.ready = true
 	return nil
@@ -386,20 +353,4 @@ func transportErrorStatus(code uint64) string {
 		description = "HTTP/2 connection error"
 	}
 	return description + " (k6 " + strconv.FormatUint(code, 10) + ")"
-}
-
-func (e *Exporter) reportEngineMetrics() error {
-	sample, ok, err := e.resources.Sample()
-	if err != nil {
-		return err
-	}
-	run := e.run
-	if !ok {
-		e.cpu.DeleteLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID)
-		e.memory.DeleteLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID)
-		return nil
-	}
-	e.cpu.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(sample.CPUCores)
-	e.memory.WithLabelValues(run.CollectionID, run.PlanID, run.RunID, run.Zone, run.AgentID).Set(float64(sample.MemoryBytes))
-	return nil
 }
