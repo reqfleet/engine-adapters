@@ -26,12 +26,19 @@ import (
 
 const csvHeader = "metric_name,metric_value,status,url\n"
 
-func fixture(t *testing.T, budget int) (*Exporter, agent.RunContext) {
+type exporterFixture struct {
+	*Exporter
+	registry *agent.MetricsRegistry
+}
+
+func fixture(t *testing.T, budget int) (*exporterFixture, agent.RunContext) {
 	t.Helper()
-	e, err := New(budget, agent.NewMetricsRegistry())
+	registry := agent.NewMetricsRegistry()
+	exporter, err := New(budget, registry)
 	require.NoError(t, err)
+	e := &exporterFixture{Exporter: exporter, registry: registry}
 	run := agent.RunContext{RunID: "run-one", CollectionID: "collection", PlanID: "plan", AgentID: "agent-2", Zone: "zone-a", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
-	require.NoError(t, e.Reset(run))
+	e.Reset(run)
 	return e, run
 }
 
@@ -49,15 +56,15 @@ func appendCSV(t *testing.T, run agent.RunContext, text string) {
 	require.NoError(t, file.Close())
 }
 
-func scrape(e *Exporter) *httptest.ResponseRecorder {
+func scrape(e *exporterFixture) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	promhttp.HandlerFor(e.registry, promhttp.HandlerOpts{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	return recorder
 }
 
-func collectAndGather(t *testing.T, e *Exporter) map[string]*dto.MetricFamily {
+func collectAndGather(t *testing.T, e *exporterFixture) map[string]*dto.MetricFamily {
 	t.Helper()
-	require.NoError(t, e.Collect(context.Background(), e.run))
+	require.NoError(t, e.Collect(context.Background(), agent.RunContext{RunID: e.runID}))
 	recorder := scrape(e)
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	parser := expfmt.NewTextParser(model.LegacyValidation)
@@ -219,7 +226,7 @@ func TestTransportErrorMetadataResetsWithRun(t *testing.T) {
 	// Missing error metadata cannot identify a cause, but must not suppress
 	// the failed request or reuse the previous run's column position.
 	putCSV(t, run, csvHeader+"http_req_duration,0,0,http://127.0.0.1:1/\n")
-	require.NoError(t, e.Reset(run))
+	e.Reset(run)
 	assertRequestMetrics(t, collectAndGather(t, e), map[string]requestMetrics{
 		"http://127.0.0.1:1/": {count: 1, sum: 0, statuses: map[string]float64{"Transport error (cause unavailable)": 1}},
 	})
@@ -262,7 +269,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 		"http_req_duration,4,200,https://example.test/c\n"+
 		"http_req_duration,6,201,https://example.test/d\n"+
 		"http_req_duration,8,500,https://example.test/a\n")
-	require.NoError(t, e.Reset(run))
+	e.Reset(run)
 	all = collectAndGather(t, e)
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/c": {count: 1, sum: 4, statuses: map[string]float64{"200": 1}},
@@ -311,7 +318,7 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 					atLimit, overLimit := valid+"b", valid+"bc"
 					// Oversized values must not merge into their valid prefix.
 					run.RunID = revision
-					require.NoError(t, e.Reset(run))
+					e.Reset(run)
 					putCSV(t, run, csvHeader+fmt.Sprintf(
 						"http_req_duration,1,200,%s\n"+
 							"http_req_duration,2,500,%s\n",
@@ -506,7 +513,7 @@ func TestInvalidCompleteCSVIsStickyUntilReset(t *testing.T) {
 			_, err = e.Observe(context.Background(), run)
 			require.ErrorIs(t, err, first)
 			putCSV(t, run, csvHeader+"http_req_duration,1,200,https://example.test/\n")
-			require.NoError(t, e.Reset(run))
+			e.Reset(run)
 			assert.Equal(t, uint64(1), single(t, collectAndGather(t, e), metricschema.RequestLatency).GetHistogram().GetSampleCount())
 		})
 	}
@@ -553,12 +560,15 @@ func TestResetClearsIdentityCountersAndCursor(t *testing.T) {
 	next := run
 	next.RunID, next.CollectionID, next.PlanID, next.AgentID, next.Zone = "new-run", "new-collection", "new-plan", "new-agent", "new-zone"
 	putCSV(t, next, csvHeader+"http_req_duration,30,500,https://example.test/new\n")
-	require.NoError(t, e.Reset(next))
+	e.Reset(next)
 	_, err := e.Observe(context.Background(), run)
 	require.ErrorContains(t, err, "active run")
-	err = e.Collect(context.Background(), run)
-	require.ErrorContains(t, err, "active run")
+	require.ErrorContains(t, e.Collect(context.Background(), run), "active run")
 	all := collectAndGather(t, e)
+	// Callback routing needs only the run ID; Reset already supplied the CSV path.
+	state, err := e.Observe(context.Background(), agent.RunContext{RunID: next.RunID})
+	require.NoError(t, err)
+	assert.Equal(t, protocol.ObservationReady, state)
 	hist := single(t, all, metricschema.RequestLatency)
 	assert.Equal(t, uint64(1), hist.GetHistogram().GetSampleCount())
 	assert.Equal(t, float64(30), hist.GetHistogram().GetSampleSum())
@@ -566,11 +576,28 @@ func TestResetClearsIdentityCountersAndCursor(t *testing.T) {
 	assert.NotContains(t, all, metricschema.EgressBytesCounter)
 	assert.NotContains(t, all, metricschema.ThreadsGauge)
 	assert.Equal(t, "500", metricLabels(single(t, all, metricschema.StatusCounter))["status"])
+
+	appendCSV(t, next, "data_received,19,,\nvus,2,,\n")
+	all = collectAndGather(t, e)
+	assert.Equal(t, float64(19), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
+	assert.Equal(t, float64(2), single(t, all, metricschema.ThreadsGauge).GetGauge().GetValue())
+	for _, family := range all {
+		for _, metric := range family.Metric {
+			labels := metricLabels(metric)
+			assert.Equal(t, "new-collection", labels["collection_id"])
+			assert.Equal(t, "new-plan", labels["plan_id"])
+			assert.Equal(t, "new-run", labels["run_id"])
+			assert.Equal(t, "new-agent", labels["engine_no"])
+			assert.Equal(t, "new-zone", labels["zone"])
+		}
+	}
 }
 
 func TestLabelBudgetValidationAndUnpreparedExporter(t *testing.T) {
 	_, err := New(-1, agent.NewMetricsRegistry())
-	require.ErrorContains(t, err, "label_limit")
+	require.Error(t, err)
+	_, err = New(10, nil)
+	require.Error(t, err)
 	e, err := New(10, agent.NewMetricsRegistry())
 	require.NoError(t, err)
 	require.Error(t, e.Collect(context.Background(), agent.RunContext{}))

@@ -30,9 +30,8 @@ import (
 type Exporter struct {
 	mu                                           sync.Mutex
 	byteLabel                                    string
-	labelLimit                                   int
 	recorder                                     *agent.MetricsRecorder
-	run                                          agent.RunContext
+	runID, resultFile                            string
 	active                                       bool
 	offset                                       int64
 	observedSize                                 int64
@@ -42,21 +41,18 @@ type Exporter struct {
 	errorCodeIndex                               int
 	ready                                        bool
 	failure                                      error
-	registry                                     *agent.MetricsRegistry
 }
 
 // New validates the per-run URL label budget and uses the SDK's collectors.
 // Additional URLs use the reserved overflow label; bytes keep aggregate attribution.
 func New(labelLimit int, registry *agent.MetricsRegistry) (*Exporter, error) {
-	if labelLimit < 0 {
-		return nil, errors.New("label_limit must be a nonnegative integer")
-	}
-	if registry == nil {
-		return nil, errors.New("SDK metrics registry is required")
+	recorder, err := agent.NewMetricsRecorder(registry, labelLimit)
+	if err != nil {
+		return nil, err
 	}
 	e := &Exporter{
-		byteLabel: "k6", labelLimit: labelLimit,
-		registry: registry,
+		byteLabel: "k6",
+		recorder:  recorder,
 	}
 	if labelLimit == 0 {
 		e.byteLabel = metricschema.OverflowRequestName
@@ -64,25 +60,20 @@ func New(labelLimit int, registry *agent.MetricsRegistry) (*Exporter, error) {
 	return e, nil
 }
 
-// Reset accepts a validated SDK run snapshot after its workspace was reset.
+// Reset binds the assigned run identity and clears SDK reporting and CSV state.
+// The SDK must finish prior-run collection before calling it in BeforeStart.
 // Call even when later adapter settings validation fails, to retire old metrics.
-func (e *Exporter) Reset(run agent.RunContext) error {
+func (e *Exporter) Reset(run agent.RunContext) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	recorder, err := agent.NewMetricsRecorder(e.registry, e.labelLimit)
-	if err != nil {
-		return err
-	}
-	e.run = agent.RunContext{RunID: run.RunID, CollectionID: run.CollectionID, PlanID: run.PlanID, AgentID: run.AgentID, Zone: run.Zone, ResultFile: run.ResultFile}
+	e.runID, e.resultFile = run.RunID, run.ResultFile
 	e.active = true
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
 	e.errorCodeIndex = -1
-	e.recorder = recorder
 	e.ready, e.failure = false, nil
-	e.registry.Reset()
-	return nil
+	e.recorder.Reset(run)
 }
 
 // Observe reads cached readiness without collecting or changing the active run.
@@ -115,10 +106,10 @@ func (e *Exporter) Collect(ctx context.Context, run agent.RunContext) error {
 	return e.drain(ctx)
 }
 
+// matchesRun guards the CSV cursor against callbacks for another run.
+// Reporting identity is bound and applied exclusively by the SDK recorder.
 func (e *Exporter) matchesRun(run agent.RunContext) bool {
-	return e.active && run.RunID == e.run.RunID && run.CollectionID == e.run.CollectionID &&
-		run.PlanID == e.run.PlanID && run.AgentID == e.run.AgentID &&
-		run.Zone == e.run.Zone && run.ResultFile == e.run.ResultFile
+	return e.active && run.RunID == e.runID
 }
 
 func (e *Exporter) fail(err error) error {
@@ -150,7 +141,7 @@ func (e *Exporter) drain(ctx context.Context) error {
 	if e.failure != nil {
 		return e.failure
 	}
-	file, err := os.Open(e.run.ResultFile)
+	file, err := os.Open(e.resultFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) && e.fileInfo == nil {
 			return nil
@@ -238,10 +229,7 @@ func (e *Exporter) point(record []string) error {
 	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 		return fmt.Errorf("invalid %s sample %q", name, record[e.valueIndex])
 	}
-	metric := agent.ShibuyaMetric{
-		CollectionID: e.run.CollectionID, PlanID: e.run.PlanID, RunID: e.run.RunID,
-		EngineID: e.run.AgentID, Zone: e.run.Zone,
-	}
+	var metric agent.ShibuyaMetric
 	switch name {
 	case "http_req_duration":
 		url := record[e.urlIndex]
