@@ -31,7 +31,7 @@ func fixture(t *testing.T, budget int) (*Exporter, agent.RunContext) {
 	e, err := New(budget, agent.NewMetricsRegistry())
 	require.NoError(t, err)
 	run := agent.RunContext{RunID: "run-one", CollectionID: "collection", PlanID: "plan", AgentID: "agent-2", Zone: "zone-a", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
-	e.Reset(run)
+	require.NoError(t, e.Reset(run))
 	return e, run
 }
 
@@ -219,7 +219,7 @@ func TestTransportErrorMetadataResetsWithRun(t *testing.T) {
 	// Missing error metadata cannot identify a cause, but must not suppress
 	// the failed request or reuse the previous run's column position.
 	putCSV(t, run, csvHeader+"http_req_duration,0,0,http://127.0.0.1:1/\n")
-	e.Reset(run)
+	require.NoError(t, e.Reset(run))
 	assertRequestMetrics(t, collectAndGather(t, e), map[string]requestMetrics{
 		"http://127.0.0.1:1/": {count: 1, sum: 0, statuses: map[string]float64{"Transport error (cause unavailable)": 1}},
 	})
@@ -262,7 +262,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 		"http_req_duration,4,200,https://example.test/c\n"+
 		"http_req_duration,6,201,https://example.test/d\n"+
 		"http_req_duration,8,500,https://example.test/a\n")
-	e.Reset(run)
+	require.NoError(t, e.Reset(run))
 	all = collectAndGather(t, e)
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/c": {count: 1, sum: 4, statuses: map[string]float64{"200": 1}},
@@ -311,7 +311,7 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 					atLimit, overLimit := valid+"b", valid+"bc"
 					// Oversized values must not merge into their valid prefix.
 					run.RunID = revision
-					e.Reset(run)
+					require.NoError(t, e.Reset(run))
 					putCSV(t, run, csvHeader+fmt.Sprintf(
 						"http_req_duration,1,200,%s\n"+
 							"http_req_duration,2,500,%s\n",
@@ -506,7 +506,7 @@ func TestInvalidCompleteCSVIsStickyUntilReset(t *testing.T) {
 			_, err = e.Observe(context.Background(), run)
 			require.ErrorIs(t, err, first)
 			putCSV(t, run, csvHeader+"http_req_duration,1,200,https://example.test/\n")
-			e.Reset(run)
+			require.NoError(t, e.Reset(run))
 			assert.Equal(t, uint64(1), single(t, collectAndGather(t, e), metricschema.RequestLatency).GetHistogram().GetSampleCount())
 		})
 	}
@@ -553,7 +553,7 @@ func TestResetClearsIdentityCountersAndCursor(t *testing.T) {
 	next := run
 	next.RunID, next.CollectionID, next.PlanID, next.AgentID, next.Zone = "new-run", "new-collection", "new-plan", "new-agent", "new-zone"
 	putCSV(t, next, csvHeader+"http_req_duration,30,500,https://example.test/new\n")
-	e.Reset(next)
+	require.NoError(t, e.Reset(next))
 	_, err := e.Observe(context.Background(), run)
 	require.ErrorContains(t, err, "active run")
 	err = e.Collect(context.Background(), run)

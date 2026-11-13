@@ -22,7 +22,7 @@ import (
 // Reporter coordinates run resets with readiness. The metrics exporter also
 // synchronizes these methods with its SDK-scheduled collection callback.
 type Reporter interface {
-	Reset(agent.RunContext)
+	Reset(agent.RunContext) error
 	Observe(context.Context, agent.RunContext) (protocol.Observation, error)
 }
 
@@ -97,7 +97,9 @@ func decodeSettings(raw json.RawMessage) (settings, error) {
 
 func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	a.preparedRun, a.entry = "", ""
-	a.reporter.Reset(run)
+	if err := a.reporter.Reset(run); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
