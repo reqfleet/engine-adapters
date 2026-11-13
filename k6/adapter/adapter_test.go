@@ -17,7 +17,10 @@ import (
 
 type reporter struct{ resets []string }
 
-func (r *reporter) Reset(run agent.RunContext) { r.resets = append(r.resets, run.RunID) }
+func (r *reporter) Reset(run agent.RunContext) error {
+	r.resets = append(r.resets, run.RunID)
+	return nil
+}
 func (*reporter) Observe(context.Context, agent.RunContext) (protocol.Observation, error) {
 	return protocol.ObservationPending, nil
 }

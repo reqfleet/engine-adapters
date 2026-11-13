@@ -31,9 +31,9 @@ For the k6 adapter, group request metrics by the CSV `url` value, subject to the
 - Use the URL as `label` for latency histograms and status counters. Repeated valid labels accumulate together; distinct values remain separate within the label budget.
 - Do not collapse request metrics under an engine-wide `k6` label. Missing URL attribution for received bytes is not a reason to discard URL attribution from latency or status metrics.
 - Do not substitute the CSV `name` column, normalize paths, truncate values, or remove query strings. k6 can rewrite the `url` tag when a script uses custom name/grouping options; do not invent a discarded original URL.
-- Validate request labels with the SDK's `agent.ShibuyaMetric.LabelIsValid()`. Preserve valid values exactly. Drop an oversized `http_req_duration` sample, including both its latency observation and status count, before admission without failing the run. Labels of 1024 bytes or more must not consume slots, enter overflow, or merge into shorter prefixes. This applies equally to URLs and grouping names; independent byte and VU samples remain unaffected.
-- Apply the same request-name admission decision to latency and status with the SDK's `metricschema.AdmitRequestName`; use `metricschema.OverflowRequestName` instead of an adapter-local overflow string. Admit the first `label_limit` distinct valid request names per run, keep admitted names stable, and fold additional valid names into `others`. The reserved overflow name never consumes a slot. A zero limit folds all valid request names into `others`; it does not bypass validation. Request names are emitted under the unchanged Prometheus `label` key.
-- Bound admission state by the label limit and clear it on every run reset, together with metric collectors. Keep run, plan, collection, agent and zone identity in their own schema labels.
+- Pass original request labels to the SDK recorder; it checks the request-label byte limit before admission. Preserve valid values exactly. Drop a rejected oversized `http_req_duration` sample, including both its latency observation and status count, without failing the run or marking readiness. Labels of 1024 bytes or more must not consume slots, enter overflow, or merge into shorter prefixes. This applies equally to URLs and grouping names; independent byte and VU samples remain unaffected.
+- Use `MetricsRecorder.ObserveRequest` so the SDK applies the same admission decision to latency and status. Do not keep an adapter admission map or call `metricschema.AdmitRequestName` before recording. The SDK admits the first `label_limit` distinct valid request names per run, keeps admitted names stable, and folds additional valid names into `others`. The reserved overflow name never consumes a slot. A zero limit folds all valid request names into `others`; it does not bypass validation. Request names are emitted under the unchanged Prometheus `label` key.
+- Create a fresh recorder on every exporter reset while clearing metric collectors under the exporter state lock. Registry reset alone does not clear recorder admission. Keep run, plan, collection, agent and zone identity in their own schema labels.
 
 ## Preserve metric attribution boundaries
 
@@ -43,7 +43,7 @@ k6 CSV rows are independent metric samples, not complete request records:
 - Standard `data_received` samples lack request URL attribution. Keep received bytes aggregate under `label="k6"` (`others` when the label limit is zero). They must not consume URL admission slots or produce per-URL byte series.
 - Per-URL bandwidth is unavailable, not zero. Never assign bytes to requests by row order, matching timestamps, or copying totals to every URL.
 - VUs, CPU and memory remain agent-level metrics, not request-labelled measurements.
-- Record independent samples through SDK `MetricsRegistry.ObserveRequest`, `AddReceivedBytes`, and `SetConcurrency`. Do not route VU/byte samples through `RecordEvent` or `MetricParser`, which also create request counts and latency observations.
+- Record independent samples through SDK `MetricsRecorder.ObserveRequest`, `AddAggregateReceivedBytes`, and `SetConcurrency`. Do not route VU/byte samples through `RecordEvent` or `MetricParser`, which also create request counts and latency observations. Request-attributed `AddReceivedBytes` is not appropriate for k6's aggregate byte samples.
 
 ## Use SDK-owned container resource reporting
 
@@ -56,8 +56,8 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 - Resolve deployment options once with `agent.LoadAgentServerOptions` and use `AgentServerOptions.LabelsUsageLimit` for the exporter. Do not add adapter-local environment parsing.
 - Preserve resolved options when adding adapter callbacks. Start with `agent.NewAgentServer`, not `MakeAgentServer`, which would resolve environment values again.
-- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. Set `CustomIngestMetrics` to the exporter's ingestion callback for engine samples that do not fit `MetricParser`'s complete-request event model; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, ingestion scheduling and exposition.
-- Keep CSV parsing, normalization and URL admission in the exporter. Collect with the callback context, synchronizing adapter state with observation. The SDK joins live callbacks/processes before a final collection call with a fresh two-second deadline. Call `registry.Reset()` together with parser/admission reset in `BeforeStart`. HTTP only gathers stored metrics; do not wrap it to drain output or sample resources.
+- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. The exporter creates a run-scoped `MetricsRecorder` with that registry and the resolved label budget. Set `CustomIngestMetrics` to its ingestion callback for engine samples that do not fit `MetricParser`'s complete-request event model; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, ingestion scheduling and exposition.
+- Keep CSV parsing, normalization, identity and source attribution in the exporter; the recorder owns request-name validation and admission. Collect with the callback context, synchronizing adapter state with observation. The SDK joins live callbacks/processes before a final collection call with a fresh two-second deadline. In `BeforeStart`, exporter Reset replaces the recorder, resets parser state and calls `registry.Reset()` under the same state lock. Propagate reset errors before launching k6. HTTP only gathers stored metrics; do not wrap it to drain output or sample resources.
 
 ## Preserve and verify the contract
 
@@ -119,12 +119,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261112221055-126a81e3e04d`, a pinned SDK snapshot providing the public conformance toolkit alongside per-agent canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining and ingestion-failure propagation. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261113022449-aa857a8a9abc`, a pinned SDK main snapshot providing the public `MetricsRecorder` API with shared request validation/admission, canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining, ingestion-failure propagation and the conformance toolkit. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261112221055-126a81e3e04d \
-  -t k6-adapter:sdk-126a81e .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261113022449-aa857a8a9abc \
+  -t k6-adapter:sdk-aa857a8 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
@@ -160,7 +160,7 @@ The review is read-only apart from disposable verification artifacts. It identif
 
 1. Use SDK callbacks (`BeforeStart`, `BuildCommand`, `Observe`) and let the SDK own downloads, run isolation, process launch/wait, cancellation and escalation. Do not implement a second supervisor.
 2. Define the primary artifact, settings units, per-agent assignment and CSV delivery rules. Bundle nonnative JavaScript dependencies before upload. The supported onboarding contract is one primary artifact plus existing CSV delivery, not arbitrary archives or dependency manifests.
-3. Normalize accurate metrics to `shibuya-v1`; document unsupported attribution instead of manufacturing request events. Prefer the SDK registry's independent recording methods for independent samples. Retain native endpoint mode when the engine already supplies a complete normalized exposition.
+3. Normalize accurate metrics to `shibuya-v1`; document unsupported attribution instead of manufacturing request events. Use the SDK recorder's independent recording methods for independent samples. Retain native endpoint mode when the engine already supplies a complete normalized exposition.
 4. Run conformance, review licenses/provenance, then publish an independently versioned image. Record the compatibility tuple below with observed test evidence.
 
 ### Shibuya maintainer: adding the next kind

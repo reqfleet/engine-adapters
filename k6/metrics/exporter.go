@@ -2,7 +2,7 @@
 //
 // Collection reads the result file written by k6's --out csv option. CSV rows
 // are independent samples, not complete request events. The exporter updates
-// SDK-owned collectors through separate request, byte, and concurrency methods,
+// the SDK MetricsRecorder through separate request, byte, and concurrency methods,
 // without fabricating requests for VU or byte samples. The SDK invokes Collect
 // during the run and once after process exit to drain final output.
 // The SDK owns metric definitions, resource sampling, exposition and authentication.
@@ -25,13 +25,13 @@ import (
 	"github.com/reqfleet/engine-sdk/protocol"
 )
 
-// Exporter owns CSV ingestion and admission state for one run.
+// Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
 // No reader or goroutine survives Collect; callbacks share the same state lock.
 type Exporter struct {
 	mu                                           sync.Mutex
 	byteLabel                                    string
 	labelLimit                                   int
-	urlLabels                                    map[string]struct{}
+	recorder                                     *agent.MetricsRecorder
 	run                                          agent.RunContext
 	active                                       bool
 	offset                                       int64
@@ -55,7 +55,7 @@ func New(labelLimit int, registry *agent.MetricsRegistry) (*Exporter, error) {
 		return nil, errors.New("SDK metrics registry is required")
 	}
 	e := &Exporter{
-		byteLabel: "k6", labelLimit: labelLimit, urlLabels: make(map[string]struct{}),
+		byteLabel: "k6", labelLimit: labelLimit,
 		registry: registry,
 	}
 	if labelLimit == 0 {
@@ -66,18 +66,23 @@ func New(labelLimit int, registry *agent.MetricsRegistry) (*Exporter, error) {
 
 // Reset accepts a validated SDK run snapshot after its workspace was reset.
 // Call even when later adapter settings validation fails, to retire old metrics.
-func (e *Exporter) Reset(run agent.RunContext) {
+func (e *Exporter) Reset(run agent.RunContext) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	recorder, err := agent.NewMetricsRecorder(e.registry, e.labelLimit)
+	if err != nil {
+		return err
+	}
 	e.run = agent.RunContext{RunID: run.RunID, CollectionID: run.CollectionID, PlanID: run.PlanID, AgentID: run.AgentID, Zone: run.Zone, ResultFile: run.ResultFile}
 	e.active = true
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
 	e.errorCodeIndex = -1
-	clear(e.urlLabels)
+	e.recorder = recorder
 	e.ready, e.failure = false, nil
 	e.registry.Reset()
+	return nil
 }
 
 // Observe reads cached readiness without collecting or changing the active run.
@@ -263,23 +268,23 @@ func (e *Exporter) point(record []string) error {
 				status = transportErrorStatus(value)
 			}
 		}
-		// Match SDK result-event ingestion: reject oversized labels before
-		// admission without failing the run or recording a partial request.
-		if _, err := (agent.ShibuyaMetric{Label: url}).LabelIsValid(); err != nil {
+		metric.Label, metric.Status, metric.Latency = url, status, value
+		if err := e.recorder.ObserveRequest(metric); err != nil {
+			// Recorder label rejection drops the whole sample without
+			// admitting its name, marking readiness, or failing the run.
 			return nil
 		}
-		metric.Label = metricschema.AdmitRequestName(url, e.urlLabels, e.labelLimit, "")
-		metric.Status, metric.Latency = status, value
-		e.registry.ObserveRequest(metric)
 	case "vus":
 		if math.Trunc(value) != value {
 			return fmt.Errorf("invalid fractional vus sample %q", record[e.valueIndex])
 		}
 		metric.Threads = value
-		e.registry.SetConcurrency(metric)
+		e.recorder.SetConcurrency(metric)
 	case "data_received":
 		metric.Label, metric.EgressBytes = e.byteLabel, value
-		e.registry.AddReceivedBytes(metric)
+		if err := e.recorder.AddAggregateReceivedBytes(metric); err != nil {
+			return err
+		}
 	}
 	e.ready = true
 	return nil
