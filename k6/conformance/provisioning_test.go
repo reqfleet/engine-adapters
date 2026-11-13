@@ -154,7 +154,7 @@ func TestWorkloadRejectsProvisioning(t *testing.T) {
 
 type provisioningReporter struct{}
 
-func (provisioningReporter) Reset(agent.RunContext) error { return nil }
+func (provisioningReporter) Reset(agent.RunContext) {}
 func (provisioningReporter) Observe(context.Context, agent.RunContext) (protocol.Observation, error) {
 	return protocol.ObservationPending, nil
 }

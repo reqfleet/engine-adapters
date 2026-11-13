@@ -33,7 +33,7 @@ For the k6 adapter, group request metrics by the CSV `url` value, subject to the
 - Do not substitute the CSV `name` column, normalize paths, truncate values, or remove query strings. k6 can rewrite the `url` tag when a script uses custom name/grouping options; do not invent a discarded original URL.
 - Pass original request labels to the SDK recorder; it checks the request-label byte limit before admission. Preserve valid values exactly. Drop a rejected oversized `http_req_duration` sample, including both its latency observation and status count, without failing the run or marking readiness. Labels of 1024 bytes or more must not consume slots, enter overflow, or merge into shorter prefixes. This applies equally to URLs and grouping names; independent byte and VU samples remain unaffected.
 - Use `MetricsRecorder.ObserveRequest` so the SDK applies the same admission decision to latency and status. Do not keep an adapter admission map or call `metricschema.AdmitRequestName` before recording. The SDK admits the first `label_limit` distinct valid request names per run, keeps admitted names stable, and folds additional valid names into `others`. The reserved overflow name never consumes a slot. A zero limit folds all valid request names into `others`; it does not bypass validation. Request names are emitted under the unchanged Prometheus `label` key.
-- Create a fresh recorder on every exporter reset while clearing metric collectors under the exporter state lock. Registry reset alone does not clear recorder admission. Keep run, plan, collection, agent and zone identity in their own schema labels.
+- Create one recorder during exporter initialization. On every exporter reset, call `recorder.Reset(run)` under the exporter state lock to bind assigned identity and clear admission, collectors, collection errors and resource state in one SDK-owned transition. Do not replace the recorder or call `registry.Reset()` separately. Keep run, plan, collection, agent and zone identity in their own schema labels.
 
 ## Preserve metric attribution boundaries
 
@@ -56,8 +56,8 @@ k6 CSV rows are independent metric samples, not complete request records:
 
 - Resolve deployment options once with `agent.LoadAgentServerOptions` and use `AgentServerOptions.LabelsUsageLimit` for the exporter. Do not add adapter-local environment parsing.
 - Preserve resolved options when adding adapter callbacks. Start with `agent.NewAgentServer`, not `MakeAgentServer`, which would resolve environment values again.
-- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. The exporter creates a run-scoped `MetricsRecorder` with that registry and the resolved label budget. Set `CustomIngestMetrics` to its ingestion callback for engine samples that do not fit `MetricParser`'s complete-request event model; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, ingestion scheduling and exposition.
-- Keep CSV parsing, normalization, identity and source attribution in the exporter; the recorder owns request-name validation and admission. Collect with the callback context, synchronizing adapter state with observation. The SDK joins live callbacks/processes before a final collection call with a fresh two-second deadline. In `BeforeStart`, exporter Reset replaces the recorder, resets parser state and calls `registry.Reset()` under the same state lock. Propagate reset errors before launching k6. HTTP only gathers stored metrics; do not wrap it to drain output or sample resources.
+- Create one `agent.MetricsRegistry` and pass it to the exporter and `AgentServerOptions.MetricsRegistry`. The exporter initializes one `MetricsRecorder` with that registry and the resolved label budget; propagate constructor errors before starting the server. Set `CustomIngestMetrics` to its ingestion callback for engine samples that do not fit `MetricParser`'s complete-request event model; leave `MetricParser`, `MetricsHandler`, `MetricsURL`, and native options unset. The SDK owns authentication, resource sampling, ingestion scheduling and exposition.
+- Keep CSV parsing, normalization, source attribution and run ID checks for the CSV cursor in the exporter. Retain the result-file path supplied at reset for reading CSV, not for callback matching; the SDK reuses that path across runs. Do not retain or compare collection, plan, agent or zone in the exporter. The recorder owns assigned identity binding and request-name validation/admission. Samples supply measurements, not identity. Collect with the callback context, synchronizing adapter state with observation. The SDK joins live callbacks/processes before a final collection call with a fresh two-second deadline. In `BeforeStart`, exporter Reset clears parser/readiness/error state and invokes `recorder.Reset(run)` under the same state lock. Reset has no error return and is not a cancellation mechanism; prior-run collection must have finished. HTTP only gathers stored metrics; do not wrap it to drain output or sample resources.
 
 ## Preserve and verify the contract
 
@@ -119,12 +119,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261113022449-aa857a8a9abc`, a pinned SDK main snapshot providing the public `MetricsRecorder` API with shared request validation/admission, canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining, ingestion-failure propagation and the conformance toolkit. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261113054304-b53aa17df9fd`, a pinned SDK main snapshot providing recorder-bound assigned identity and a coordinated reset of all run-local reporting state, alongside canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining, ingestion-failure propagation and the conformance toolkit. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261113022449-aa857a8a9abc \
-  -t k6-adapter:sdk-aa857a8 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261113054304-b53aa17df9fd \
+  -t k6-adapter:sdk-b53aa17 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
