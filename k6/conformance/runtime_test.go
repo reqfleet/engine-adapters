@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -41,6 +42,9 @@ func TestPublicK6Runtime(t *testing.T) {
 	inflight := make(chan struct{}, 1)
 	inflightEnded := make(chan struct{}, 1)
 	target := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRequestBytes(w, r) {
+			return
+		}
 		requests.record(r.URL.Path, r.Header.Get("X-Revision"))
 		if strings.HasPrefix(r.URL.Path, "/data") {
 			assert.Equal(t, "row-a|row-b", r.Header.Get("X-Data"))
@@ -112,6 +116,7 @@ export default function(){
 }`,
 		boundaryURL+"b", boundaryURL+"bc", boundaryURL, boundaryURL, conformance.TargetURL+"/500",
 		groupedPrefix+"界", groupedPrefix+"界suffix", groupedPrefix, conformance.TargetURL+"/200"))
+	byteCases := requestByteFixtures(artifacts)
 	settings := json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)
 	fixture := conformance.Fixture{File: "labels.js", Settings: settings}
 	longLabels := conformance.Fixture{File: "long-labels.js", Settings: settings}
@@ -126,11 +131,19 @@ export default function(){
 			Reuse:             conformance.Fixture{File: "second.js", Settings: settings},
 			CompletionTimeout: 90 * time.Second,
 			AssertMetrics: func(t *testing.T, runtime *conformance.Runtime, run string) conformance.MetricsSnapshot {
+				// Budget mode comes from the configured fixture, never CSV sample presence.
+				for _, scenario := range byteCases {
+					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
+						_, snapshot := compareCSVSnapshotSource(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, "request_received_bytes")
+						assertRequestByteBodies(t, runtime, run, snapshot)
+						return snapshot
+					}
+				}
 				_, snapshot := compareCSVSnapshot(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit)
 				return snapshot
 			},
 		},
-		Budgets: []conformance.BudgetScenario{
+		Budgets: append([]conformance.BudgetScenario{
 			{Name: "overflow", LabelLimit: 4, Fixture: fixture, MinimumRequests: 14,
 				RequestLabels: []string{conformance.TargetURL + "/200", conformance.TargetURL + "/200?item=a", conformance.TargetURL + "/200?item=b", conformance.TargetURL + "/500", "others"}, ByteLabels: []string{"k6"}},
 			{Name: "zero", LabelLimit: 0, Fixture: fixture, MinimumRequests: 14,
@@ -139,9 +152,10 @@ export default function(){
 				RequestLabels: []string{boundaryURL, conformance.TargetURL + "/500", groupedPrefix}, ByteLabels: []string{"k6"}},
 			{Name: "byte-limit-zero", LabelLimit: 0, Fixture: longLabels, MinimumRequests: 14,
 				RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
-		},
+		}, byteCases...),
 		Scenarios: func(t *testing.T, runtime *conformance.Runtime) {
 			runK6Scenarios(t, runtime, requests, inflight, inflightEnded, firstSource)
+			runRequestByteScenarios(t, runtime)
 			provisioning.assertUnused(t, runtime.Root)
 		},
 	})
@@ -413,6 +427,11 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 
 func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string, labelLimit int) (totals, conformance.MetricsSnapshot) {
 	t.Helper()
+	return compareCSVSnapshotSource(t, client, filename, run, labelLimit, "data_received")
+}
+
+func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run string, labelLimit int, source string) (totals, conformance.MetricsSnapshot) {
+	t.Helper()
 	file, err := os.Open(filename)
 	require.NoError(t, err)
 	defer file.Close()
@@ -429,6 +448,27 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 	expected := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}}
 	durations := map[string][]float64{}
 	admitted := map[string]bool{}
+	bytes := map[string]float64{}
+	if source == "data_received" {
+		label := "k6"
+		if labelLimit == 0 {
+			label = "others"
+		}
+		bytes[label] = 0
+	}
+	admit := func(label string) (string, bool) {
+		if label == "" || len(label) >= 1024 {
+			return "", false
+		}
+		if label != "others" && !admitted[label] {
+			if len(admitted) < labelLimit {
+				admitted[label] = true
+			} else {
+				label = "others"
+			}
+		}
+		return label, true
+	}
 	for {
 		row, e := reader.Read()
 		if e == io.EOF {
@@ -439,18 +479,11 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 		require.NoError(t, e)
 		switch row[columns["metric_name"]] {
 		case "http_req_duration":
-			url := row[columns["url"]]
-			require.NotEmpty(t, url, "duration rows must retain their request URL")
+			url, valid := admit(row[columns["url"]])
+			require.NotEmpty(t, row[columns["url"]], "duration rows must retain their request URL")
 			require.Equal(t, "GET", row[columns["method"]], "existing system tags must be preserved")
-			if len(url) >= 1024 {
+			if !valid {
 				continue
-			}
-			if url != "others" && !admitted[url] {
-				if len(admitted) < labelLimit {
-					admitted[url] = true
-				} else {
-					url = "others"
-				}
 			}
 			if expected.requests[url] == nil {
 				expected.requests[url] = &requestTotals{status: map[string]float64{}}
@@ -476,7 +509,23 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 			expected.count++
 			expected.sum += value
 			expected.status[status]++
-		case "data_received":
+		case "data_received", "request_received_bytes":
+			if row[columns["metric_name"]] != source {
+				continue
+			}
+			require.False(t, value < 0 || math.IsNaN(value) || math.IsInf(value, 0), "selected byte samples must be valid")
+			label := "k6"
+			if source == "request_received_bytes" {
+				require.NotEmpty(t, row[columns["url"]], "custom byte samples must retain their request URL")
+				var valid bool
+				label, valid = admit(row[columns["url"]])
+				if !valid {
+					continue
+				}
+			} else if labelLimit == 0 {
+				label = "others"
+			}
+			bytes[label] += value
 			expected.bytes += value
 		case "vus":
 			expected.vus = value
@@ -491,14 +540,10 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 		}
 		requests[label] = conformance.RequestExpectation{Statuses: statuses, LatenciesMS: durations[label]}
 	}
-	byteLabel := "k6"
-	if labelLimit == 0 {
-		byteLabel = "others"
-	}
 	snapshot := conformance.AssertMetrics(t, scrape(t, client), conformance.MetricsExpectation{
 		Identity:    conformance.MetricIdentity{CollectionID: proofCollection, PlanID: proofPlan, RunID: run, EngineNo: "7", Zone: "local"},
 		Requests:    requests,
-		Bytes:       map[string]float64{byteLabel: expected.bytes},
+		Bytes:       bytes,
 		Concurrency: &expected.vus,
 		Resources:   conformance.ResourceExpectation{CPU: conformance.MeasurementRequired, Memory: conformance.MeasurementRequired},
 	})

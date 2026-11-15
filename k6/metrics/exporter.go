@@ -30,6 +30,7 @@ import (
 type Exporter struct {
 	mu                                           sync.Mutex
 	byteLabel                                    string
+	receivedBytesSource                          string
 	recorder                                     *agent.MetricsRecorder
 	runID, resultFile                            string
 	active                                       bool
@@ -44,15 +45,16 @@ type Exporter struct {
 }
 
 // New validates the per-run URL label budget and uses the SDK's collectors.
-// Additional URLs use the reserved overflow label; bytes keep aggregate attribution.
+// Additional URLs use the reserved overflow label, including request-attributed bytes.
 func New(labelLimit int, registry *agent.MetricsRegistry) (*Exporter, error) {
 	recorder, err := agent.NewMetricsRecorder(registry, labelLimit)
 	if err != nil {
 		return nil, err
 	}
 	e := &Exporter{
-		byteLabel: "k6",
-		recorder:  recorder,
+		byteLabel:           "k6",
+		recorder:            recorder,
+		receivedBytesSource: "data_received",
 	}
 	if labelLimit == 0 {
 		e.byteLabel = metricschema.OverflowRequestName
@@ -68,12 +70,32 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	defer e.mu.Unlock()
 	e.runID, e.resultFile = run.RunID, run.ResultFile
 	e.active = true
+	e.receivedBytesSource = "data_received"
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
 	e.errorCodeIndex = -1
 	e.ready, e.failure = false, nil
 	e.recorder.Reset(run)
+}
+
+// ConfigureReceivedBytes selects the run's byte counter before launch. An empty
+// source retains k6's aggregate default; custom counters require URL attribution.
+func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.matchesRun(run) {
+		return errors.New("received bytes configuration does not match the active run")
+	}
+	switch source {
+	case "", "data_received":
+		e.receivedBytesSource = "data_received"
+	case "request_received_bytes":
+		e.receivedBytesSource = source
+	default:
+		return fmt.Errorf("unsupported received bytes source %q", source)
+	}
+	return nil
 }
 
 // Observe reads cached readiness without collecting or changing the active run.
@@ -222,7 +244,7 @@ func (e *Exporter) header(record []string) error {
 
 func (e *Exporter) point(record []string) error {
 	name := record[e.nameIndex]
-	if name != "http_req_duration" && name != "vus" && name != "data_received" {
+	if name != "http_req_duration" && name != "vus" && name != e.receivedBytesSource {
 		return nil
 	}
 	value, err := strconv.ParseFloat(record[e.valueIndex], 64)
@@ -272,6 +294,16 @@ func (e *Exporter) point(record []string) error {
 		metric.Label, metric.EgressBytes = e.byteLabel, value
 		if err := e.recorder.AddAggregateReceivedBytes(metric); err != nil {
 			return err
+		}
+	case "request_received_bytes":
+		url := record[e.urlIndex]
+		if url == "" {
+			return errors.New("missing received bytes request URL")
+		}
+		metric.Label, metric.EgressBytes = url, value
+		if err := e.recorder.AddReceivedBytes(metric); err != nil {
+			// Match request sample rejection: no admission, readiness or failure.
+			return nil
 		}
 	}
 	e.ready = true

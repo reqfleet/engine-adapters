@@ -46,7 +46,7 @@ Before marking the run prepared, `BeforeStart` executes `/usr/local/bin/k6 inspe
 
 After inspection, `/usr/local/bin/k6 deps --json <generated-entry-path>` checks whether the packaged binary satisfies the plan's dependencies. This separate check is necessary because k6 skips version-constraint enforcement during inspection when automatic resolution is disabled. A custom-build requirement, dependency-check error or missing compatibility result fails preparation. Image overrides must support this dependency-check command and JSON contract; unsupported versions fail closed rather than silently ignoring requirements.
 
-Inspection stdout is discarded. Stderr capture is limited to its final 16 KiB while excess output is drained; oversized diagnostics include a truncation marker. This bounds memory and error payloads while retaining the final diagnostic after verbose init logging.
+Inspection stdout is parsed as k6 options JSON to select the received-byte source before launch. Stderr capture is limited to its final 16 KiB while excess output is drained; oversized diagnostics include a truncation marker.
 
 Command execution is direct, not shell interpolation:
 
@@ -66,9 +66,24 @@ Use absolute paths, e.g. `open('/test-data/targets.csv')`, because the generated
 
 The exporter **collects metrics by parsing the CSV file** written by `k6 run --out csv=<run.ResultFile>`. It reads new records with Go's `encoding/csv` and updates the corresponding SDK-owned `shibuya-v1` collectors. The SDK's HTTP endpoint exposes those values; it is not the collection source.
 
-The SDK `MetricParser` callback is not suitable for these rows: it represents complete requests, whereas k6 CSV contains independent samples. Passing a `vus` or `data_received` row through that callback would fabricate a request and latency observation. The exporter instead calls `MetricsRecorder.ObserveRequest`, `AddAggregateReceivedBytes`, or `SetConcurrency` independently. It defines no Prometheus collectors and does not call the complete-event `RecordEvent` method.
+The SDK `MetricParser` callback is not suitable for these rows: it represents complete requests, whereas k6 CSV contains independent samples. Passing a `vus`, `data_received`, or custom byte-counter row through that callback would fabricate a request and latency observation. The exporter instead calls `MetricsRecorder.ObserveRequest`, `AddAggregateReceivedBytes`, `AddReceivedBytes`, or `SetConcurrency` independently. It defines no Prometheus collectors and does not call the complete-event `RecordEvent` method.
 
-The entry point creates one `agent.MetricsRegistry`, passes it to the exporter and `AgentServerOptions.MetricsRegistry`, and sets `CustomIngestMetrics` to `exporter.Collect`. The exporter creates a fresh `agent.MetricsRecorder` for each run with the resolved label budget and that registry. This callback handles k6's independent CSV samples rather than complete-request events. The SDK invokes it after launch, every 250ms and once after process exit. HTTP requests only gather stored values: there is no wrapper, extra listener or proxy. The SDK owns `/metrics` on port 8080, bearer authentication, resource sampling and exposition. `MetricParser`, `MetricsHandler`, `MetricsURL`, `NativeMetricsSchema`, and folding options are unset. `ResultFile` names k6's CSV output only; the adapter retains parsing, normalization, source attribution and ingestion-state ownership, not a request-name admission map.
+The entry point creates one `agent.MetricsRegistry`, passes it to the exporter and `AgentServerOptions.MetricsRegistry`, and sets `CustomIngestMetrics` to `exporter.Collect`. The exporter creates one `agent.MetricsRecorder` with the resolved label budget and resets it for each run. This callback handles k6's independent CSV samples rather than complete-request events. The SDK invokes it after launch, every 250ms and once after process exit. HTTP requests only gather stored values: there is no wrapper, extra listener or proxy. The SDK owns `/metrics` on port 8080, bearer authentication, resource sampling and exposition. `MetricParser`, `MetricsHandler`, `MetricsURL`, `NativeMetricsSchema`, and folding options are unset. `ResultFile` names k6's CSV output only; the adapter retains parsing, normalization, source attribution and ingestion-state ownership, not a request-name admission map.
+
+### Metric attribution
+
+"Per request" means cumulative series grouped by the emitted request URL/grouping name, not a separate series for every call. All series also carry the assigned run and agent identity.
+
+| Metric | Attribution |
+|---|---|
+| `shibuya_latency_label_milliseconds` | Request URL/grouping name; latency histogram in milliseconds |
+| `shibuya_status_counter` | Request URL/grouping name and outcome |
+| `shibuya_egress_bytes_counter` | Agent aggregate by default; request URL/grouping name with the explicit custom-counter mode below |
+| `shibuya_threads_gauge` | Latest k6 `vus` sample for the agent; no request label |
+| `shibuya_cpu_gauge` | Container-wide CPU cores; no request label |
+| `shibuya_mem_gauge` | Container-wide memory bytes; no request label |
+
+The historical "egress" counter measures **received bytes**, not outgoing traffic or sent-plus-received traffic. It is cumulative; bandwidth is its rate over time. Default byte totals are emitted once under `label="k6"`, not copied onto each request. VUs are not in-flight HTTP requests: a VU may sleep, execute sequential requests, or issue a parallel batch. CPU and memory cannot be attributed to individual requests.
 
 ### CSV output format
 
@@ -90,7 +105,7 @@ data_received,1793861284,151.000000,,,,,,,,,default,,,,,,,
 - `url` supplies the request metric label. Samples with the same URL share latency and status series; different URLs remain separate within the label budget and byte limit below.
 - The remaining columns carry tags or metadata; an empty cell means that field has no value for that sample.
 
-The header depends on the enabled system tags. The exporter locates `metric_name`, `metric_value`, `status`, `url` and optional `error_code` by name rather than fixed positions and ignores unrelated columns. Missing required columns or an empty URL on an HTTP duration sample fail ingestion; non-request samples may leave `url` empty. Values containing commas, quotes or newlines use standard CSV quoting; splitting lines on commas is not sufficient.
+The header depends on the enabled system tags. The exporter locates `metric_name`, `metric_value`, `status`, `url` and optional `error_code` by name rather than fixed positions and ignores unrelated columns. Missing required columns or an empty URL on an HTTP duration or selected custom request-byte sample fail ingestion; aggregate byte and VU samples may leave `url` empty. Values containing commas, quotes or newlines use standard CSV quoting; splitting lines on commas is not sufficient.
 
 ### Normalization and run lifecycle
 
@@ -98,20 +113,65 @@ HTTP latency histograms and status counters use the exact CSV `url` value as `la
 
 The entrypoint resolves configuration once with `agent.LoadAgentServerOptions`, passes `AgentServerOptions.LabelsUsageLimit` to the exporter, and starts `agent.NewAgentServer` with the resolved options. The adapter does not parse environment variables itself. The SDK defaults an unset or empty `label_limit` to 10, accepts decimal integers with an optional sign (for example, `+4`), and rejects negative values, malformed input, whitespace and integer overflow at startup.
 
-Request labels must be **shorter than 1024 bytes**, measured in UTF-8 bytes rather than characters. The SDK recorder validates the original label before admission or recording. Values of 1024 bytes or more cause the entire `http_req_duration` sample to be dropped: neither its latency observation nor its status count is recorded. This shares the SDK result-event policy and applies equally to URLs and plan-defined grouping names. Oversized values are not truncated and do not merge into valid prefixes. The exporter treats recorder label rejection as a dropped sample, not a CSV/exporter failure; readiness still requires a valid standard sample. Independent received-byte and VU samples remain unaffected.
+Request labels must be **shorter than 1024 bytes**, measured in UTF-8 bytes rather than characters. The SDK recorder validates the original label before admission or recording. Values of 1024 bytes or more cause the entire `http_req_duration` sample to be dropped: neither its latency observation nor its status count is recorded. This shares the SDK result-event policy and applies equally to URLs and plan-defined grouping names. Oversized values are not truncated and do not merge into valid prefixes. The exporter treats recorder label rejection as a dropped sample, not a CSV/exporter failure; readiness still requires a valid selected sample. Independent received-byte and VU samples remain unaffected; a selected custom byte sample also undergoes its own label validation.
 
 The SDK recorder owns the request-name budget and synchronized admission state, using the shared `metricschema.AdmitRequestName` policy and `others` overflow name. The exporter passes original request names without pre-admitting them. A request name identifies a request or request group and is emitted under the unchanged Prometheus `label` key. The first N distinct valid request names observed in each run receive their own series; additional valid names fold into `label="others"`. A source name already equal to `others` does not consume a slot. `ObserveRequest` applies one decision to latency and status. Admitted names remain stable after the budget fills. Rejected names consume no admission slots and are not retained. A zero limit folds every valid request name into `others`, but still drops oversized samples. Each exporter reset calls `recorder.Reset(run)` so the same recorder starts the new run with fresh admission and metric state.
 
 The source value is always the CSV `url` tag. k6's [request grouping](https://grafana.com/docs/k6/latest/using-k6/http-requests/#group-urls-under-one-tag), such as a custom `tags.name` or `http.url` template, can replace the emitted `url` with a grouped value before CSV export. The same byte limit applies to that grouping value; the adapter cannot reconstruct URLs omitted by k6. To retain distinct labels, keep emitted values below 1024 bytes, avoid source grouping, and provide enough label slots.
 
-Received-byte samples lack request URL attribution and remain aggregate under `label="k6"` (`label="others"` when the limit is zero). They do not consume URL admission slots or create byte series for individual URLs. Per-URL bandwidth is unavailable, not zero. VUs, CPU and memory remain agent-level metrics.
+Built-in `data_received` samples lack request URL attribution. By default they remain aggregate under `label="k6"` (`label="others"` when the limit is zero), without consuming request-name slots. Per-URL bandwidth is unavailable, not zero, unless the plan explicitly supplies the custom byte counter below. VUs, CPU and memory remain agent-level metrics.
 
 | CSV point | Normalized effect |
 |---|---|
 | `http_req_duration` | One latency observation in milliseconds and one status count, grouped by URL within the label budget and byte limit; transport failures use the error statuses below, including when duration is zero |
 | `vus` | Set latest actual per-agent concurrency, including genuine zero; no request count |
-| `data_received` | Add received-byte delta to the aggregate historical `shibuya_egress_bytes_counter`; no request count or URL attribution |
+| `data_received` | In default mode, add received-byte delta to the aggregate historical `shibuya_egress_bytes_counter`; ignore in custom-counter mode |
+| `request_received_bytes` | Only in custom-counter mode, add byte delta to `shibuya_egress_bytes_counter` using the exact CSV `url` and shared SDK label admission; no latency, status or concurrency update |
 | `http_reqs`, `data_sent`, other names | Ignore; no double counting and no synthetic request observations |
+
+#### Opt-in request-byte counter
+
+Stock k6 supports [custom counters with tags](https://grafana.com/docs/k6/latest/javascript-api/k6-metrics/counter/). To supply request-attributed bytes, declare `Counter('request_received_bytes')` and select it in `options.ext.reqfleet.receivedBytes`:
+
+```js
+import http from 'k6/http';
+import { sleep } from 'k6';
+import { Counter } from 'k6/metrics';
+
+const received = new Counter('request_received_bytes');
+export const options = {
+  ext: { reqfleet: { receivedBytes: 'request_received_bytes' } },
+};
+
+export default function () {
+  const url = 'https://example.com/products';
+  const label = url; // Or a stable grouping name, e.g. 'products'.
+  const res = http.get(url, {
+    tags: { name: label },
+    responseType: 'binary',
+  });
+  if (res.body instanceof ArrayBuffer) {
+    received.add(res.body.byteLength, { url: label });
+  }
+  sleep(1);
+}
+```
+
+The selector accepts `data_received` (default when absent or empty) or `request_received_bytes`; other values and non-string selectors fail preparation. It is read from `k6 inspect` before any samples are collected and remains fixed for that run. Existing plans need no changes. Merely declaring a custom counter does not opt in.
+
+In custom-counter mode, built-in `data_received` samples are ignored from the start, including samples preceding the first custom point. They are never added to, subtracted from, or used to fill gaps in request-byte totals. If the plan emits no custom samples, the byte family is absent, not fabricated as zero or replaced by aggregate traffic. Instrument every request whose bytes you want reported, including calls in setup/teardown and each batch/async response where applicable. Partial instrumentation produces partial byte totals.
+
+Each `Counter.add` must provide a **measured byte delta**, not a running total, and a nonempty `url` tag. Custom counters do not inherit the preceding HTTP request's tags: supply `url` explicitly, matching the HTTP metric's emitted URL/grouping value. The adapter does not fall back to `name`, infer attribution from row order/timestamps, or check that a corresponding HTTP request exists. CSV does not encode custom metric types; declaring this reserved metric as a Gauge, Rate or Trend is outside the contract.
+
+The SDK's existing byte-length check and shared request-name budget apply to custom points. Repeated labels accumulate; query variants remain distinct within the budget; excess valid names fold into `others`. A custom point may admit a name before its HTTP duration point. Labels of 1024 bytes or more drop only that byte sample, without consuming a slot or marking readiness; independent HTTP/VU samples are unaffected. Empty URLs and negative, nonnumeric or nonfinite selected byte values fail ingestion. A genuine measured zero is recorded. Custom samples never create latency observations or status counts. Collection, final drain, repeated-scrape retention and reset follow the same lifecycle as the other metrics; reset also restores default source selection before preparing the next plan.
+
+**The example measures response-body size, not full network bandwidth:**
+
+- `responseType: 'binary'` makes `byteLength` a byte count; JavaScript string `.length` is not a byte count for Unicode.
+- k6 returns the body after supported decompression. The count excludes response headers, transfer framing and TLS/connection overhead and need not equal built-in `data_received`.
+- The example retains response bodies, overriding body-discard behavior for that call and increasing memory use. Without a body or another trustworthy byte measurement, omit the sample; do not substitute `Content-Length` or an invented zero.
+- With automatic redirects, k6's returned response contains only the final response. This example does not count intermediate response bodies, even though native latency/status samples include those HTTP attempts.
+- This is explicit plan instrumentation, not automatic interception of every request. The adapter reports the supplied measurements and cannot recover omitted bytes.
 
 #### Transport failures
 
@@ -131,7 +191,7 @@ DNS failures and refused connections can have `http_req_duration=0`: k6's reques
 
 #### Collection lifecycle
 
-The exporter resolves required CSV header names, uses `encoding/csv` including quoted/multiline values, retains its committed offset, retries incomplete tails and processes records once in `Collect`. Collection and observation share the state lock; observation only reads cached readiness and errors. Invalid recognized values, complete malformed records, required-column errors and post-start truncation/read errors fail collection instead of producing fabricated data. The SDK fails the run and registry scrapes on those errors. Readiness stays pending until collection sees a valid standard sample. Check `/progress`, not the metrics response status: an empty registry is still a successful scrape. The SDK separately handles a process that exits before readiness is polled.
+The exporter resolves required CSV header names, uses `encoding/csv` including quoted/multiline values, retains its committed offset, retries incomplete tails and processes records once in `Collect`. Collection and observation share the state lock; observation only reads cached readiness and errors. Invalid selected values, complete malformed records, required-column errors and post-start truncation/read errors fail collection instead of producing fabricated data. The SDK fails the run and registry scrapes on those errors. Readiness stays pending until collection sees a valid selected sample. Check `/progress`, not the metrics response status: an empty registry is still a successful scrape. The SDK separately handles a process that exits before readiness is polled.
 
 Collection, plan, run, agent and zone identity come from the current `RunContext`, bound once by `recorder.Reset(run)` during `BeforeStart`. CSV samples supply only measurements and source attribution; the SDK applies the bound identity to request, received-byte, concurrency and resource metrics. The exporter retains the run ID to reject callbacks for another run and the result-file path solely for reading CSV. The SDK reuses that path across runs, so it is not part of callback matching. The exporter neither stores nor compares collection, plan, agent or zone. The SDK registry defines the ordinary histogram with `metricschema.RequestLatencyBuckets()`. Shared conformance validation uses the canonical boundary helpers, with independent fixed-profile fixtures guarding against schema drift. k6 reports only the ordinary HTTP histogram; `ObserveRequest` does not reinterpret a grouping value such as `llm_resp` as an LLM measurement.
 
@@ -161,7 +221,7 @@ The SDK owns port 8080, `/healthz`, authenticated `/metrics`, coordinator TLS/CA
 
 Conformance is a real public-protocol runtime check, not a guarantee that a particular Shibuya deployment has been integrated. Record the actual exercised `(Shibuya release, adapter image digest, selected SDK version, selected k6 version, metrics shibuya-v1)` tuple and live smoke results before production use.
 
-The adapter's `k6/conformance` tests consume the optional public `github.com/reqfleet/engine-sdk/conformance` toolkit from the pinned SDK dependency, not a copied adapter-local harness. Its container suite exercises SDK lifecycle and authenticated serving, validates normalized metrics against real k6 CSV output, and runs positive-overflow, zero-label-budget and 1023/1024/1025-byte URL scenarios, including custom Unicode grouping names, oversized-sample rejection without prefix merging, and unchanged aggregate-only bytes. k6-specific hooks, scheduling, assignment and transport-error cases remain in the adapter's tests. `make -C k6 test-unit` also runs the SDK metrics validator's unit tests and validates exporter exposition for ASCII and multibyte UTF-8 URL boundaries, rejected samples followed by valid samples, repeated samples, positive/zero budgets and reset. See [the reusable suite contract](../AGENTS.md#reusable-adapter-conformance) when adding another adapter.
+The adapter's `k6/conformance` tests consume the optional public `github.com/reqfleet/engine-sdk/conformance` toolkit from the pinned SDK dependency, not a copied adapter-local harness. Its container suite exercises SDK lifecycle and authenticated serving, validates normalized metrics against real k6 CSV output, and runs positive-overflow, zero-label-budget and 1023/1024/1025-byte URL scenarios, including custom Unicode grouping names, oversized-sample rejection without prefix merging, and unchanged default aggregate bytes. Custom-counter scenarios compare exact binary, UTF-8 and decoded gzip body sizes with request-labelled byte totals, exercise explicit source selection, absent samples, invalid options/samples, source preservation, retention and custom/default/custom reuse. k6-specific hooks, scheduling, assignment and transport-error cases remain in the adapter's tests. `make -C k6 test-unit` also runs the SDK metrics validator's unit tests and validates exporter exposition for ASCII and multibyte UTF-8 URL boundaries, rejected samples followed by valid samples, repeated samples, shared admission across byte/request samples, positive/zero budgets and reset. See [the reusable suite contract](../AGENTS.md#reusable-adapter-conformance) when adding another adapter.
 
 Pinned-engine regressions use a controlled local build-service peer inside the network-isolated container. Positive controls prove that unsupported imports and engine/extension requirements can provision and execute the peer's marker executable without the adapter policy. Adapter runs must make zero provisioning/download requests and never execute that replacement, including with a conflicting inherited resolution setting. Unsupported-plan cases report protocol and terminal-state failures through their own subtests. A post-preparation source mutation independently exercises the workload invocation's guard; ordinary HTTP plans and compatible version constraints still pass the real-engine lifecycle and metrics checks.
 

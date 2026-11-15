@@ -23,6 +23,7 @@ import (
 // synchronizes these methods with its SDK-scheduled collection callback.
 type Reporter interface {
 	Reset(agent.RunContext)
+	ConfigureReceivedBytes(agent.RunContext, string) error
 	Observe(context.Context, agent.RunContext) (protocol.Observation, error)
 }
 
@@ -148,12 +149,35 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	if err := writeAtomic(ctx, entry, content); err != nil {
 		return fmt.Errorf("prepare k6 wrapper: %w", err)
 	}
-	if err := a.check(ctx, run, nil, "inspect", entry); err != nil {
+	var output bytes.Buffer
+	if err := a.check(ctx, run, &output, "inspect", entry); err != nil {
 		return err
+	}
+	var inspected struct {
+		Ext struct {
+			Reqfleet struct {
+				ReceivedBytes json.RawMessage `json:"receivedBytes"`
+			} `json:"reqfleet"`
+		} `json:"ext"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &inspected); err != nil {
+		return fmt.Errorf("k6 inspection options: %w", err)
+	}
+	var byteSource string
+	if raw := inspected.Ext.Reqfleet.ReceivedBytes; len(raw) != 0 {
+		if raw[0] != '"' {
+			return fmt.Errorf("k6 options.ext.reqfleet.receivedBytes must be a string")
+		}
+		if err := json.Unmarshal(raw, &byteSource); err != nil {
+			return fmt.Errorf("k6 options.ext.reqfleet.receivedBytes: %w", err)
+		}
+	}
+	if err := a.reporter.ConfigureReceivedBytes(run, byteSource); err != nil {
+		return fmt.Errorf("k6 options.ext.reqfleet.receivedBytes: %w", err)
 	}
 	// With resolution disabled, inspect skips version constraints.
 	// Use k6's dependency checker to validate them.
-	var output bytes.Buffer
+	output.Reset()
 	if err := a.check(ctx, run, &output, "deps", "--json", entry); err != nil {
 		return err
 	}
