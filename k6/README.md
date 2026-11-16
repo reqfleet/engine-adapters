@@ -77,8 +77,8 @@ The entry point creates one `agent.MetricsRegistry`, passes it to the exporter a
 | Metric | Attribution |
 |---|---|
 | `shibuya_latency_label_milliseconds` | Request URL/grouping name; latency histogram in milliseconds |
-| `shibuya_status_counter` | Request URL/grouping name and outcome |
-| `shibuya_egress_bytes_counter` | Agent aggregate by default; request URL/grouping name in request-byte mode, or `tps` in stream-bandwidth mode |
+| `shibuya_status_counter` | Request URL/grouping name and outcome; successful received-token counts under `tps` when selected |
+| `shibuya_egress_bytes_counter` | Agent aggregate by default; request URL/grouping name with the explicit custom-counter mode below |
 | `shibuya_threads_gauge` | Latest k6 `vus` sample for the agent; no request label |
 | `shibuya_cpu_gauge` | Container-wide CPU cores; no request label |
 | `shibuya_mem_gauge` | Container-wide memory bytes; no request label |
@@ -129,7 +129,7 @@ Built-in `data_received` samples lack request URL attribution. By default they r
 | `request_received_bytes` | Only in custom-counter mode, add byte delta to `shibuya_egress_bytes_counter` using the exact CSV `url` and shared SDK label admission; no latency, status or concurrency update |
 | `llm_response_duration` | Only when selected by `llmResponse`, observe milliseconds in `shibuya_latency_llm_resp_milliseconds` under `llm_resp` (or `others` after admission overflow) |
 | `llm_time_to_first_token` | Only when selected by `ttft`, observe milliseconds in the ordinary histogram under `ttft` (or `others` after admission overflow) |
-| `llm_streamed_bytes` | Only when selected by `receivedBytes`, add measured generated-payload byte deltas under `tps` (or `others`); replaces all other byte sources |
+| `llm_token_events` | Only when selected by `tps`, count each unit-valued token observation in `shibuya_status_counter` under `tps`, status `200` (or `others` after admission overflow); no latency, bytes or concurrency update |
 | `http_reqs`, `data_sent`, other names | Ignore; no double counting and no synthetic request observations |
 
 #### Opt-in request-byte counter
@@ -160,7 +160,7 @@ export default function () {
 }
 ```
 
-Omit the selector or leave it empty to use built-in `data_received`. Select `request_received_bytes` for the URL-attributed mode above, or `llm_streamed_bytes` for the [TPS bandwidth mode](#opt-in-tps-stream-bandwidth) below. Explicitly setting `data_received`, other values or a non-string selector fails preparation. The selector is read from `k6 inspect` before any samples are collected and remains fixed for that run. Existing plans need no changes. Merely declaring a custom counter does not opt in.
+Omit the selector or leave it empty to use built-in `data_received`. Select `request_received_bytes` for the URL-attributed mode above. Explicitly setting `data_received`, other values or a non-string selector fails preparation. The selector is read from `k6 inspect` before any samples are collected and remains fixed for that run. Existing plans need no changes. Merely declaring a custom counter does not opt in. TPS selection is independent of this byte-source choice.
 
 In custom-counter mode, built-in `data_received` samples are ignored from the start, including samples preceding the first custom point. They are never added to, subtracted from, or used to fill gaps in request-byte totals. If the plan emits no custom samples, the byte family is absent, not fabricated as zero or replaced by aggregate traffic. Instrument every request whose bytes you want reported, including calls in setup/teardown and each batch/async response where applicable. Partial instrumentation produces partial byte totals.
 
@@ -232,33 +232,32 @@ Timing points need no `url`, `name` or `status` values. Their CSV tags do not ch
 
 Timing observations never increment status counters, add received bytes, or change VUs. HTTP latency/outcomes and the selected byte source remain independent. Identity binding, final drain, retained scrapes and reset use the same SDK-owned lifecycle as other samples.
 
-#### Opt-in TPS stream bandwidth
+#### Opt-in token-stream TPS
 
-The SDK's [shared LLM contract](https://github.com/reqfleet/engine-sdk/blob/main/agent/metrics.md#llm-streaming-metrics) defines historical `tps` as streamed payload bandwidth, not model tokens per second, for every engine. k6 implements that contract through the following fixed byte source; it introduces no new normalized family or token counter.
+The SDK's [shared LLM contract](https://github.com/reqfleet/engine-sdk/blob/main/agent/metrics.md#llm-streaming-metrics) defines TPS as received-token throughput, not payload bandwidth. k6 maps explicit token observations into the existing status counter used by the TPS chart; no SDK runtime API or dashboard change is needed.
 
-Select a streamed-payload Counter as the run's single byte source:
+Declare the fixed token-event Counter and select it independently of byte and timing sources:
 
 ```js
 import { Counter } from 'k6/metrics';
 
-const streamedBytes = new Counter('llm_streamed_bytes');
+const tokens = new Counter('llm_token_events');
 export const options = {
-  ext: {
-    reqfleet: {
-      receivedBytes: 'llm_streamed_bytes',
-    },
-  },
+  ext: { reqfleet: { tps: 'llm_token_events' } },
 };
 ```
 
-- Add each measured generated-payload **byte delta** to `streamedBytes`. For k6 binary payloads, use the actual byte length; for text, measure the payload's encoding rather than JavaScript string length. Protocol parsing and content selection follow the shared contract.
-- `receivedBytes: 'llm_streamed_bytes'` ignores both native `data_received` and `request_received_bytes` for the entire run, including before the first custom point. It cannot simultaneously select another byte source. Do not add the full response size again at completion. With no custom samples, bytes are unavailable: there is no aggregate fallback or fabricated zero.
-- Declaring the Counter alone does not opt in. The `receivedBytes` selection is fixed by inspection before launch; reset restores default aggregate bytes.
-- This source requires no CSV `url`, `name` or `status` values; those tags cannot override `tps`. The exporter calls SDK `AddReceivedBytes`, sharing admission with the other request-labelled samples. SDK folding and label-collision rules apply unchanged.
-- Selected values must be finite and nonnegative; measured zero is valid. Invalid selected values fail ingestion; unselected points are ignored. SDK rules govern partial measurements, independent outcomes, cumulative retention, final drain and coordinated reset.
-- Streamed-byte points never create latency, status or concurrency observations. Bandwidth is the rate of `shibuya_egress_bytes_counter{label="tps"}`; a chart querying request-status counts cannot display this byte-only measurement.
+- Call `tokens.add(1)` in the streaming callback **once per received generated token**, including the first token. Recording TTFT must not skip that token's TPS observation. Payload byte length, character length and elapsed milliseconds are not token counts.
+- For an SSE endpoint guaranteeing one token per token-bearing `data:` event, each such event produces one observation. SSE can split one event across multiple `data:` lines, and network reads can split or combine events: parse the protocol before counting. Ignore empty/control events, role-only deltas, heartbeats and `[DONE]`. If a server batches tokens, instrument each known token; do not assume one message is one model token when cardinality is unknown.
+- Each CSV point must have value **exactly `1`**. Batched `add(n)`, cumulative totals, rates, zero, negative, fractional and nonfinite values fail ingestion when selected. Emit no sample when no token arrives. CSV does not encode the custom metric type; Gauge, Rate and Trend declarations are outside this Counter contract.
+- The exporter calls SDK `RecordStatus` with `label="tps"` and `status="200"` once per point. Here `200` denotes a successful token receipt, not another HTTP response. CSV `url`, `name` and `status` tags cannot override that attribution. Stream/request failures belong to their own outcome reporting, not extra `tps` observations.
+- Omit `tps` or set it to an empty string to disable ingestion. Any other selector value or non-string selector fails preparation. Selection is fixed by inspection before launch; declaring the Counter alone does not opt in. Unselected points are ignored, and reset disables TPS before the next plan's inspection.
+- Token observations create no latency, byte or concurrency samples. Existing `llmResponse`, `ttft`, native HTTP metrics and `receivedBytes` selection remain independent. Missing token observations stay unavailable, without byte-derived estimates or fabricated zero series.
+- Counts use SDK-owned identity, shared admission, retention and final drain. Repeated scrapes do not recount tokens; cancellation retains tokens already received. Overflow folds `tps` into `others`, which may also contain HTTP outcomes and must not be presented as isolated token throughput. Avoid HTTP grouping names that collide with `tps`.
 
-Instrument actual streaming callbacks using a supported client, such as stock k6 WebSocket callbacks. This selector does not install an SSE extension or enable automatic extension resolution.
+The existing TPS chart derives the rate from `shibuya_status_counter{label="tps"}`. An inter-token-duration metric is not required; bandwidth remains a separate byte-counter measurement.
+
+Use a client with actual streaming callbacks. The stock k6 image supports WebSocket callbacks, used by conformance, but this selector does not add an SSE client or extension. Buffered `k6/http` responses cannot recover live token arrivals; unsupported extension imports remain rejected by the pinned-engine policy.
 
 #### Transport failures
 
@@ -314,4 +313,4 @@ Pinned-engine regressions use a controlled local build-service peer inside the n
 
 The container target first runs shared runtime regressions with a small SDK-based workload, covering completion before the first progress poll, reaping exited orphans while the adapter remains active, and cleanup of descendants in separate process groups/sessions. It then runs the real k6 suite. The shared validator's unit tests cover retained-series uniqueness, histogram invariants, request-label byte limits and optional LLM response histograms. k6 LLM scenarios compare custom timing CSV observations with both normalized histogram profiles, including overflow, zero budget, independent HTTP counts, optional selection, final drain and reused-run reset.
 
-TPS conformance uses stock k6 WebSocket callbacks against a controlled local stream, including UTF-8 generated payload, protocol-only messages, interrupted generations and a teardown stream. It compares measured CSV byte deltas with normalized metrics, verifies that first chunks contribute bytes without synthetic latency or status measurements, and excludes completion summaries and competing byte sources. Additional scenarios cover source selection, unavailable measurements, invalid samples, overflow/zero budgets, retained final metrics and reset to aggregate bytes.
+TPS conformance uses stock k6 WebSocket callbacks against a controlled token stream, including different UTF-8 payload sizes, protocol-only messages, interrupted generations and a teardown stream. It compares unit-valued CSV token events with normalized counts, includes the first token, and excludes control messages and completion summaries. It also verifies independent HTTP outcomes and byte-source selection, missing observations, invalid selectors/samples, overflow/zero budgets, retained final metrics and reused-run reset. This proves token-event ingestion, not stock-image SSE client support.

@@ -136,7 +136,7 @@ export default function(){
 			AssertMetrics: func(t *testing.T, runtime *conformance.Runtime, run string) conformance.MetricsSnapshot {
 				for _, scenario := range tpsCases {
 					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
-						_, snapshot := compareCSVSnapshotSource(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.LLMStreamedBytesMetric)
+						_, snapshot := compareCSVSnapshotSelection(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.DataReceivedMetric, llmTimingSelection{tps: true})
 						assertTPSCSV(t, runtime, true)
 						require.NotNil(t, snapshot.Requests["others"].Latency)
 						return snapshot
@@ -476,6 +476,7 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 	responseDurations := map[string][]float64{}
 	admitted := map[string]bool{}
 	bytes := map[string]float64{}
+	tokenCounts := map[string]uint64{}
 	if source == metrics.DataReceivedMetric {
 		label := "k6"
 		if labelLimit == 0 {
@@ -505,6 +506,20 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 		value, e := strconv.ParseFloat(row[columns["metric_value"]], 64)
 		require.NoError(t, e)
 		switch row[columns["metric_name"]] {
+		case metrics.LLMTokenEventsMetric:
+			if !timings.tps {
+				continue
+			}
+			require.Equal(t, float64(1), value, "each selected point is one received token")
+			label, valid := admit("tps")
+			require.True(t, valid)
+			if expected.requests[label] == nil {
+				expected.requests[label] = &requestTotals{status: map[string]float64{}}
+			}
+			// 200 is the normalized successful token-event outcome, not a
+			// per-token HTTP response. Generation errors add no token points.
+			expected.requests[label].status["200"]++
+			tokenCounts[label]++
 		case llmResponseSource, llmTTFTSource:
 			if row[columns["metric_name"]] == llmResponseSource && timings.response {
 				label, valid := admit(metricschema.LLMResponseLabel)
@@ -547,7 +562,7 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 			expected.count++
 			expected.sum += value
 			expected.status[status]++
-		case metrics.DataReceivedMetric, metrics.RequestReceivedBytesMetric, metrics.LLMStreamedBytesMetric:
+		case metrics.DataReceivedMetric, metrics.RequestReceivedBytesMetric:
 			if row[columns["metric_name"]] != source {
 				continue
 			}
@@ -560,10 +575,6 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 				if !valid {
 					continue
 				}
-			} else if source == metrics.LLMStreamedBytesMetric {
-				var valid bool
-				label, valid = admit("tps")
-				require.True(t, valid)
 			} else if labelLimit == 0 {
 				label = "others"
 			}
@@ -609,6 +620,12 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 		}
 		observed.sum += value.sum
 		for status, count := range request.Statuses {
+			if status == "200" {
+				count -= tokenCounts[label] // Keep HTTP totals independent of token receipts.
+				if count == 0 {
+					continue
+				}
+			}
 			value.status[status] = float64(count)
 			value.count += count
 			observed.count += count

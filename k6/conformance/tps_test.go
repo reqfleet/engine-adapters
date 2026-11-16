@@ -24,7 +24,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var tpsChunks = []string{"A", "界🙂é", "last"}
+// The controlled endpoint declares each nonempty content event to be exactly
+// one generated model token, regardless of its UTF-8 byte or character length.
+var tpsTokens = []string{"A", "界🙂é", "last"}
 
 // This deliberately small RFC 6455 target uses only the standard library. All
 // server frames are unmasked, final text frames with payloads shorter than 126
@@ -68,31 +70,32 @@ func serveTPSStream(t *testing.T, w http.ResponseWriter, r *http.Request) bool {
 		}
 		return assert.NoError(t, rw.Flush())
 	}
-	if !send(map[string]any{"kind": "role", "role": "assistant"}) {
+	if !send(map[string]any{"kind": "role", "role": "assistant", "unit": "model_token"}) {
 		return true
 	}
-	chunks := tpsChunks
+	chunks := tpsTokens
 	if r.URL.Path == "/tps/interrupted" {
 		chunks = chunks[:2]
 	}
-	total := 0
+	if !send(map[string]any{"kind": "content", "content": "", "tokens": 0}) {
+		return true
+	}
 	for index, chunk := range chunks {
 		if index > 1 {
 			if !send(map[string]any{"kind": "heartbeat"}) {
 				return true
 			}
 		}
-		if !send(map[string]any{"kind": "content", "content": chunk}) {
+		if !send(map[string]any{"kind": "content", "content": chunk, "tokens": 1}) {
 			return true
 		}
-		total += len(chunk)
 	}
 	kind := "complete"
 	if r.URL.Path == "/tps/interrupted" {
 		kind = "error"
 	}
 	// The completion summary is deliberately redundant: never count it again.
-	if !send(map[string]any{"kind": kind, "total_bytes": total}) {
+	if !send(map[string]any{"kind": "done"}) || !send(map[string]any{"kind": kind, "total_tokens": len(chunks)}) {
 		return true
 	}
 	if _, err = rw.Write([]byte{0x88, 2, 3, 232}); !assert.NoError(t, err) || !assert.NoError(t, rw.Flush()) {
@@ -109,21 +112,23 @@ import ws from 'k6/ws';
 import {sleep} from 'k6';
 import {Counter} from 'k6/metrics';
 export const options={systemTags:['method']%s};
-const streamed=new Counter('llm_streamed_bytes');
+const tokens=new Counter('llm_token_events');
 const requestBytes=new Counter('request_received_bytes');
 function stream(path){
   let chunks=0;
   let terminal=false;
+  let tokenUnits=false;
   const response=ws.connect('%s'+path,{},function(socket){
     socket.on('message',function(raw){
       const message=JSON.parse(raw);
+      if(message.kind==='role'){tokenUnits=message.unit==='model_token';return;}
       if(message.kind==='complete'||message.kind==='error'){terminal=true;return;}
-      if(message.kind!=='content')return;
-      // Encode UTF-8, not UTF-16 code units, and exclude the JSON envelope.
-      const bytes=encodeURIComponent(message.content).replace(/%%[0-9A-F]{2}/g,'x').length;
+      if(message.kind!=='content'||!message.content)return;
+      // Transport frames alone do not establish model-token cardinality.
+      if(!tokenUnits||message.tokens!==1)throw new Error('unknown token cardinality');
       const tags=chunks%%2===0?{}:{url:'not-tps',name:'NOT-TPS',status:'599'};
       if(%t){
-        streamed.add(bytes,tags);
+        tokens.add(1,tags);
       }
       chunks++;
     });
@@ -140,7 +145,7 @@ export default function(){
   stream('/tps/stream');
   stream('/tps/interrupted');
   http.get('%s/500');
-  // Three outcomes prove both streams have finished before Stop.
+  // Three HTTP outcomes plus five token receipts precede teardown.
   http.get('%s/tps/done');
   sleep(0.1);
 }
@@ -150,30 +155,35 @@ export function teardown(){stream('/tps/stream');}
 }
 
 func tpsFixtures(artifacts map[string]string) []conformance.BudgetScenario {
-	selection := `,ext:{reqfleet:{receivedBytes:'llm_streamed_bytes'}}`
-	artifacts["tps-bytes.js"] = tpsScript(selection, true)
+	selection := `,ext:{reqfleet:{tps:'llm_token_events'}}`
+	artifacts["tps-tokens.js"] = tpsScript(selection, true)
 	artifacts["tps-none.js"] = tpsScript(selection, false)
 	artifacts["tps-default.js"] = tpsScript("", true)
-	artifacts["tps-disabled.js"] = tpsScript(`,ext:{reqfleet:{receivedBytes:''}}`, true)
-	artifacts["tps-request-bytes.js"] = tpsScript(`,ext:{reqfleet:{receivedBytes:'request_received_bytes'}}`, true)
+	artifacts["tps-disabled.js"] = tpsScript(`,ext:{reqfleet:{tps:''}}`, true)
+	artifacts["tps-request-bytes.js"] = tpsScript(`,ext:{reqfleet:{tps:'llm_token_events',receivedBytes:'request_received_bytes'}}`, true)
 	for _, selected := range []bool{false, true} {
 		options := ""
 		if selected {
 			options = selection
 		}
-		artifacts[fmt.Sprintf("tps-negative-%t.js", selected)] = fmt.Sprintf(`import http from 'k6/http';
+		for index, value := range []float64{-1, 0, 2, 0.5} {
+			artifacts[fmt.Sprintf("tps-invalid-%t-%d.js", selected, index)] = fmt.Sprintf(`import http from 'k6/http';
 import {sleep} from 'k6';
 import {Counter} from 'k6/metrics';
 export const options={systemTags:['method']%s};
-const value=new Counter('llm_streamed_bytes');
-export default function(){if(__ITER>0){sleep(0.1);return;}value.add(-1);http.get('%s/tps/seed');sleep(0.1);}
-`, options, conformance.TargetURL)
+const value=new Counter('llm_token_events');
+export default function(){if(__ITER>0){sleep(0.1);return;}value.add(%g);http.get('%s/tps/seed');sleep(0.1);}
+`, options, value, conformance.TargetURL)
+		}
 	}
-	fixture := conformance.Fixture{File: "tps-bytes.js", Settings: json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)}
+	for index, selector := range []string{`true`, `12`, `[]`, `{}`, `'unknown'`, `'llm_streamed_bytes'`} {
+		artifacts[fmt.Sprintf("tps-selector-%d.js", index)] = tpsScript(`,ext:{reqfleet:{tps:`+selector+`}}`, true)
+	}
+	fixture := conformance.Fixture{File: "tps-tokens.js", Settings: json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)}
 	return []conformance.BudgetScenario{
-		{Name: "tps-overflow", LabelLimit: 1, Fixture: fixture, MinimumRequests: 3,
-			RequestLabels: []string{conformance.TargetURL + "/tps/seed", "others"}, ByteLabels: []string{"others"}},
-		{Name: "tps-zero", LabelLimit: 0, Fixture: fixture, MinimumRequests: 3,
+		{Name: "tps-overflow", LabelLimit: 1, Fixture: fixture, MinimumRequests: 8,
+			RequestLabels: []string{conformance.TargetURL + "/tps/seed", "others"}, ByteLabels: []string{"k6"}},
+		{Name: "tps-zero", LabelLimit: 0, Fixture: fixture, MinimumRequests: 8,
 			RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
 	}
 }
@@ -198,29 +208,29 @@ func assertTPSCSV(t *testing.T, runtime *conformance.Runtime, emit bool) {
 	for _, row := range rows[1:] {
 		name := row[columns["metric_name"]]
 		switch name {
-		case metrics.LLMStreamedBytesMetric, metrics.RequestReceivedBytesMetric, metrics.DataReceivedMetric:
+		case metrics.LLMTokenEventsMetric, metrics.RequestReceivedBytesMetric, metrics.DataReceivedMetric:
 			value, err := strconv.ParseFloat(row[columns["metric_value"]], 64)
 			require.NoError(t, err)
 			values[name] = append(values[name], value)
-			if name == metrics.LLMStreamedBytesMetric {
+			if name == metrics.LLMTokenEventsMetric {
 				urls[row[columns["url"]]] = true
 			}
 		}
 	}
-	require.NotEmpty(t, values[metrics.DataReceivedMetric], "ignored native wire traffic must actually exist")
+	require.NotEmpty(t, values[metrics.DataReceivedMetric], "independent native wire traffic must actually exist")
 	require.Equal(t, []float64{9876}, values[metrics.RequestReceivedBytesMetric], "the competing URL-attributed byte source exists too")
 	if !emit {
-		require.Empty(t, values[metrics.LLMStreamedBytesMetric])
+		require.Empty(t, values[metrics.LLMTokenEventsMetric])
 		return
 	}
 	want := []float64{}
 	// Two complete streams (including teardown), one interrupted generation.
-	for _, chunks := range [][]string{tpsChunks, tpsChunks[:2], tpsChunks} {
-		for _, chunk := range chunks {
-			want = append(want, float64(len(chunk)))
+	for _, tokens := range [][]string{tpsTokens, tpsTokens[:2], tpsTokens} {
+		for range tokens {
+			want = append(want, 1)
 		}
 	}
-	require.Equal(t, want, values[metrics.LLMStreamedBytesMetric], "include every first chunk and UTF-8 byte, exclude envelopes, controls and completion totals")
+	require.Equal(t, want, values[metrics.LLMTokenEventsMetric], "include every first token, exclude envelopes, empty content, controls and completion totals")
 	require.Equal(t, map[string]bool{"": true, "not-tps": true}, urls, "both absent and misleading tags must map to reserved tps")
 }
 
@@ -228,94 +238,112 @@ func runTPSScenarios(t *testing.T, runtime *conformance.Runtime) {
 	t.Helper()
 	settings := json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)
 	csvPath := filepath.Join(runtime.Root, "test-result", "k6.csv")
-	check := func(t *testing.T, id, file, source string, emit bool) {
+	check := func(t *testing.T, id, file, source string, selected, emit bool) {
 		t.Helper()
 		runtime.Start(t, id, conformance.Fixture{File: file, Settings: settings})
 		runtime.Running(t, id)
-		runtime.AwaitRequests(t, id, 3)
+		if selected && emit {
+			runtime.AwaitRequests(t, id, 8)
+		} else {
+			runtime.AwaitRequests(t, id, 3)
+		}
 		runtime.Stop(t, id)
 		runtime.Terminal(t, id, protocol.RunCanceled, proofWait)
-		observed, snapshot := compareCSVSnapshotSource(t, runtime.Client, csvPath, id, runtime.LabelLimit, source)
+		selection := llmTimingSelection{tps: selected}
+		observed, snapshot := compareCSVSnapshotSelection(t, runtime.Client, csvPath, id, runtime.LabelLimit, source, selection)
 		assertTPSCSV(t, runtime, emit)
-		require.Equal(t, uint64(3), observed.count, "WebSocket chunks and summary markers never create HTTP outcomes")
+		require.Equal(t, uint64(3), observed.count, "token receipts and summary markers never create HTTP outcomes")
 		require.Equal(t, map[string]float64{"200": 2, "500": 1}, observed.status)
-		if source == metrics.LLMStreamedBytesMetric {
-			if emit {
-				want := float64(3*len(tpsChunks[0]) + 3*len(tpsChunks[1]) + 2*len(tpsChunks[2]))
-				require.Equal(t, map[string]float64{"tps": want}, snapshot.Bytes, "exclude native and request-attributed bytes, including pre-stream traffic")
-			} else {
-				require.Empty(t, snapshot.Bytes, "missing selected samples cannot fall back to either competing byte source")
-			}
-		} else if source == metrics.RequestReceivedBytesMetric {
+		if source == metrics.RequestReceivedBytesMetric {
 			require.Equal(t, map[string]float64{"request-only": 9876}, snapshot.Bytes)
 		} else {
 			require.Positive(t, observed.bytes)
 			require.Equal(t, map[string]float64{"k6": observed.bytes}, snapshot.Bytes)
 		}
-		require.NotContains(t, snapshot.Requests, "tps", "byte-only TPS never fabricates latency or outcomes")
-		_, retained := compareCSVSnapshotSource(t, runtime.Client, csvPath, id, runtime.LabelLimit, source)
-		require.Equal(t, snapshot, retained, "final streamed bytes remain retained without duplicate ingestion")
+		if selected && emit {
+			require.Equal(t, map[string]uint64{"200": 8}, snapshot.Requests["tps"].Statuses)
+			require.Nil(t, snapshot.Requests["tps"].Latency)
+			require.Nil(t, snapshot.Requests["tps"].LLMResponseLatency)
+		} else {
+			require.NotContains(t, snapshot.Requests, "tps")
+		}
+		require.NotContains(t, snapshot.Bytes, "tps", "tokens never create bandwidth")
+		_, retained := compareCSVSnapshotSelection(t, runtime.Client, csvPath, id, runtime.LabelLimit, source, selection)
+		require.Equal(t, snapshot, retained, "final token counts remain retained without duplicate ingestion")
 	}
 	for index, scenario := range []struct {
-		file, source string
-		emit         bool
+		file, source   string
+		selected, emit bool
 	}{
-		{"tps-bytes.js", metrics.LLMStreamedBytesMetric, true},
-		{"tps-default.js", metrics.DataReceivedMetric, true},
-		{"tps-bytes.js", metrics.LLMStreamedBytesMetric, true},
-		{"tps-disabled.js", metrics.DataReceivedMetric, true},
-		{"tps-request-bytes.js", metrics.RequestReceivedBytesMetric, true},
-		{"tps-none.js", metrics.LLMStreamedBytesMetric, false},
+		{"tps-tokens.js", metrics.DataReceivedMetric, true, true},
+		{"tps-default.js", metrics.DataReceivedMetric, false, true},
+		{"tps-tokens.js", metrics.DataReceivedMetric, true, true},
+		{"tps-disabled.js", metrics.DataReceivedMetric, false, true},
+		{"tps-request-bytes.js", metrics.RequestReceivedBytesMetric, true, true},
+		{"tps-none.js", metrics.DataReceivedMetric, true, false},
 	} {
 		t.Run("tps-reuse/"+strconv.Itoa(index), func(t *testing.T) {
-			check(t, strconv.Itoa(1800+index), scenario.file, scenario.source, scenario.emit)
+			check(t, strconv.Itoa(1800+index), scenario.file, scenario.source, scenario.selected, scenario.emit)
 		})
 	}
 	for selectedIndex, selected := range []bool{true, false} {
-		t.Run(fmt.Sprintf("tps-negative/%t", selected), func(t *testing.T) {
-			source := metrics.LLMStreamedBytesMetric
-			id := strconv.Itoa(1870 + selectedIndex)
-			file := fmt.Sprintf("tps-negative-%t.js", selected)
-			runtime.Start(t, id, conformance.Fixture{File: file, Settings: settings})
-			if selected {
-				status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
-				require.Contains(t, status.ErrorMessage, "invalid "+source+" sample")
-				return
-			}
-			runtime.Running(t, id)
-			runtime.AwaitRequests(t, id, 1)
-			runtime.Stop(t, id)
-			runtime.Terminal(t, id, protocol.RunCanceled, proofWait)
-			observed, snapshot := compareCSVSnapshot(t, runtime.Client, csvPath, id, runtime.LabelLimit)
-			output, err := os.Open(csvPath)
-			require.NoError(t, err)
-			defer output.Close()
-			rows, err := csv.NewReader(output).ReadAll()
-			require.NoError(t, err)
-			require.NotEmpty(t, rows)
-			columns := map[string]int{}
-			for index, name := range rows[0] {
-				columns[name] = index
-			}
-			require.Contains(t, columns, "metric_name")
-			require.Contains(t, columns, "metric_value")
-			var values []float64
-			for _, row := range rows[1:] {
-				if row[columns["metric_name"]] == source {
-					value, err := strconv.ParseFloat(row[columns["metric_value"]], 64)
-					require.NoError(t, err)
-					values = append(values, value)
+		for index, invalid := range []float64{-1, 0, 2, 0.5} {
+			t.Run(fmt.Sprintf("tps-invalid/%t/%d", selected, index), func(t *testing.T) {
+				source := metrics.LLMTokenEventsMetric
+				id := strconv.Itoa(1850 + selectedIndex*10 + index)
+				file := fmt.Sprintf("tps-invalid-%t-%d.js", selected, index)
+				runtime.Start(t, id, conformance.Fixture{File: file, Settings: settings})
+				if selected {
+					status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
+					require.Contains(t, status.ErrorMessage, "invalid "+source+" sample")
+					return
 				}
-			}
-			require.Equal(t, []float64{-1}, values, "the ignored source must emit a genuinely invalid observation")
-			require.Equal(t, uint64(1), observed.count)
-			require.NotContains(t, snapshot.Requests, "tps")
-			require.Equal(t, map[string]float64{"k6": observed.bytes}, snapshot.Bytes)
+				runtime.Running(t, id)
+				runtime.AwaitRequests(t, id, 1)
+				runtime.Stop(t, id)
+				runtime.Terminal(t, id, protocol.RunCanceled, proofWait)
+				observed, snapshot := compareCSVSnapshot(t, runtime.Client, csvPath, id, runtime.LabelLimit)
+				output, err := os.Open(csvPath)
+				require.NoError(t, err)
+				defer output.Close()
+				rows, err := csv.NewReader(output).ReadAll()
+				require.NoError(t, err)
+				require.NotEmpty(t, rows)
+				columns := map[string]int{}
+				for index, name := range rows[0] {
+					columns[name] = index
+				}
+				require.Contains(t, columns, "metric_name")
+				require.Contains(t, columns, "metric_value")
+				var values []float64
+				for _, row := range rows[1:] {
+					if row[columns["metric_name"]] == source {
+						value, err := strconv.ParseFloat(row[columns["metric_value"]], 64)
+						require.NoError(t, err)
+						values = append(values, value)
+					}
+				}
+				require.Equal(t, []float64{invalid}, values, "the ignored source must emit a genuinely invalid observation")
+				require.Equal(t, uint64(1), observed.count)
+				require.NotContains(t, snapshot.Requests, "tps")
+				require.Equal(t, map[string]float64{"k6": observed.bytes}, snapshot.Bytes)
+			})
+		}
+	}
+	for index := range 6 {
+		t.Run(fmt.Sprintf("tps-selector/%d", index), func(t *testing.T) {
+			id := strconv.Itoa(1880 + index)
+			runtime.Start(t, id, conformance.Fixture{File: fmt.Sprintf("tps-selector-%d.js", index), Settings: settings})
+			status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
+			require.Contains(t, status.ErrorMessage, "tps")
+			body := scrape(t, runtime.Client)
+			require.NotContains(t, body, `run_id="1863"`, "failed preparation must clear preceding run measurements")
+			require.NotContains(t, body, `run_id="`+id+`"`, "invalid selection must not launch or report samples")
 		})
 	}
 	t.Run("tps-recovery", func(t *testing.T) {
-		check(t, "1890", "tps-bytes.js", metrics.LLMStreamedBytesMetric, true)
-		check(t, "1891", "tps-default.js", metrics.DataReceivedMetric, true)
+		check(t, "1890", "tps-tokens.js", metrics.DataReceivedMetric, true, true)
+		check(t, "1891", "tps-default.js", metrics.DataReceivedMetric, false, true)
 	})
 	runtime.AssertAlive(t)
 }

@@ -25,6 +25,7 @@ type Reporter interface {
 	Reset(agent.RunContext)
 	ConfigureReceivedBytes(agent.RunContext, string) error
 	ConfigureLLMTimings(agent.RunContext, string, string) error
+	ConfigureTPS(agent.RunContext, string) error
 	Observe(context.Context, agent.RunContext) (protocol.Observation, error)
 }
 
@@ -160,6 +161,7 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 				ReceivedBytes json.RawMessage `json:"receivedBytes"`
 				LLMResponse   json.RawMessage `json:"llmResponse"`
 				TTFT          json.RawMessage `json:"ttft"`
+				TPS           json.RawMessage `json:"tps"`
 			} `json:"reqfleet"`
 		} `json:"ext"`
 	}
@@ -178,11 +180,18 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	if err != nil {
 		return err
 	}
+	tpsSource, err := metricSource(inspected.Ext.Reqfleet.TPS, "tps")
+	if err != nil {
+		return err
+	}
 	if err := a.reporter.ConfigureReceivedBytes(run, byteSource); err != nil {
 		return fmt.Errorf("k6 options.ext.reqfleet.receivedBytes: %w", err)
 	}
 	if err := a.reporter.ConfigureLLMTimings(run, responseSource, ttftSource); err != nil {
 		return fmt.Errorf("k6 options.ext.reqfleet LLM timings: %w", err)
+	}
+	if err := a.reporter.ConfigureTPS(run, tpsSource); err != nil {
+		return fmt.Errorf("k6 options.ext.reqfleet.tps: %w", err)
 	}
 	// With resolution disabled, inspect skips version constraints.
 	// Use k6's dependency checker to validate them.

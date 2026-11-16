@@ -26,6 +26,9 @@ func (*reporter) ConfigureReceivedBytes(agent.RunContext, string) error {
 func (*reporter) ConfigureLLMTimings(agent.RunContext, string, string) error {
 	return nil
 }
+func (*reporter) ConfigureTPS(agent.RunContext, string) error {
+	return nil
+}
 func (*reporter) Observe(context.Context, agent.RunContext) (protocol.Observation, error) {
 	return protocol.ObservationPending, nil
 }

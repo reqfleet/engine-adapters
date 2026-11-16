@@ -32,6 +32,7 @@ const (
 type llmTimingSelection struct {
 	response bool
 	ttft     bool
+	tps      bool
 }
 
 func serveLLMTiming(w http.ResponseWriter, r *http.Request) bool {

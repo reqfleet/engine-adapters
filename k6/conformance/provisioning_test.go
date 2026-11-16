@@ -161,6 +161,9 @@ func (provisioningReporter) ConfigureReceivedBytes(agent.RunContext, string) err
 func (provisioningReporter) ConfigureLLMTimings(agent.RunContext, string, string) error {
 	return nil
 }
+func (provisioningReporter) ConfigureTPS(agent.RunContext, string) error {
+	return nil
+}
 func (provisioningReporter) Observe(context.Context, agent.RunContext) (protocol.Observation, error) {
 	return protocol.ObservationPending, nil
 }
