@@ -42,9 +42,10 @@ k6 CSV rows are independent metric samples, not complete request records:
 - An `http_req_duration` sample supplies latency, HTTP status and URL together. Use it for the URL-grouped latency observation and status count; do not also count `http_reqs` and double-count requests.
 - Standard `data_received` samples lack request URL attribution. In default mode, keep received bytes aggregate under `label="k6"` (`others` when the label limit is zero). They must not consume URL admission slots or produce per-URL byte series.
 - Plans may opt into `Counter('request_received_bytes')` using `options.ext.reqfleet.receivedBytes = 'request_received_bytes'`. Read this option from k6 inspection before launch, require the custom point's explicit nonempty CSV `url`, and record only its measured byte delta through SDK `AddReceivedBytes`. Share request-label validation/admission with latency/status; drop oversized custom points without marking readiness. Ignore native `data_received` for the entire custom-mode run, never mix both byte sources or switch after samples arrive. Missing custom measurements remain unavailable, not aggregate fallbacks or invented zeroes. Reset restores the default mode before the next plan's inspection.
+- Plans may independently select `options.ext.reqfleet.llmResponse = 'llm_response_duration'` and `options.ext.reqfleet.ttft = 'llm_time_to_first_token'`. Record measured millisecond Trend observations through SDK `ObserveLLMResponse` and `ObserveLatency` respectively, using reserved `llm_resp` and `ttft` labels rather than CSV URL tags. Share SDK admission with HTTP and request-byte samples; folded response timings must retain the wide LLM histogram. Never create status, byte or concurrency measurements from timing points, infer TTFT from HTTP waiting time, or substitute HTTP duration for absent LLM instrumentation. Reset disables both selectors before the next inspection. See [the timing contract](k6/README.md#opt-in-llm-timing-histograms).
 - Without explicit request-byte instrumentation, per-URL bandwidth is unavailable, not zero. Never assign aggregate bytes to requests by row order, matching timestamps, or copying totals to every URL. Document custom body measurements separately from full wire traffic, including decompression, discarded bodies and redirects.
 - VUs, CPU and memory remain agent-level metrics, not request-labelled measurements.
-- Record independent samples through SDK `MetricsRecorder.ObserveRequest`, `AddAggregateReceivedBytes`, `AddReceivedBytes`, and `SetConcurrency`. Do not route VU/byte samples through `RecordEvent` or `MetricParser`, which also create request counts and latency observations. Request-attributed `AddReceivedBytes` is appropriate only for explicit custom request-byte samples, never k6's aggregate byte samples.
+- Record independent samples through SDK `MetricsRecorder.ObserveRequest`, `ObserveLLMResponse`, `ObserveLatency`, `AddAggregateReceivedBytes`, `AddReceivedBytes`, and `SetConcurrency`. Do not route VU/byte/timing samples through `RecordEvent` or `MetricParser`, which also create unrelated request measurements. Request-attributed `AddReceivedBytes` is appropriate only for explicit custom request-byte samples, never k6's aggregate byte samples.
 
 ## Use SDK-owned container resource reporting
 
@@ -120,12 +121,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261113054304-b53aa17df9fd`, a pinned SDK main snapshot providing recorder-bound assigned identity and a coordinated reset of all run-local reporting state, alongside canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining, ingestion-failure propagation and the conformance toolkit. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261116061113-4635b12e9b6e`, a pinned SDK main snapshot providing independent LLM response observations, recorder-bound assigned identity and a coordinated reset of all run-local reporting state, alongside canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining, ingestion-failure propagation and the conformance toolkit. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261113054304-b53aa17df9fd \
-  -t k6-adapter:sdk-b53aa17 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261116061113-4635b12e9b6e \
+  -t k6-adapter:sdk-4635b12 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.

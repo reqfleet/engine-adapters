@@ -24,6 +24,7 @@ import (
 type Reporter interface {
 	Reset(agent.RunContext)
 	ConfigureReceivedBytes(agent.RunContext, string) error
+	ConfigureLLMTimings(agent.RunContext, string, string) error
 	Observe(context.Context, agent.RunContext) (protocol.Observation, error)
 }
 
@@ -157,23 +158,31 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 		Ext struct {
 			Reqfleet struct {
 				ReceivedBytes json.RawMessage `json:"receivedBytes"`
+				LLMResponse   json.RawMessage `json:"llmResponse"`
+				TTFT          json.RawMessage `json:"ttft"`
 			} `json:"reqfleet"`
 		} `json:"ext"`
 	}
 	if err := json.Unmarshal(output.Bytes(), &inspected); err != nil {
 		return fmt.Errorf("k6 inspection options: %w", err)
 	}
-	var byteSource string
-	if raw := inspected.Ext.Reqfleet.ReceivedBytes; len(raw) != 0 {
-		if raw[0] != '"' {
-			return fmt.Errorf("k6 options.ext.reqfleet.receivedBytes must be a string")
-		}
-		if err := json.Unmarshal(raw, &byteSource); err != nil {
-			return fmt.Errorf("k6 options.ext.reqfleet.receivedBytes: %w", err)
-		}
+	byteSource, err := metricSource(inspected.Ext.Reqfleet.ReceivedBytes, "receivedBytes")
+	if err != nil {
+		return err
+	}
+	responseSource, err := metricSource(inspected.Ext.Reqfleet.LLMResponse, "llmResponse")
+	if err != nil {
+		return err
+	}
+	ttftSource, err := metricSource(inspected.Ext.Reqfleet.TTFT, "ttft")
+	if err != nil {
+		return err
 	}
 	if err := a.reporter.ConfigureReceivedBytes(run, byteSource); err != nil {
 		return fmt.Errorf("k6 options.ext.reqfleet.receivedBytes: %w", err)
+	}
+	if err := a.reporter.ConfigureLLMTimings(run, responseSource, ttftSource); err != nil {
+		return fmt.Errorf("k6 options.ext.reqfleet LLM timings: %w", err)
 	}
 	// With resolution disabled, inspect skips version constraints.
 	// Use k6's dependency checker to validate them.
@@ -196,6 +205,20 @@ func (a *Adapter) BeforeStart(ctx context.Context, run agent.RunContext) error {
 	}
 	a.preparedRun, a.entry = run.RunID, entry
 	return nil
+}
+
+func metricSource(raw json.RawMessage, option string) (string, error) {
+	if len(raw) == 0 {
+		return "", nil
+	}
+	if raw[0] != '"' {
+		return "", fmt.Errorf("k6 options.ext.reqfleet.%s must be a string", option)
+	}
+	var source string
+	if err := json.Unmarshal(raw, &source); err != nil {
+		return "", fmt.Errorf("k6 options.ext.reqfleet.%s: %w", option, err)
+	}
+	return source, nil
 }
 
 func (a *Adapter) BuildCommand(_ context.Context, run agent.RunContext) (agent.Command, error) {

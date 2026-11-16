@@ -1,6 +1,6 @@
 # HTTP k6 reference adapter
 
-Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [main snapshot b53aa17](https://github.com/reqfleet/engine-sdk/commit/b53aa17df9fd9342e4d4fd4f89d00ee948a7f02d), pinned in `go.mod` as `v0.5.1-0.20261113054304-b53aa17df9fd` for recorder-bound assigned identity, coordinated run reset, request admission, SDK-owned collectors, custom ingestion and the optional public conformance toolkit. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
+Default engine: [k6 v2.3.0](https://github.com/grafana/k6/releases/tag/v2.3.0), configurable at image build time. Default public SDK: [main snapshot 4635b12](https://github.com/reqfleet/engine-sdk/commit/4635b12e9b6e3bfb55fe0b1e6b54907f6fb5dbf2), pinned in `go.mod` as `v0.5.1-0.20261116061113-4635b12e9b6e` for independent LLM response observations, recorder-bound assigned identity, coordinated run reset, request admission, SDK-owned collectors, custom ingestion and the optional public conformance toolkit. Metrics: `shibuya-v1`. See [AGENTS.md](../AGENTS.md) for detailed development, onboarding and release instructions.
 
 ## Supported plan
 
@@ -66,7 +66,7 @@ Use absolute paths, e.g. `open('/test-data/targets.csv')`, because the generated
 
 The exporter **collects metrics by parsing the CSV file** written by `k6 run --out csv=<run.ResultFile>`. It reads new records with Go's `encoding/csv` and updates the corresponding SDK-owned `shibuya-v1` collectors. The SDK's HTTP endpoint exposes those values; it is not the collection source.
 
-The SDK `MetricParser` callback is not suitable for these rows: it represents complete requests, whereas k6 CSV contains independent samples. Passing a `vus`, `data_received`, or custom byte-counter row through that callback would fabricate a request and latency observation. The exporter instead calls `MetricsRecorder.ObserveRequest`, `AddAggregateReceivedBytes`, `AddReceivedBytes`, or `SetConcurrency` independently. It defines no Prometheus collectors and does not call the complete-event `RecordEvent` method.
+The SDK `MetricParser` callback is not suitable for these rows: it represents complete requests, whereas k6 CSV contains independent samples. Passing a `vus`, `data_received`, custom byte-counter or custom timing row through that callback would fabricate request measurements. The exporter instead calls `MetricsRecorder.ObserveRequest`, `ObserveLLMResponse`, `ObserveLatency`, `AddAggregateReceivedBytes`, `AddReceivedBytes`, or `SetConcurrency` independently. It defines no Prometheus collectors and does not call the complete-event `RecordEvent` method.
 
 The entry point creates one `agent.MetricsRegistry`, passes it to the exporter and `AgentServerOptions.MetricsRegistry`, and sets `CustomIngestMetrics` to `exporter.Collect`. The exporter creates one `agent.MetricsRecorder` with the resolved label budget and resets it for each run. This callback handles k6's independent CSV samples rather than complete-request events. The SDK invokes it after launch, every 250ms and once after process exit. HTTP requests only gather stored values: there is no wrapper, extra listener or proxy. The SDK owns `/metrics` on port 8080, bearer authentication, resource sampling and exposition. `MetricParser`, `MetricsHandler`, `MetricsURL`, `NativeMetricsSchema`, and folding options are unset. `ResultFile` names k6's CSV output only; the adapter retains parsing, normalization, source attribution and ingestion-state ownership, not a request-name admission map.
 
@@ -127,6 +127,8 @@ Built-in `data_received` samples lack request URL attribution. By default they r
 | `vus` | Set latest actual per-agent concurrency, including genuine zero; no request count |
 | `data_received` | In default mode, add received-byte delta to the aggregate historical `shibuya_egress_bytes_counter`; ignore in custom-counter mode |
 | `request_received_bytes` | Only in custom-counter mode, add byte delta to `shibuya_egress_bytes_counter` using the exact CSV `url` and shared SDK label admission; no latency, status or concurrency update |
+| `llm_response_duration` | Only when selected by `llmResponse`, observe milliseconds in `shibuya_latency_llm_resp_milliseconds` under `llm_resp` (or `others` after admission overflow) |
+| `llm_time_to_first_token` | Only when selected by `ttft`, observe milliseconds in the ordinary histogram under `ttft` (or `others` after admission overflow) |
 | `http_reqs`, `data_sent`, other names | Ignore; no double counting and no synthetic request observations |
 
 #### Opt-in request-byte counter
@@ -173,6 +175,60 @@ The SDK's existing byte-length check and shared request-name budget apply to cus
 - With automatic redirects, k6's returned response contains only the final response. This example does not count intermediate response bodies, even though native latency/status samples include those HTTP attempts.
 - This is explicit plan instrumentation, not automatic interception of every request. The adapter reports the supplied measurements and cannot recover omitted bytes.
 
+#### Opt-in LLM timing histograms
+
+LLM timing is explicit plan instrumentation, not inferred from HTTP request names, URLs, durations or waiting times. Select either or both fixed custom [Trend](https://grafana.com/docs/k6/latest/javascript-api/k6-metrics/trend/) sources in `options.ext.reqfleet`:
+
+```js
+import { Trend } from 'k6/metrics';
+
+const responseDuration = new Trend('llm_response_duration', true);
+const timeToFirstToken = new Trend('llm_time_to_first_token', true);
+export const options = {
+  ext: {
+    reqfleet: {
+      llmResponse: 'llm_response_duration',
+      ttft: 'llm_time_to_first_token',
+    },
+  },
+};
+```
+
+Add one **measured elapsed time in milliseconds** per completed LLM response to `responseDuration`, and one per observed first generated token to `timeToFirstToken`. These are individual observations, not cumulative values, averages or percentiles. The `true` argument identifies timing Trends; it does not convert seconds to milliseconds. CSV does not encode custom metric types, so declaring these reserved sources as Counters, Gauges or Rates is outside the contract.
+
+Define the measurement interval in the plan. For example, start immediately before sending the generation request, record TTFT when the first nonempty generated token reaches the client, and record response duration when the protocol signals completion. Do not treat a stream-open event, role-only delta, heartbeat or HTTP first byte as a token. Stock k6's buffered HTTP response does not expose streaming token arrival: `response.timings.waiting` is not TTFT, and a multi-token buffered response cannot recover it. Use a client with actual token callbacks when streaming TTFT is required. Automatic extension resolution remains disabled; selecting these Trends does not add an LLM or streaming client.
+
+For a non-streaming endpoint, a complete runnable response-duration example is:
+
+```js
+import http from 'k6/http';
+import { Trend } from 'k6/metrics';
+
+const responseDuration = new Trend('llm_response_duration', true);
+export const options = {
+  ext: { reqfleet: { llmResponse: 'llm_response_duration' } },
+};
+
+export default function () {
+  const started = Date.now();
+  const response = http.post('https://example.com/v1/chat/completions',
+    JSON.stringify({ model: 'example-model', messages: [{ role: 'user', content: 'Hello' }], stream: false }),
+    { headers: { 'Content-Type': 'application/json' } });
+  const elapsed = Date.now() - started;
+  if (response.status === 200 && response.json('choices.0.message.content') != null) {
+    responseDuration.add(elapsed);
+  }
+}
+```
+
+This interval includes client-observed request/response time, not just model computation. It intentionally does not report TTFT. Adapt completion/error detection to the actual endpoint protocol. Omit unavailable measurements on failed or interrupted generations; an already measured first-token time can remain even when completion subsequently fails. A genuine measured zero is valid. No timing samples means no corresponding series, not a fabricated zero or HTTP-duration fallback.
+
+Omitting a selector or setting it to `""` disables that measurement. The only accepted nonempty values are the exact names shown above; other strings and non-string values (including `null`) fail preparation. Merely declaring a Trend does not opt in. Inspection fixes both selections before launch; reset disables both before inspecting the next plan. Unselected points are ignored, including invalid numeric values. Selected negative, nonnumeric or nonfinite observations fail ingestion.
+
+Timing points need no `url`, `name` or `status` values. Their CSV tags do not change the reserved labels. Both timings share the recorder's first-N request-label budget with HTTP requests and custom received bytes: whichever names arrive first claim slots. A zero or exhausted budget folds them into `others`, but **response duration remains in the wide LLM histogram**, never the ordinary one. TTFT uses ordinary histogram bounds; the response histogram uses the SDK's separate bounds through 300000 ms plus `+Inf`. HTTP groups named `ttft` share that ordinary label; HTTP groups named `llm_resp` still use the ordinary histogram. Avoid those grouping names when distinct reporting is needed.
+
+Timing observations never increment status counters, add received bytes, or change VUs. HTTP latency/outcomes and the selected byte source remain independent. Identity binding, final drain, retained scrapes and reset use the same SDK-owned lifecycle as other samples.
+
 #### Transport failures
 
 When k6 emits `status=0`, the normalized `shibuya_status_counter` uses a stable, readable description with the native error code instead of an apparent HTTP status of `0`. The code comes from the same duration sample as the URL; no cross-row matching is used. Common [k6 error codes](https://grafana.com/docs/k6/latest/javascript-api/error-codes/):
@@ -193,9 +249,9 @@ DNS failures and refused connections can have `http_req_duration=0`: k6's reques
 
 The exporter resolves required CSV header names, uses `encoding/csv` including quoted/multiline values, retains its committed offset, retries incomplete tails and processes records once in `Collect`. Collection and observation share the state lock; observation only reads cached readiness and errors. Invalid selected values, complete malformed records, required-column errors and post-start truncation/read errors fail collection instead of producing fabricated data. The SDK fails the run and registry scrapes on those errors. Readiness stays pending until collection sees a valid selected sample. Check `/progress`, not the metrics response status: an empty registry is still a successful scrape. The SDK separately handles a process that exits before readiness is polled.
 
-Collection, plan, run, agent and zone identity come from the current `RunContext`, bound once by `recorder.Reset(run)` during `BeforeStart`. CSV samples supply only measurements and source attribution; the SDK applies the bound identity to request, received-byte, concurrency and resource metrics. The exporter retains the run ID to reject callbacks for another run and the result-file path solely for reading CSV. The SDK reuses that path across runs, so it is not part of callback matching. The exporter neither stores nor compares collection, plan, agent or zone. The SDK registry defines the ordinary histogram with `metricschema.RequestLatencyBuckets()`. Shared conformance validation uses the canonical boundary helpers, with independent fixed-profile fixtures guarding against schema drift. k6 reports only the ordinary HTTP histogram; `ObserveRequest` does not reinterpret a grouping value such as `llm_resp` as an LLM measurement.
+Collection, plan, run, agent and zone identity come from the current `RunContext`, bound once by `recorder.Reset(run)` during `BeforeStart`. CSV samples supply only measurements and source attribution; the SDK applies the bound identity to request, received-byte, concurrency and resource metrics. The exporter retains the run ID to reject callbacks for another run and the result-file path solely for reading CSV. The SDK reuses that path across runs, so it is not part of callback matching. The exporter neither stores nor compares collection, plan, agent or zone. The SDK registry defines ordinary and LLM histogram bounds through `metricschema.RequestLatencyBuckets()` and `metricschema.LLMResponseLatencyBuckets()`. Shared conformance validation uses the canonical boundary helpers, with independent fixed-profile fixtures guarding against schema drift. `ObserveRequest` does not reinterpret a grouping value such as `llm_resp` as an LLM measurement; only explicitly selected custom response timings populate the wide histogram.
 
-The SDK samples container resources in a background loop after launch and every five seconds, with a final attempt after joining live monitors. The k6 exporter owns no resource sampler or gauges. Recorder reset clears resource state and binds the assigned identity; successful launch also establishes a fresh CPU baseline. Completed values remain available without further reads after exit. First use, a run reset or a decreasing counter omits both CPU and memory until a complete sample is available. A resource read error warns and skips the update, preserving last-good values without failing HTTP or the workload. See the SDK's [resource metrics contract](https://github.com/reqfleet/engine-sdk/blob/b53aa17df9fd9342e4d4fd4f89d00ee948a7f02d/agent/metrics.md#runtime-resource-metrics) for sampling and recovery semantics.
+The SDK samples container resources in a background loop after launch and every five seconds, with a final attempt after joining live monitors. The k6 exporter owns no resource sampler or gauges. Recorder reset clears resource state and binds the assigned identity; successful launch also establishes a fresh CPU baseline. Completed values remain available without further reads after exit. First use, a run reset or a decreasing counter omits both CPU and memory until a complete sample is available. A resource read error warns and skips the update, preserving last-good values without failing HTTP or the workload. See the SDK's [resource metrics contract](https://github.com/reqfleet/engine-sdk/blob/4635b12e9b6e3bfb55fe0b1e6b54907f6fb5dbf2/agent/metrics.md#runtime-resource-metrics) for sampling and recovery semantics.
 
 Memory is cgroup-accounted bytes, including cache. Both resources measure all processes in the container's cgroup, not just the k6 PID. The SDK expects that cgroup mounted at `/sys/fs/cgroup`: v2 uses `cpu.stat` and `memory.current`; v1 requires the combined `cpu,cpuacct/cpuacct.usage` and `memory/memory.usage_in_bytes` paths. V1 CPU nanoseconds are truncated to microseconds by the SDK. No host or process fallback is used.
 
@@ -225,4 +281,4 @@ The adapter's `k6/conformance` tests consume the optional public `github.com/req
 
 Pinned-engine regressions use a controlled local build-service peer inside the network-isolated container. Positive controls prove that unsupported imports and engine/extension requirements can provision and execute the peer's marker executable without the adapter policy. Adapter runs must make zero provisioning/download requests and never execute that replacement, including with a conflicting inherited resolution setting. Unsupported-plan cases report protocol and terminal-state failures through their own subtests. A post-preparation source mutation independently exercises the workload invocation's guard; ordinary HTTP plans and compatible version constraints still pass the real-engine lifecycle and metrics checks.
 
-The container target first runs shared runtime regressions with a small SDK-based workload, covering completion before the first progress poll, reaping exited orphans while the adapter remains active, and cleanup of descendants in separate process groups/sessions. It then runs the real k6 suite. The shared validator's unit tests cover retained-series uniqueness, histogram invariants, request-label byte limits and optional LLM response histograms; k6 itself continues to report the HTTP metrics described above.
+The container target first runs shared runtime regressions with a small SDK-based workload, covering completion before the first progress poll, reaping exited orphans while the adapter remains active, and cleanup of descendants in separate process groups/sessions. It then runs the real k6 suite. The shared validator's unit tests cover retained-series uniqueness, histogram invariants, request-label byte limits and optional LLM response histograms. k6 LLM scenarios compare custom timing CSV observations with both normalized histogram profiles, including overflow, zero budget, independent HTTP counts, optional selection, final drain and reused-run reset.
