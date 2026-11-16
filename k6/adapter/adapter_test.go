@@ -20,6 +20,9 @@ type reporter struct{ resets []string }
 func (r *reporter) Reset(run agent.RunContext) {
 	r.resets = append(r.resets, run.RunID)
 }
+func (*reporter) ConfigureReceivedBytes(agent.RunContext, string) error {
+	return nil
+}
 func (*reporter) Observe(context.Context, agent.RunContext) (protocol.Observation, error) {
 	return protocol.ObservationPending, nil
 }

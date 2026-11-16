@@ -40,10 +40,11 @@ For the k6 adapter, group request metrics by the CSV `url` value, subject to the
 k6 CSV rows are independent metric samples, not complete request records:
 
 - An `http_req_duration` sample supplies latency, HTTP status and URL together. Use it for the URL-grouped latency observation and status count; do not also count `http_reqs` and double-count requests.
-- Standard `data_received` samples lack request URL attribution. Keep received bytes aggregate under `label="k6"` (`others` when the label limit is zero). They must not consume URL admission slots or produce per-URL byte series.
-- Per-URL bandwidth is unavailable, not zero. Never assign bytes to requests by row order, matching timestamps, or copying totals to every URL.
+- Standard `data_received` samples lack request URL attribution. In default mode, keep received bytes aggregate under `label="k6"` (`others` when the label limit is zero). They must not consume URL admission slots or produce per-URL byte series.
+- Plans may opt into `Counter('request_received_bytes')` using `options.ext.reqfleet.receivedBytes = 'request_received_bytes'`. Read this option from k6 inspection before launch, require the custom point's explicit nonempty CSV `url`, and record only its measured byte delta through SDK `AddReceivedBytes`. Share request-label validation/admission with latency/status; drop oversized custom points without marking readiness. Ignore native `data_received` for the entire custom-mode run, never mix both byte sources or switch after samples arrive. Missing custom measurements remain unavailable, not aggregate fallbacks or invented zeroes. Reset restores the default mode before the next plan's inspection.
+- Without explicit request-byte instrumentation, per-URL bandwidth is unavailable, not zero. Never assign aggregate bytes to requests by row order, matching timestamps, or copying totals to every URL. Document custom body measurements separately from full wire traffic, including decompression, discarded bodies and redirects.
 - VUs, CPU and memory remain agent-level metrics, not request-labelled measurements.
-- Record independent samples through SDK `MetricsRecorder.ObserveRequest`, `AddAggregateReceivedBytes`, and `SetConcurrency`. Do not route VU/byte samples through `RecordEvent` or `MetricParser`, which also create request counts and latency observations. Request-attributed `AddReceivedBytes` is not appropriate for k6's aggregate byte samples.
+- Record independent samples through SDK `MetricsRecorder.ObserveRequest`, `AddAggregateReceivedBytes`, `AddReceivedBytes`, and `SetConcurrency`. Do not route VU/byte samples through `RecordEvent` or `MetricParser`, which also create request counts and latency observations. Request-attributed `AddReceivedBytes` is appropriate only for explicit custom request-byte samples, never k6's aggregate byte samples.
 
 ## Use SDK-owned container resource reporting
 
@@ -62,8 +63,8 @@ k6 CSV rows are independent metric samples, not complete request records:
 ## Preserve and verify the contract
 
 - Retain both `url` and `status` in k6 `systemTags`, including when a plan supplies an explicit tag list; preserve the other requested tags.
-- Parse CSV with `encoding/csv`, locate required columns by name, and reject missing URL columns or empty URLs on HTTP duration samples. Non-request samples may have empty URL fields.
-- Regression coverage must distinguish multiple URLs, repeated requests to one URL, query-string variants, and URL versus name columns. Cover ASCII and multibyte byte-length boundaries, oversized-sample rejection before admission, custom grouping names, no prefix merging, overflow, zero budget, reset, independent status counts, and aggregate-only bytes.
+- Parse CSV with `encoding/csv`, locate required columns by name, and reject missing URL columns or empty URLs on HTTP duration and selected custom request-byte samples. Aggregate byte and VU samples may have empty URL fields.
+- Regression coverage must distinguish multiple URLs, repeated requests to one URL, query-string variants, and URL versus name columns. Cover ASCII and multibyte byte-length boundaries, oversized-sample rejection before admission, custom grouping names, no prefix merging, overflow, zero budget, reset, independent status counts, default aggregate-only bytes, and custom request-byte selection without double counting or fallback.
 - For metrics behavior changes, run `make -C k6 test-unit` and container-only `make -C k6 test-conformance` from the repository root, plus a live smoke when adding behavior not exercised by conformance. Never run the integration binary directly on the host; it owns fixed ports and `/test-data`.
 - Keep [the metrics documentation](k6/README.md#url-grouped-request-metrics), exporter tests, and live conformance assertions aligned with these semantics.
 
@@ -185,7 +186,7 @@ Run a real deployment smoke through API upload, collection creation, launch, tri
 
 ### Plan author
 
-Upload one bundled `.js` plus optional CSVs, choose per-agent VUs, duration in minutes, rampup seconds and engine count, then trigger and inspect URL-grouped request latency and status counts. Received bytes remain an agent/run aggregate because k6 does not attribute those samples to request URLs. Two engines with concurrency 2 produce four total VUs; the adapter never divides that assignment again. See [the detailed contract and examples](k6/README.md).
+Upload one bundled `.js` plus optional CSVs, choose per-agent VUs, duration in minutes, rampup seconds and engine count, then trigger and inspect URL-grouped request latency and status counts. Received bytes default to an agent/run aggregate because k6's built-in byte samples lack request URLs. For request-attributed measurements, explicitly select and emit the custom byte counter described in [the detailed contract and examples](k6/README.md#opt-in-request-byte-counter). Two engines with concurrency 2 produce four total VUs; the adapter never divides that assignment again.
 
 ## Commit and open a pull request
 
