@@ -79,8 +79,9 @@ func serveTPSStream(t *testing.T, w http.ResponseWriter, r *http.Request) bool {
 		chunks = chunks[:2]
 	}
 	total := 0
+	// Send the first pair back-to-back to exercise buffered/coalesced callbacks.
 	for index, chunk := range chunks {
-		if index > 0 {
+		if index > 1 {
 			time.Sleep(35 * time.Millisecond)
 			if !send(map[string]any{"kind": "heartbeat"}) {
 				return true
@@ -260,7 +261,8 @@ func assertTPSCSV(t *testing.T, runtime *conformance.Runtime, emit, boundaries b
 	}
 	require.Len(t, intervals, 5, "three generations yield 2+1+2 intervals, never a fake first interval or cross-generation gap")
 	for _, interval := range intervals {
-		require.GreaterOrEqual(t, interval, 20.0, "actual callback timing includes the controlled inter-chunk delay")
+		// Server send spacing does not bound client callback spacing.
+		require.GreaterOrEqual(t, interval, 0.0, "coalesced callbacks may have a zero interval")
 	}
 }
 
