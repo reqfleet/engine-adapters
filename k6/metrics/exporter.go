@@ -25,6 +25,13 @@ import (
 	"github.com/reqfleet/engine-sdk/protocol"
 )
 
+const (
+	// DataReceivedMetric is k6's built-in aggregate received-byte counter.
+	DataReceivedMetric = "data_received"
+	// RequestReceivedBytesMetric is the opt-in URL-attributed byte counter.
+	RequestReceivedBytesMetric = "request_received_bytes"
+)
+
 // Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
 // No reader or goroutine survives Collect; callbacks share the same state lock.
 type Exporter struct {
@@ -54,7 +61,7 @@ func New(labelLimit int, registry *agent.MetricsRegistry) (*Exporter, error) {
 	e := &Exporter{
 		byteLabel:           "k6",
 		recorder:            recorder,
-		receivedBytesSource: "data_received",
+		receivedBytesSource: DataReceivedMetric,
 	}
 	if labelLimit == 0 {
 		e.byteLabel = metricschema.OverflowRequestName
@@ -70,7 +77,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	defer e.mu.Unlock()
 	e.runID, e.resultFile = run.RunID, run.ResultFile
 	e.active = true
-	e.receivedBytesSource = "data_received"
+	e.receivedBytesSource = DataReceivedMetric
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
@@ -88,9 +95,9 @@ func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) e
 		return errors.New("received bytes configuration does not match the active run")
 	}
 	switch source {
-	case "", "data_received":
-		e.receivedBytesSource = "data_received"
-	case "request_received_bytes":
+	case "":
+		e.receivedBytesSource = DataReceivedMetric
+	case RequestReceivedBytesMetric:
 		e.receivedBytesSource = source
 	default:
 		return fmt.Errorf("unsupported received bytes source %q", source)
@@ -290,12 +297,12 @@ func (e *Exporter) point(record []string) error {
 		}
 		metric.Threads = value
 		e.recorder.SetConcurrency(metric)
-	case "data_received":
+	case DataReceivedMetric:
 		metric.Label, metric.EgressBytes = e.byteLabel, value
 		if err := e.recorder.AddAggregateReceivedBytes(metric); err != nil {
 			return err
 		}
-	case "request_received_bytes":
+	case RequestReceivedBytesMetric:
 		url := record[e.urlIndex]
 		if url == "" {
 			return errors.New("missing received bytes request URL")

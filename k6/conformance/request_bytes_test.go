@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/reqfleet/engine-adapters/k6/metrics"
 	"github.com/reqfleet/engine-sdk/conformance"
 	"github.com/reqfleet/engine-sdk/protocol"
 	"github.com/stretchr/testify/require"
@@ -84,7 +85,7 @@ func requestByteScript(source string, emit bool) string {
 import {sleep} from 'k6';
 import {Counter} from 'k6/metrics';
 export const options={systemTags:['method'],ext:{reqfleet:{receivedBytes:%s}}};
-const received=new Counter('request_received_bytes');
+const received=new Counter(%q);
 const cases=%s;
 export default function(){
   if(__ITER>0){sleep(1);return;}
@@ -101,16 +102,15 @@ export default function(){
   http.get(%q,{responseType:'binary'});
   sleep(1);
 }
-`, source, cases, emit, conformance.TargetURL+"/request-bytes/done")
+`, source, metrics.RequestReceivedBytesMetric, cases, emit, conformance.TargetURL+"/request-bytes/done")
 }
 
 func requestByteFixtures(artifacts map[string]string) []conformance.BudgetScenario {
-	artifacts["request-bytes.js"] = requestByteScript(`"request_received_bytes"`, true)
-	artifacts["request-bytes-default.js"] = requestByteScript(`"data_received"`, true)
+	artifacts["request-bytes.js"] = requestByteScript(strconv.Quote(metrics.RequestReceivedBytesMetric), true)
 	artifacts["request-bytes-empty.js"] = requestByteScript(`""`, true)
 	artifacts["request-bytes-absent.js"] = strings.Replace(requestByteScript(`""`, true), `,ext:{reqfleet:{receivedBytes:""}}`, "", 1)
-	artifacts["request-bytes-none.js"] = requestByteScript(`"request_received_bytes"`, false)
-	for index, source := range []string{`"unknown"`, `true`, `42`, `[]`, `{}`, `null`} {
+	artifacts["request-bytes-none.js"] = requestByteScript(strconv.Quote(metrics.RequestReceivedBytesMetric), false)
+	for index, source := range []string{strconv.Quote(metrics.DataReceivedMetric), `"unknown"`, `true`, `42`, `[]`, `{}`, `null`} {
 		artifacts[fmt.Sprintf("request-bytes-invalid-%d.js", index)] = requestByteScript(source, true)
 	}
 	for name, sample := range map[string]string{
@@ -119,8 +119,8 @@ func requestByteFixtures(artifacts map[string]string) []conformance.BudgetScenar
 	} {
 		artifacts["request-bytes-"+name+".js"] = `import {sleep} from 'k6';
 import {Counter} from 'k6/metrics';
-export const options={ext:{reqfleet:{receivedBytes:'request_received_bytes'}}};
-const received=new Counter('request_received_bytes');
+export const options={ext:{reqfleet:{receivedBytes:'` + metrics.RequestReceivedBytesMetric + `'}}};
+const received=new Counter('` + metrics.RequestReceivedBytesMetric + `');
 export default function(){` + sample + `sleep(1);}`
 	}
 	cases := requestByteCases()
@@ -164,9 +164,9 @@ func assertRequestByteBodies(t *testing.T, runtime *conformance.Runtime, run str
 		value, err := strconv.ParseFloat(row[columns["metric_value"]], 64)
 		require.NoError(t, err)
 		switch row[columns["metric_name"]] {
-		case "data_received":
+		case metrics.DataReceivedMetric:
 			builtIn += value
-		case "request_received_bytes":
+		case metrics.RequestReceivedBytesMetric:
 			actualSamples[row[columns["url"]]] = append(actualSamples[row[columns["url"]]], value)
 		}
 	}
@@ -194,12 +194,12 @@ func runRequestByteScenarios(t *testing.T, runtime *conformance.Runtime) {
 		file, source string
 		emit         bool
 	}{
-		{"request-bytes.js", "request_received_bytes", true},
-		{"request-bytes-default.js", "data_received", true},
-		{"request-bytes.js", "request_received_bytes", true},
-		{"request-bytes-none.js", "request_received_bytes", false},
-		{"request-bytes-absent.js", "data_received", true},
-		{"request-bytes-empty.js", "data_received", true},
+		{"request-bytes.js", metrics.RequestReceivedBytesMetric, true},
+		{"request-bytes-empty.js", metrics.DataReceivedMetric, true},
+		{"request-bytes.js", metrics.RequestReceivedBytesMetric, true},
+		{"request-bytes-none.js", metrics.RequestReceivedBytesMetric, false},
+		{"request-bytes-absent.js", metrics.DataReceivedMetric, true},
+		{"request-bytes-empty.js", metrics.DataReceivedMetric, true},
 	} {
 		t.Run("request-bytes-reuse/"+strconv.Itoa(index), func(t *testing.T) {
 			id := strconv.Itoa(1600 + index)
@@ -209,18 +209,18 @@ func runRequestByteScenarios(t *testing.T, runtime *conformance.Runtime) {
 			runtime.Stop(t, id)
 			runtime.Terminal(t, id, protocol.RunCanceled, proofWait)
 			observed, snapshot := compareCSVSnapshotSource(t, runtime.Client, csvPath, id, runtime.LabelLimit, scenario.source)
-			if scenario.source == "request_received_bytes" {
+			if scenario.source == metrics.RequestReceivedBytesMetric {
 				original, err := os.ReadFile("/test-data/script.js")
 				require.NoError(t, err)
-				require.Equal(t, requestByteScript(`"request_received_bytes"`, scenario.emit), string(original), "selection must not rewrite the uploaded plan")
+				require.Equal(t, requestByteScript(strconv.Quote(metrics.RequestReceivedBytesMetric), scenario.emit), string(original), "selection must not rewrite the uploaded plan")
 				if scenario.emit {
 					assertRequestByteBodies(t, runtime, id, snapshot)
 				} else {
 					require.Empty(t, snapshot.Bytes, "selected mode without samples cannot fall back to data_received or fabricate zero series")
 					raw, err := os.ReadFile(csvPath)
 					require.NoError(t, err)
-					require.Contains(t, string(raw), "data_received,", "built-in measurements exist even when no custom counter was emitted")
-					require.NotContains(t, string(raw), "request_received_bytes,")
+					require.Contains(t, string(raw), metrics.DataReceivedMetric+",", "built-in measurements exist even when no custom counter was emitted")
+					require.NotContains(t, string(raw), metrics.RequestReceivedBytesMetric+",")
 				}
 			} else {
 				require.Equal(t, map[string]float64{"k6": observed.bytes}, snapshot.Bytes, "custom counters are ignored without opt-in")
@@ -230,7 +230,7 @@ func runRequestByteScenarios(t *testing.T, runtime *conformance.Runtime) {
 			require.Equal(t, snapshot, retained, "final custom-byte snapshots must persist without duplicate ingestion")
 		})
 	}
-	for index := range 6 {
+	for index := range 7 {
 		id := strconv.Itoa(1650 + index)
 		runtime.Start(t, id, conformance.Fixture{File: fmt.Sprintf("request-bytes-invalid-%d.js", index), Settings: settings})
 		status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
@@ -240,7 +240,7 @@ func runRequestByteScenarios(t *testing.T, runtime *conformance.Runtime) {
 	}
 	for index, failure := range []struct{ name, diagnostic string }{
 		{"missing-url", "missing received bytes request URL"},
-		{"negative", "invalid request_received_bytes sample"},
+		{"negative", "invalid " + metrics.RequestReceivedBytesMetric + " sample"},
 	} {
 		t.Run("request-bytes-invalid-sample/"+failure.name, func(t *testing.T) {
 			id := strconv.Itoa(1670 + index)
@@ -256,7 +256,7 @@ func runRequestByteScenarios(t *testing.T, runtime *conformance.Runtime) {
 	runtime.AwaitRequests(t, id, 10)
 	runtime.Stop(t, id)
 	runtime.Terminal(t, id, protocol.RunCanceled, proofWait)
-	_, snapshot := compareCSVSnapshotSource(t, runtime.Client, csvPath, id, runtime.LabelLimit, "request_received_bytes")
+	_, snapshot := compareCSVSnapshotSource(t, runtime.Client, csvPath, id, runtime.LabelLimit, metrics.RequestReceivedBytesMetric)
 	assertRequestByteBodies(t, runtime, id, snapshot)
 	runtime.AssertAlive(t)
 }

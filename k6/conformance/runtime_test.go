@@ -23,6 +23,7 @@ import (
 
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	"github.com/reqfleet/engine-adapters/k6/metrics"
 	"github.com/reqfleet/engine-sdk/conformance"
 	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
@@ -134,7 +135,7 @@ export default function(){
 				// Budget mode comes from the configured fixture, never CSV sample presence.
 				for _, scenario := range byteCases {
 					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
-						_, snapshot := compareCSVSnapshotSource(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, "request_received_bytes")
+						_, snapshot := compareCSVSnapshotSource(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.RequestReceivedBytesMetric)
 						assertRequestByteBodies(t, runtime, run, snapshot)
 						return snapshot
 					}
@@ -427,7 +428,7 @@ func compareCSV(t *testing.T, client *http.Client, filename, run string) totals 
 
 func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string, labelLimit int) (totals, conformance.MetricsSnapshot) {
 	t.Helper()
-	return compareCSVSnapshotSource(t, client, filename, run, labelLimit, "data_received")
+	return compareCSVSnapshotSource(t, client, filename, run, labelLimit, metrics.DataReceivedMetric)
 }
 
 func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run string, labelLimit int, source string) (totals, conformance.MetricsSnapshot) {
@@ -449,7 +450,7 @@ func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run s
 	durations := map[string][]float64{}
 	admitted := map[string]bool{}
 	bytes := map[string]float64{}
-	if source == "data_received" {
+	if source == metrics.DataReceivedMetric {
 		label := "k6"
 		if labelLimit == 0 {
 			label = "others"
@@ -509,13 +510,13 @@ func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run s
 			expected.count++
 			expected.sum += value
 			expected.status[status]++
-		case "data_received", "request_received_bytes":
+		case metrics.DataReceivedMetric, metrics.RequestReceivedBytesMetric:
 			if row[columns["metric_name"]] != source {
 				continue
 			}
 			require.False(t, value < 0 || math.IsNaN(value) || math.IsInf(value, 0), "selected byte samples must be valid")
 			label := "k6"
-			if source == "request_received_bytes" {
+			if source == metrics.RequestReceivedBytesMetric {
 				require.NotEmpty(t, row[columns["url"]], "custom byte samples must retain their request URL")
 				var valid bool
 				label, valid = admit(row[columns["url"]])

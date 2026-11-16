@@ -157,7 +157,7 @@ export default function () {
 }
 ```
 
-The selector accepts `data_received` (default when absent or empty) or `request_received_bytes`; other values and non-string selectors fail preparation. It is read from `k6 inspect` before any samples are collected and remains fixed for that run. Existing plans need no changes. Merely declaring a custom counter does not opt in.
+Omit the selector or leave it empty to use built-in `data_received`. The only accepted nonempty selector is `request_received_bytes`; explicitly setting `data_received`, other values or a non-string selector fails preparation. The selector is read from `k6 inspect` before any samples are collected and remains fixed for that run. Existing plans need no changes. Merely declaring a custom counter does not opt in.
 
 In custom-counter mode, built-in `data_received` samples are ignored from the start, including samples preceding the first custom point. They are never added to, subtracted from, or used to fill gaps in request-byte totals. If the plan emits no custom samples, the byte family is absent, not fabricated as zero or replaced by aggregate traffic. Instrument every request whose bytes you want reported, including calls in setup/teardown and each batch/async response where applicable. Partial instrumentation produces partial byte totals.
 
