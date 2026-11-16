@@ -30,6 +30,10 @@ const (
 	DataReceivedMetric = "data_received"
 	// RequestReceivedBytesMetric is the opt-in URL-attributed byte counter.
 	RequestReceivedBytesMetric = "request_received_bytes"
+	// LLMResponseDurationMetric supplies opt-in complete LLM response timings.
+	LLMResponseDurationMetric = "llm_response_duration"
+	// LLMTimeToFirstTokenMetric supplies opt-in first generated token timings.
+	LLMTimeToFirstTokenMetric = "llm_time_to_first_token"
 )
 
 // Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
@@ -38,6 +42,7 @@ type Exporter struct {
 	mu                                           sync.Mutex
 	byteLabel                                    string
 	receivedBytesSource                          string
+	llmResponseSource, ttftSource                string
 	recorder                                     *agent.MetricsRecorder
 	runID, resultFile                            string
 	active                                       bool
@@ -78,6 +83,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.runID, e.resultFile = run.RunID, run.ResultFile
 	e.active = true
 	e.receivedBytesSource = DataReceivedMetric
+	e.llmResponseSource, e.ttftSource = "", ""
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
@@ -102,6 +108,24 @@ func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) e
 	default:
 		return fmt.Errorf("unsupported received bytes source %q", source)
 	}
+	return nil
+}
+
+// ConfigureLLMTimings selects independent timing sources before launch.
+// Empty selectors disable the corresponding measurement for this run.
+func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.matchesRun(run) {
+		return errors.New("LLM timing configuration does not match the active run")
+	}
+	if response != "" && response != LLMResponseDurationMetric {
+		return fmt.Errorf("unsupported LLM response source %q", response)
+	}
+	if ttft != "" && ttft != LLMTimeToFirstTokenMetric {
+		return fmt.Errorf("unsupported TTFT source %q", ttft)
+	}
+	e.llmResponseSource, e.ttftSource = response, ttft
 	return nil
 }
 
@@ -251,7 +275,8 @@ func (e *Exporter) header(record []string) error {
 
 func (e *Exporter) point(record []string) error {
 	name := record[e.nameIndex]
-	if name != "http_req_duration" && name != "vus" && name != e.receivedBytesSource {
+	if name != "http_req_duration" && name != "vus" && name != e.receivedBytesSource &&
+		(name == "" || (name != e.llmResponseSource && name != e.ttftSource)) {
 		return nil
 	}
 	value, err := strconv.ParseFloat(record[e.valueIndex], 64)
@@ -290,6 +315,15 @@ func (e *Exporter) point(record []string) error {
 			// Recorder label rejection drops the whole sample without
 			// admitting its name, marking readiness, or failing the run.
 			return nil
+		}
+	case LLMResponseDurationMetric:
+		if err := e.recorder.ObserveLLMResponse(value); err != nil {
+			return err
+		}
+	case LLMTimeToFirstTokenMetric:
+		metric.Label, metric.Latency = metricschema.TTFTLabel, value
+		if err := e.recorder.ObserveLatency(metric); err != nil {
+			return err
 		}
 	case "vus":
 		if math.Trunc(value) != value {

@@ -43,7 +43,7 @@ func TestPublicK6Runtime(t *testing.T) {
 	inflight := make(chan struct{}, 1)
 	inflightEnded := make(chan struct{}, 1)
 	target := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if serveRequestBytes(w, r) {
+		if serveRequestBytes(w, r) || serveLLMTiming(w, r) {
 			return
 		}
 		requests.record(r.URL.Path, r.Header.Get("X-Revision"))
@@ -118,6 +118,7 @@ export default function(){
 		boundaryURL+"b", boundaryURL+"bc", boundaryURL, boundaryURL, conformance.TargetURL+"/500",
 		groupedPrefix+"界", groupedPrefix+"界suffix", groupedPrefix, conformance.TargetURL+"/200"))
 	byteCases := requestByteFixtures(artifacts)
+	llmCases := llmTimingFixtures(artifacts)
 	settings := json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)
 	fixture := conformance.Fixture{File: "labels.js", Settings: settings}
 	longLabels := conformance.Fixture{File: "long-labels.js", Settings: settings}
@@ -132,6 +133,14 @@ export default function(){
 			Reuse:             conformance.Fixture{File: "second.js", Settings: settings},
 			CompletionTimeout: 90 * time.Second,
 			AssertMetrics: func(t *testing.T, runtime *conformance.Runtime, run string) conformance.MetricsSnapshot {
+				for _, scenario := range llmCases {
+					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
+						_, snapshot := compareCSVSnapshotSelection(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.DataReceivedMetric, llmTimingSelection{response: true, ttft: true})
+						assertLLMTimingCSV(t, runtime, true)
+						require.NotNil(t, snapshot.Requests["others"].LLMResponseLatency, "overflow must retain the wide response histogram")
+						return snapshot
+					}
+				}
 				// Budget mode comes from the configured fixture, never CSV sample presence.
 				for _, scenario := range byteCases {
 					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
@@ -153,10 +162,11 @@ export default function(){
 				RequestLabels: []string{boundaryURL, conformance.TargetURL + "/500", groupedPrefix}, ByteLabels: []string{"k6"}},
 			{Name: "byte-limit-zero", LabelLimit: 0, Fixture: longLabels, MinimumRequests: 14,
 				RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
-		}, byteCases...),
+		}, append(byteCases, llmCases...)...),
 		Scenarios: func(t *testing.T, runtime *conformance.Runtime) {
 			runK6Scenarios(t, runtime, requests, inflight, inflightEnded, firstSource)
 			runRequestByteScenarios(t, runtime)
+			runLLMTimingScenarios(t, runtime)
 			provisioning.assertUnused(t, runtime.Root)
 		},
 	})
@@ -433,6 +443,11 @@ func compareCSVSnapshot(t *testing.T, client *http.Client, filename, run string,
 
 func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run string, labelLimit int, source string) (totals, conformance.MetricsSnapshot) {
 	t.Helper()
+	return compareCSVSnapshotSelection(t, client, filename, run, labelLimit, source, llmTimingSelection{})
+}
+
+func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, run string, labelLimit int, source string, timings llmTimingSelection) (totals, conformance.MetricsSnapshot) {
+	t.Helper()
 	file, err := os.Open(filename)
 	require.NoError(t, err)
 	defer file.Close()
@@ -448,6 +463,7 @@ func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run s
 	}
 	expected := totals{status: map[string]float64{}, requests: map[string]*requestTotals{}}
 	durations := map[string][]float64{}
+	responseDurations := map[string][]float64{}
 	admitted := map[string]bool{}
 	bytes := map[string]float64{}
 	if source == metrics.DataReceivedMetric {
@@ -479,6 +495,17 @@ func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run s
 		value, e := strconv.ParseFloat(row[columns["metric_value"]], 64)
 		require.NoError(t, e)
 		switch row[columns["metric_name"]] {
+		case llmResponseSource, llmTTFTSource:
+			if row[columns["metric_name"]] == llmResponseSource && timings.response {
+				label, valid := admit(metricschema.LLMResponseLabel)
+				require.True(t, valid)
+				responseDurations[label] = append(responseDurations[label], value)
+			}
+			if row[columns["metric_name"]] == llmTTFTSource && timings.ttft {
+				label, valid := admit(metricschema.TTFTLabel)
+				require.True(t, valid)
+				durations[label] = append(durations[label], value)
+			}
 		case "http_req_duration":
 			url, valid := admit(row[columns["url"]])
 			require.NotEmpty(t, row[columns["url"]], "duration rows must retain their request URL")
@@ -541,6 +568,16 @@ func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run s
 		}
 		requests[label] = conformance.RequestExpectation{Statuses: statuses, LatenciesMS: durations[label]}
 	}
+	for label, values := range durations {
+		request := requests[label]
+		request.LatenciesMS = values
+		requests[label] = request
+	}
+	for label, values := range responseDurations {
+		request := requests[label]
+		request.LLMResponseLatenciesMS = values
+		requests[label] = request
+	}
 	snapshot := conformance.AssertMetrics(t, scrape(t, client), conformance.MetricsExpectation{
 		Identity:    conformance.MetricIdentity{CollectionID: proofCollection, PlanID: proofPlan, RunID: run, EngineNo: "7", Zone: "local"},
 		Requests:    requests,
@@ -552,11 +589,15 @@ func compareCSVSnapshotSource(t *testing.T, client *http.Client, filename, run s
 	// Stable addition order keeps retained-scrape comparisons deterministic.
 	for _, label := range slices.Sorted(maps.Keys(snapshot.Requests)) {
 		request := snapshot.Requests[label]
-		value := &requestTotals{count: request.Latency.Count, sum: request.Latency.Sum, status: map[string]float64{}}
-		observed.count += value.count
+		value := &requestTotals{status: map[string]float64{}}
+		if request.Latency != nil {
+			value.sum = request.Latency.Sum
+		}
 		observed.sum += value.sum
 		for status, count := range request.Statuses {
 			value.status[status] = float64(count)
+			value.count += count
+			observed.count += count
 			observed.status[status] += float64(count)
 		}
 		observed.requests[label] = value
