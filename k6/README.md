@@ -78,7 +78,7 @@ The entry point creates one `agent.MetricsRegistry`, passes it to the exporter a
 |---|---|
 | `shibuya_latency_label_milliseconds` | Request URL/grouping name; latency histogram in milliseconds |
 | `shibuya_status_counter` | Request URL/grouping name and outcome |
-| `shibuya_egress_bytes_counter` | Agent aggregate by default; request URL/grouping name with the explicit custom-counter mode below |
+| `shibuya_egress_bytes_counter` | Agent aggregate by default; request URL/grouping name in request-byte mode, or `tps` in stream-bandwidth mode |
 | `shibuya_threads_gauge` | Latest k6 `vus` sample for the agent; no request label |
 | `shibuya_cpu_gauge` | Container-wide CPU cores; no request label |
 | `shibuya_mem_gauge` | Container-wide memory bytes; no request label |
@@ -129,6 +129,8 @@ Built-in `data_received` samples lack request URL attribution. By default they r
 | `request_received_bytes` | Only in custom-counter mode, add byte delta to `shibuya_egress_bytes_counter` using the exact CSV `url` and shared SDK label admission; no latency, status or concurrency update |
 | `llm_response_duration` | Only when selected by `llmResponse`, observe milliseconds in `shibuya_latency_llm_resp_milliseconds` under `llm_resp` (or `others` after admission overflow) |
 | `llm_time_to_first_token` | Only when selected by `ttft`, observe milliseconds in the ordinary histogram under `ttft` (or `others` after admission overflow) |
+| `llm_streamed_bytes` | Only when selected by `receivedBytes`, add measured generated-payload byte deltas under `tps` (or `others`); replaces all other byte sources |
+| `llm_inter_chunk_duration` | Only when selected by `tpsInterval`, observe milliseconds between generated-payload chunks in the ordinary histogram under `tps` (or `others`) |
 | `http_reqs`, `data_sent`, other names | Ignore; no double counting and no synthetic request observations |
 
 #### Opt-in request-byte counter
@@ -159,7 +161,7 @@ export default function () {
 }
 ```
 
-Omit the selector or leave it empty to use built-in `data_received`. The only accepted nonempty selector is `request_received_bytes`; explicitly setting `data_received`, other values or a non-string selector fails preparation. The selector is read from `k6 inspect` before any samples are collected and remains fixed for that run. Existing plans need no changes. Merely declaring a custom counter does not opt in.
+Omit the selector or leave it empty to use built-in `data_received`. Select `request_received_bytes` for the URL-attributed mode above, or `llm_streamed_bytes` for the [TPS bandwidth mode](#opt-in-tps-stream-bandwidth) below. Explicitly setting `data_received`, other values or a non-string selector fails preparation. The selector is read from `k6 inspect` before any samples are collected and remains fixed for that run. Existing plans need no changes. Merely declaring a custom counter does not opt in.
 
 In custom-counter mode, built-in `data_received` samples are ignored from the start, including samples preceding the first custom point. They are never added to, subtracted from, or used to fill gaps in request-byte totals. If the plan emits no custom samples, the byte family is absent, not fabricated as zero or replaced by aggregate traffic. Instrument every request whose bytes you want reported, including calls in setup/teardown and each batch/async response where applicable. Partial instrumentation produces partial byte totals.
 
@@ -177,7 +179,9 @@ The SDK's existing byte-length check and shared request-name budget apply to cus
 
 #### Opt-in LLM timing histograms
 
-LLM timing is explicit plan instrumentation, not inferred from HTTP request names, URLs, durations or waiting times. Select either or both fixed custom [Trend](https://grafana.com/docs/k6/latest/javascript-api/k6-metrics/trend/) sources in `options.ext.reqfleet`:
+The SDK's [engine-neutral LLM streaming contract](https://github.com/reqfleet/engine-sdk/blob/main/agent/metrics.md#llm-streaming-metrics) defines measurement boundaries, normalized families, units, labels and failure semantics for all engines. The following is k6's source mapping and opt-in instrumentation, not a separate LLM specification. The link follows the SDK development contract; it does not change the pinned runtime version listed above.
+
+Select either or both fixed custom [Trend](https://grafana.com/docs/k6/latest/javascript-api/k6-metrics/trend/) sources in `options.ext.reqfleet`:
 
 ```js
 import { Trend } from 'k6/metrics';
@@ -196,7 +200,7 @@ export const options = {
 
 Add one **measured elapsed time in milliseconds** per completed LLM response to `responseDuration`, and one per observed first generated token to `timeToFirstToken`. These are individual observations, not cumulative values, averages or percentiles. The `true` argument identifies timing Trends; it does not convert seconds to milliseconds. CSV does not encode custom metric types, so declaring these reserved sources as Counters, Gauges or Rates is outside the contract.
 
-Define the measurement interval in the plan. For example, start immediately before sending the generation request, record TTFT when the first nonempty generated token reaches the client, and record response duration when the protocol signals completion. Do not treat a stream-open event, role-only delta, heartbeat or HTTP first byte as a token. Stock k6's buffered HTTP response does not expose streaming token arrival: `response.timings.waiting` is not TTFT, and a multi-token buffered response cannot recover it. Use a client with actual token callbacks when streaming TTFT is required. Automatic extension resolution remains disabled; selecting these Trends does not add an LLM or streaming client.
+Instrument the request-start, first generated payload and protocol-completion boundaries defined by the SDK contract. Stock k6's buffered HTTP response does not expose streaming token arrival: `response.timings.waiting` is not TTFT, and a multi-token buffered response cannot recover it. Use a client with actual token callbacks when streaming TTFT is required. Automatic extension resolution remains disabled; selecting these Trends does not add an LLM or streaming client.
 
 For a non-streaming endpoint, a complete runnable response-duration example is:
 
@@ -221,13 +225,43 @@ export default function () {
 }
 ```
 
-This interval includes client-observed request/response time, not just model computation. It intentionally does not report TTFT. Adapt completion/error detection to the actual endpoint protocol. Omit unavailable measurements on failed or interrupted generations; an already measured first-token time can remain even when completion subsequently fails. A genuine measured zero is valid. No timing samples means no corresponding series, not a fabricated zero or HTTP-duration fallback.
+This non-streaming example intentionally reports only completed-response duration. Adapt its completion/error detection to the endpoint protocol and follow the SDK contract for unavailable measurements and interrupted generations.
 
 Omitting a selector or setting it to `""` disables that measurement. The only accepted nonempty values are the exact names shown above; other strings and non-string values (including `null`) fail preparation. Merely declaring a Trend does not opt in. Inspection fixes both selections before launch; reset disables both before inspecting the next plan. Unselected points are ignored, including invalid numeric values. Selected negative, nonnumeric or nonfinite observations fail ingestion.
 
-Timing points need no `url`, `name` or `status` values. Their CSV tags do not change the reserved labels. Both timings share the recorder's first-N request-label budget with HTTP requests and custom received bytes: whichever names arrive first claim slots. A zero or exhausted budget folds them into `others`, but **response duration remains in the wide LLM histogram**, never the ordinary one. TTFT uses ordinary histogram bounds; the response histogram uses the SDK's separate bounds through 300000 ms plus `+Inf`. HTTP groups named `ttft` share that ordinary label; HTTP groups named `llm_resp` still use the ordinary histogram. Avoid those grouping names when distinct reporting is needed.
+Timing points need no `url`, `name` or `status` values. Their CSV tags do not change the reserved labels. The exporter calls SDK `ObserveLLMResponse` for response duration and `ObserveLatency` under `ttft` for first-token timing, sharing admission with HTTP and custom bytes. SDK overflow and histogram-family rules apply unchanged. HTTP groups named `ttft` share that ordinary label; HTTP groups named `llm_resp` still use the ordinary histogram. Avoid those grouping names when distinct reporting is needed.
 
 Timing observations never increment status counters, add received bytes, or change VUs. HTTP latency/outcomes and the selected byte source remain independent. Identity binding, final drain, retained scrapes and reset use the same SDK-owned lifecycle as other samples.
+
+#### Opt-in TPS stream bandwidth
+
+The SDK's [shared LLM contract](https://github.com/reqfleet/engine-sdk/blob/main/agent/metrics.md#llm-streaming-metrics) defines historical `tps` as streamed payload bandwidth, not model tokens per second, for every engine. k6 implements that contract through the following fixed sources; it introduces no new normalized family or token counter.
+
+Select a streamed-payload Counter as the run's single byte source, and optionally an independent Trend for inter-chunk cadence:
+
+```js
+import { Counter, Trend } from 'k6/metrics';
+
+const streamedBytes = new Counter('llm_streamed_bytes');
+const interChunkDuration = new Trend('llm_inter_chunk_duration', true);
+export const options = {
+  ext: {
+    reqfleet: {
+      receivedBytes: 'llm_streamed_bytes',
+      tpsInterval: 'llm_inter_chunk_duration',
+    },
+  },
+};
+```
+
+- Add each measured generated-payload **byte delta** to `streamedBytes`. For k6 binary payloads, use the actual byte length; for text, measure the payload's encoding rather than JavaScript string length. Protocol parsing and content selection follow the shared contract.
+- Add each measured within-stream **inter-chunk interval in milliseconds** to `interChunkDuration`. The Trend's `true` timing flag does not convert units. Keep per-stream state in the plan and do not emit a first-chunk interval.
+- `receivedBytes: 'llm_streamed_bytes'` ignores both native `data_received` and `request_received_bytes` for the entire run, including before the first custom point. It cannot simultaneously select another byte source. Do not add the full response size again at completion. With no custom samples, bytes are unavailable: there is no aggregate fallback or fabricated zero.
+- `tpsInterval` independently accepts only `llm_inter_chunk_duration`; omission or `""` disables it. Other strings and non-string values, including `null`, fail preparation. Declaring sources alone does not opt in. Both selections are fixed by inspection before launch; reset restores default aggregate bytes and disables interval ingestion.
+- Neither source requires CSV `url`, `name` or `status` values; those tags cannot override `tps`. The exporter calls SDK `AddReceivedBytes` and `ObserveLatency`, sharing admission with the other request-labelled samples. SDK folding, histogram and label-collision rules apply unchanged.
+- Selected values must be finite and nonnegative; measured zero is valid. Invalid selected values fail ingestion; unselected points are ignored. SDK rules govern partial measurements, independent outcomes, cumulative retention, final drain and coordinated reset.
+
+Instrument actual streaming callbacks using a supported client, such as stock k6 WebSocket callbacks. These selectors do not install an SSE extension or enable automatic extension resolution.
 
 #### Transport failures
 
@@ -282,3 +316,5 @@ The adapter's `k6/conformance` tests consume the optional public `github.com/req
 Pinned-engine regressions use a controlled local build-service peer inside the network-isolated container. Positive controls prove that unsupported imports and engine/extension requirements can provision and execute the peer's marker executable without the adapter policy. Adapter runs must make zero provisioning/download requests and never execute that replacement, including with a conflicting inherited resolution setting. Unsupported-plan cases report protocol and terminal-state failures through their own subtests. A post-preparation source mutation independently exercises the workload invocation's guard; ordinary HTTP plans and compatible version constraints still pass the real-engine lifecycle and metrics checks.
 
 The container target first runs shared runtime regressions with a small SDK-based workload, covering completion before the first progress poll, reaping exited orphans while the adapter remains active, and cleanup of descendants in separate process groups/sessions. It then runs the real k6 suite. The shared validator's unit tests cover retained-series uniqueness, histogram invariants, request-label byte limits and optional LLM response histograms. k6 LLM scenarios compare custom timing CSV observations with both normalized histogram profiles, including overflow, zero budget, independent HTTP counts, optional selection, final drain and reused-run reset.
+
+TPS conformance uses stock k6 WebSocket callbacks against a controlled local stream, including UTF-8 generated payload, protocol-only messages, interrupted generations and a teardown stream. It compares measured CSV byte deltas and arrival intervals with normalized metrics, verifies that first chunks contribute bytes but no synthetic interval, and excludes completion summaries and competing byte sources. Additional scenarios cover optional selection, unavailable measurements, invalid configuration/samples, ordinary histogram boundaries, overflow/zero budgets, retained final metrics and reset to aggregate bytes.

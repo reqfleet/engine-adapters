@@ -43,7 +43,7 @@ func TestPublicK6Runtime(t *testing.T) {
 	inflight := make(chan struct{}, 1)
 	inflightEnded := make(chan struct{}, 1)
 	target := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if serveRequestBytes(w, r) || serveLLMTiming(w, r) {
+		if serveRequestBytes(w, r) || serveLLMTiming(w, r) || serveTPSStream(t, w, r) {
 			return
 		}
 		requests.record(r.URL.Path, r.Header.Get("X-Revision"))
@@ -119,6 +119,7 @@ export default function(){
 		groupedPrefix+"界", groupedPrefix+"界suffix", groupedPrefix, conformance.TargetURL+"/200"))
 	byteCases := requestByteFixtures(artifacts)
 	llmCases := llmTimingFixtures(artifacts)
+	tpsCases := tpsFixtures(artifacts)
 	settings := json.RawMessage(`{"concurrency":"1","duration":"1","rampup":"0"}`)
 	fixture := conformance.Fixture{File: "labels.js", Settings: settings}
 	longLabels := conformance.Fixture{File: "long-labels.js", Settings: settings}
@@ -133,6 +134,14 @@ export default function(){
 			Reuse:             conformance.Fixture{File: "second.js", Settings: settings},
 			CompletionTimeout: 90 * time.Second,
 			AssertMetrics: func(t *testing.T, runtime *conformance.Runtime, run string) conformance.MetricsSnapshot {
+				for _, scenario := range tpsCases {
+					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
+						_, snapshot := compareCSVSnapshotSelection(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.LLMStreamedBytesMetric, llmTimingSelection{interval: true})
+						assertTPSCSV(t, runtime, true, false)
+						require.NotNil(t, snapshot.Requests["others"].Latency)
+						return snapshot
+					}
+				}
 				for _, scenario := range llmCases {
 					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
 						_, snapshot := compareCSVSnapshotSelection(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.DataReceivedMetric, llmTimingSelection{response: true, ttft: true})
@@ -162,11 +171,12 @@ export default function(){
 				RequestLabels: []string{boundaryURL, conformance.TargetURL + "/500", groupedPrefix}, ByteLabels: []string{"k6"}},
 			{Name: "byte-limit-zero", LabelLimit: 0, Fixture: longLabels, MinimumRequests: 14,
 				RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
-		}, append(byteCases, llmCases...)...),
+		}, append(append(byteCases, llmCases...), tpsCases...)...),
 		Scenarios: func(t *testing.T, runtime *conformance.Runtime) {
 			runK6Scenarios(t, runtime, requests, inflight, inflightEnded, firstSource)
 			runRequestByteScenarios(t, runtime)
 			runLLMTimingScenarios(t, runtime)
+			runTPSScenarios(t, runtime)
 			provisioning.assertUnused(t, runtime.Root)
 		},
 	})
@@ -506,6 +516,13 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 				require.True(t, valid)
 				durations[label] = append(durations[label], value)
 			}
+		case metrics.LLMInterChunkDurationMetric:
+			if timings.interval {
+				require.False(t, value < 0 || math.IsNaN(value) || math.IsInf(value, 0), "selected intervals must be valid")
+				label, valid := admit("tps")
+				require.True(t, valid)
+				durations[label] = append(durations[label], value)
+			}
 		case "http_req_duration":
 			url, valid := admit(row[columns["url"]])
 			require.NotEmpty(t, row[columns["url"]], "duration rows must retain their request URL")
@@ -537,7 +554,7 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 			expected.count++
 			expected.sum += value
 			expected.status[status]++
-		case metrics.DataReceivedMetric, metrics.RequestReceivedBytesMetric:
+		case metrics.DataReceivedMetric, metrics.RequestReceivedBytesMetric, metrics.LLMStreamedBytesMetric:
 			if row[columns["metric_name"]] != source {
 				continue
 			}
@@ -550,6 +567,10 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 				if !valid {
 					continue
 				}
+			} else if source == metrics.LLMStreamedBytesMetric {
+				var valid bool
+				label, valid = admit("tps")
+				require.True(t, valid)
 			} else if labelLimit == 0 {
 				label = "others"
 			}

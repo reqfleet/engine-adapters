@@ -34,26 +34,33 @@ const (
 	LLMResponseDurationMetric = "llm_response_duration"
 	// LLMTimeToFirstTokenMetric supplies opt-in first generated token timings.
 	LLMTimeToFirstTokenMetric = "llm_time_to_first_token"
+	// LLMStreamedBytesMetric supplies opt-in generated-payload byte deltas.
+	LLMStreamedBytesMetric = "llm_streamed_bytes"
+	// LLMInterChunkDurationMetric supplies opt-in intervals between payload chunks.
+	LLMInterChunkDurationMetric = "llm_inter_chunk_duration"
+
+	// The dashboard's historical TPS label represents bandwidth, not token counts.
+	llmTPSLabel = "tps"
 )
 
 // Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
 // No reader or goroutine survives Collect; callbacks share the same state lock.
 type Exporter struct {
-	mu                                           sync.Mutex
-	byteLabel                                    string
-	receivedBytesSource                          string
-	llmResponseSource, ttftSource                string
-	recorder                                     *agent.MetricsRecorder
-	runID, resultFile                            string
-	active                                       bool
-	offset                                       int64
-	observedSize                                 int64
-	fileInfo                                     os.FileInfo
-	columns                                      int
-	nameIndex, valueIndex, statusIndex, urlIndex int
-	errorCodeIndex                               int
-	ready                                        bool
-	failure                                      error
+	mu                                               sync.Mutex
+	byteLabel                                        string
+	receivedBytesSource                              string
+	llmResponseSource, ttftSource, tpsIntervalSource string
+	recorder                                         *agent.MetricsRecorder
+	runID, resultFile                                string
+	active                                           bool
+	offset                                           int64
+	observedSize                                     int64
+	fileInfo                                         os.FileInfo
+	columns                                          int
+	nameIndex, valueIndex, statusIndex, urlIndex     int
+	errorCodeIndex                                   int
+	ready                                            bool
+	failure                                          error
 }
 
 // New validates the per-run URL label budget and uses the SDK's collectors.
@@ -83,7 +90,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.runID, e.resultFile = run.RunID, run.ResultFile
 	e.active = true
 	e.receivedBytesSource = DataReceivedMetric
-	e.llmResponseSource, e.ttftSource = "", ""
+	e.llmResponseSource, e.ttftSource, e.tpsIntervalSource = "", "", ""
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
@@ -92,8 +99,8 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.recorder.Reset(run)
 }
 
-// ConfigureReceivedBytes selects the run's byte counter before launch. An empty
-// source retains k6's aggregate default; custom counters require URL attribution.
+// ConfigureReceivedBytes selects the run's only byte counter before launch.
+// Empty retains aggregate bytes; custom modes use URL or reserved TPS attribution.
 func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -103,7 +110,7 @@ func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) e
 	switch source {
 	case "":
 		e.receivedBytesSource = DataReceivedMetric
-	case RequestReceivedBytesMetric:
+	case RequestReceivedBytesMetric, LLMStreamedBytesMetric:
 		e.receivedBytesSource = source
 	default:
 		return fmt.Errorf("unsupported received bytes source %q", source)
@@ -113,7 +120,7 @@ func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) e
 
 // ConfigureLLMTimings selects independent timing sources before launch.
 // Empty selectors disable the corresponding measurement for this run.
-func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft string) error {
+func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft, interval string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.matchesRun(run) {
@@ -125,7 +132,10 @@ func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft stri
 	if ttft != "" && ttft != LLMTimeToFirstTokenMetric {
 		return fmt.Errorf("unsupported TTFT source %q", ttft)
 	}
-	e.llmResponseSource, e.ttftSource = response, ttft
+	if interval != "" && interval != LLMInterChunkDurationMetric {
+		return fmt.Errorf("unsupported TPS interval source %q", interval)
+	}
+	e.llmResponseSource, e.ttftSource, e.tpsIntervalSource = response, ttft, interval
 	return nil
 }
 
@@ -276,7 +286,7 @@ func (e *Exporter) header(record []string) error {
 func (e *Exporter) point(record []string) error {
 	name := record[e.nameIndex]
 	if name != "http_req_duration" && name != "vus" && name != e.receivedBytesSource &&
-		(name == "" || (name != e.llmResponseSource && name != e.ttftSource)) {
+		(name == "" || (name != e.llmResponseSource && name != e.ttftSource && name != e.tpsIntervalSource)) {
 		return nil
 	}
 	value, err := strconv.ParseFloat(record[e.valueIndex], 64)
@@ -323,6 +333,16 @@ func (e *Exporter) point(record []string) error {
 	case LLMTimeToFirstTokenMetric:
 		metric.Label, metric.Latency = metricschema.TTFTLabel, value
 		if err := e.recorder.ObserveLatency(metric); err != nil {
+			return err
+		}
+	case LLMInterChunkDurationMetric:
+		metric.Label, metric.Latency = llmTPSLabel, value
+		if err := e.recorder.ObserveLatency(metric); err != nil {
+			return err
+		}
+	case LLMStreamedBytesMetric:
+		metric.Label, metric.EgressBytes = llmTPSLabel, value
+		if err := e.recorder.AddReceivedBytes(metric); err != nil {
 			return err
 		}
 	case "vus":
