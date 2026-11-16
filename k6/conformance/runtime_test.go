@@ -136,8 +136,8 @@ export default function(){
 			AssertMetrics: func(t *testing.T, runtime *conformance.Runtime, run string) conformance.MetricsSnapshot {
 				for _, scenario := range tpsCases {
 					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
-						_, snapshot := compareCSVSnapshotSelection(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.LLMStreamedBytesMetric, llmTimingSelection{interval: true})
-						assertTPSCSV(t, runtime, true, false)
+						_, snapshot := compareCSVSnapshotSource(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.LLMStreamedBytesMetric)
+						assertTPSCSV(t, runtime, true)
 						require.NotNil(t, snapshot.Requests["others"].Latency)
 						return snapshot
 					}
@@ -513,13 +513,6 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 			}
 			if row[columns["metric_name"]] == llmTTFTSource && timings.ttft {
 				label, valid := admit(metricschema.TTFTLabel)
-				require.True(t, valid)
-				durations[label] = append(durations[label], value)
-			}
-		case metrics.LLMInterChunkDurationMetric:
-			if timings.interval {
-				require.False(t, value < 0 || math.IsNaN(value) || math.IsInf(value, 0), "selected intervals must be valid")
-				label, valid := admit("tps")
 				require.True(t, valid)
 				durations[label] = append(durations[label], value)
 			}

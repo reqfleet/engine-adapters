@@ -130,7 +130,6 @@ Built-in `data_received` samples lack request URL attribution. By default they r
 | `llm_response_duration` | Only when selected by `llmResponse`, observe milliseconds in `shibuya_latency_llm_resp_milliseconds` under `llm_resp` (or `others` after admission overflow) |
 | `llm_time_to_first_token` | Only when selected by `ttft`, observe milliseconds in the ordinary histogram under `ttft` (or `others` after admission overflow) |
 | `llm_streamed_bytes` | Only when selected by `receivedBytes`, add measured generated-payload byte deltas under `tps` (or `others`); replaces all other byte sources |
-| `llm_inter_chunk_duration` | Only when selected by `tpsInterval`, observe milliseconds between generated-payload chunks in the ordinary histogram under `tps` (or `others`) |
 | `http_reqs`, `data_sent`, other names | Ignore; no double counting and no synthetic request observations |
 
 #### Opt-in request-byte counter
@@ -235,33 +234,31 @@ Timing observations never increment status counters, add received bytes, or chan
 
 #### Opt-in TPS stream bandwidth
 
-The SDK's [shared LLM contract](https://github.com/reqfleet/engine-sdk/blob/main/agent/metrics.md#llm-streaming-metrics) defines historical `tps` as streamed payload bandwidth, not model tokens per second, for every engine. k6 implements that contract through the following fixed sources; it introduces no new normalized family or token counter.
+The SDK's [shared LLM contract](https://github.com/reqfleet/engine-sdk/blob/main/agent/metrics.md#llm-streaming-metrics) defines historical `tps` as streamed payload bandwidth, not model tokens per second, for every engine. k6 implements that contract through the following fixed byte source; it introduces no new normalized family or token counter.
 
-Select a streamed-payload Counter as the run's single byte source, and optionally an independent Trend for inter-chunk cadence:
+Select a streamed-payload Counter as the run's single byte source:
 
 ```js
-import { Counter, Trend } from 'k6/metrics';
+import { Counter } from 'k6/metrics';
 
 const streamedBytes = new Counter('llm_streamed_bytes');
-const interChunkDuration = new Trend('llm_inter_chunk_duration', true);
 export const options = {
   ext: {
     reqfleet: {
       receivedBytes: 'llm_streamed_bytes',
-      tpsInterval: 'llm_inter_chunk_duration',
     },
   },
 };
 ```
 
 - Add each measured generated-payload **byte delta** to `streamedBytes`. For k6 binary payloads, use the actual byte length; for text, measure the payload's encoding rather than JavaScript string length. Protocol parsing and content selection follow the shared contract.
-- Add each measured within-stream **inter-chunk interval in milliseconds** to `interChunkDuration`. The Trend's `true` timing flag does not convert units. Keep per-stream state in the plan and do not emit a first-chunk interval.
 - `receivedBytes: 'llm_streamed_bytes'` ignores both native `data_received` and `request_received_bytes` for the entire run, including before the first custom point. It cannot simultaneously select another byte source. Do not add the full response size again at completion. With no custom samples, bytes are unavailable: there is no aggregate fallback or fabricated zero.
-- `tpsInterval` independently accepts only `llm_inter_chunk_duration`; omission or `""` disables it. Other strings and non-string values, including `null`, fail preparation. Declaring sources alone does not opt in. Both selections are fixed by inspection before launch; reset restores default aggregate bytes and disables interval ingestion.
-- Neither source requires CSV `url`, `name` or `status` values; those tags cannot override `tps`. The exporter calls SDK `AddReceivedBytes` and `ObserveLatency`, sharing admission with the other request-labelled samples. SDK folding, histogram and label-collision rules apply unchanged.
+- Declaring the Counter alone does not opt in. The `receivedBytes` selection is fixed by inspection before launch; reset restores default aggregate bytes.
+- This source requires no CSV `url`, `name` or `status` values; those tags cannot override `tps`. The exporter calls SDK `AddReceivedBytes`, sharing admission with the other request-labelled samples. SDK folding and label-collision rules apply unchanged.
 - Selected values must be finite and nonnegative; measured zero is valid. Invalid selected values fail ingestion; unselected points are ignored. SDK rules govern partial measurements, independent outcomes, cumulative retention, final drain and coordinated reset.
+- Streamed-byte points never create latency, status or concurrency observations. Bandwidth is the rate of `shibuya_egress_bytes_counter{label="tps"}`; a chart querying request-status counts cannot display this byte-only measurement.
 
-Instrument actual streaming callbacks using a supported client, such as stock k6 WebSocket callbacks. These selectors do not install an SSE extension or enable automatic extension resolution.
+Instrument actual streaming callbacks using a supported client, such as stock k6 WebSocket callbacks. This selector does not install an SSE extension or enable automatic extension resolution.
 
 #### Transport failures
 
@@ -317,6 +314,4 @@ Pinned-engine regressions use a controlled local build-service peer inside the n
 
 The container target first runs shared runtime regressions with a small SDK-based workload, covering completion before the first progress poll, reaping exited orphans while the adapter remains active, and cleanup of descendants in separate process groups/sessions. It then runs the real k6 suite. The shared validator's unit tests cover retained-series uniqueness, histogram invariants, request-label byte limits and optional LLM response histograms. k6 LLM scenarios compare custom timing CSV observations with both normalized histogram profiles, including overflow, zero budget, independent HTTP counts, optional selection, final drain and reused-run reset.
 
-TPS conformance uses stock k6 WebSocket callbacks against a controlled local stream, including UTF-8 generated payload, protocol-only messages, interrupted generations and a teardown stream. It compares measured CSV byte deltas and arrival intervals with normalized metrics, verifies that first chunks contribute bytes but no synthetic interval, and excludes completion summaries and competing byte sources. Additional scenarios cover optional selection, unavailable measurements, invalid configuration/samples, ordinary histogram boundaries, overflow/zero budgets, retained final metrics and reset to aggregate bytes.
-
-The streaming fixture sends its first two payload chunks back-to-back. Cadence checks accept measured zero intervals because buffered client callbacks need not preserve server-side send spacing.
+TPS conformance uses stock k6 WebSocket callbacks against a controlled local stream, including UTF-8 generated payload, protocol-only messages, interrupted generations and a teardown stream. It compares measured CSV byte deltas with normalized metrics, verifies that first chunks contribute bytes without synthetic latency or status measurements, and excludes completion summaries and competing byte sources. Additional scenarios cover source selection, unavailable measurements, invalid samples, overflow/zero budgets, retained final metrics and reset to aggregate bytes.
