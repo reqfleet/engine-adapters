@@ -2,8 +2,8 @@
 //
 // Collection reads the result file written by k6's --out csv option. CSV rows
 // are independent samples, not complete request events. The exporter updates
-// the SDK MetricsRecorder through separate request, byte, and concurrency methods,
-// without fabricating requests for VU or byte samples. The SDK invokes Collect
+// the SDK MetricsRecorder through separate request, token, byte, and concurrency
+// methods, without fabricating requests for independent samples. The SDK invokes Collect
 // during the run and once after process exit to drain final output.
 // The SDK owns metric definitions, resource sampling, exposition and authentication.
 // See ../README.md for the CSV format and sample mapping.
@@ -34,26 +34,33 @@ const (
 	LLMResponseDurationMetric = "llm_response_duration"
 	// LLMTimeToFirstTokenMetric supplies opt-in first generated token timings.
 	LLMTimeToFirstTokenMetric = "llm_time_to_first_token"
+	// LLMTokenEventsMetric supplies one point per received generated token.
+	LLMTokenEventsMetric = "llm_token_events"
+	// LLMInterTokenDurationMetric supplies gaps from the second generated token onward.
+	LLMInterTokenDurationMetric = "llm_inter_token_duration"
+
+	// TPS counts received tokens under the shared contract's lowercase label.
+	llmTPSLabel = "tps"
 )
 
 // Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
 // No reader or goroutine survives Collect; callbacks share the same state lock.
 type Exporter struct {
-	mu                                           sync.Mutex
-	byteLabel                                    string
-	receivedBytesSource                          string
-	llmResponseSource, ttftSource                string
-	recorder                                     *agent.MetricsRecorder
-	runID, resultFile                            string
-	active                                       bool
-	offset                                       int64
-	observedSize                                 int64
-	fileInfo                                     os.FileInfo
-	columns                                      int
-	nameIndex, valueIndex, statusIndex, urlIndex int
-	errorCodeIndex                               int
-	ready                                        bool
-	failure                                      error
+	mu                                                         sync.Mutex
+	byteLabel                                                  string
+	receivedBytesSource                                        string
+	llmResponseSource, ttftSource, tpsSource, interTokenSource string
+	recorder                                                   *agent.MetricsRecorder
+	runID, resultFile                                          string
+	active                                                     bool
+	offset                                                     int64
+	observedSize                                               int64
+	fileInfo                                                   os.FileInfo
+	columns                                                    int
+	nameIndex, valueIndex, statusIndex, urlIndex               int
+	errorCodeIndex                                             int
+	ready                                                      bool
+	failure                                                    error
 }
 
 // New validates the per-run URL label budget and uses the SDK's collectors.
@@ -83,7 +90,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.runID, e.resultFile = run.RunID, run.ResultFile
 	e.active = true
 	e.receivedBytesSource = DataReceivedMetric
-	e.llmResponseSource, e.ttftSource = "", ""
+	e.llmResponseSource, e.ttftSource, e.tpsSource, e.interTokenSource = "", "", "", ""
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
@@ -92,8 +99,8 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.recorder.Reset(run)
 }
 
-// ConfigureReceivedBytes selects the run's byte counter before launch. An empty
-// source retains k6's aggregate default; custom counters require URL attribution.
+// ConfigureReceivedBytes selects the run's only byte counter before launch.
+// Empty retains aggregate bytes; the custom source uses explicit URL attribution.
 func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -111,9 +118,24 @@ func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) e
 	return nil
 }
 
+// ConfigureTPS selects independent received-token observations before launch.
+// Empty disables TPS; each selected point must represent exactly one token.
+func (e *Exporter) ConfigureTPS(run agent.RunContext, source string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.matchesRun(run) {
+		return errors.New("TPS configuration does not match the active run")
+	}
+	if source != "" && source != LLMTokenEventsMetric {
+		return fmt.Errorf("unsupported TPS source %q", source)
+	}
+	e.tpsSource = source
+	return nil
+}
+
 // ConfigureLLMTimings selects independent timing sources before launch.
 // Empty selectors disable the corresponding measurement for this run.
-func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft string) error {
+func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft, interToken string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.matchesRun(run) {
@@ -125,7 +147,10 @@ func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft stri
 	if ttft != "" && ttft != LLMTimeToFirstTokenMetric {
 		return fmt.Errorf("unsupported TTFT source %q", ttft)
 	}
-	e.llmResponseSource, e.ttftSource = response, ttft
+	if interToken != "" && interToken != LLMInterTokenDurationMetric {
+		return fmt.Errorf("unsupported inter-token source %q", interToken)
+	}
+	e.llmResponseSource, e.ttftSource, e.interTokenSource = response, ttft, interToken
 	return nil
 }
 
@@ -276,7 +301,7 @@ func (e *Exporter) header(record []string) error {
 func (e *Exporter) point(record []string) error {
 	name := record[e.nameIndex]
 	if name != "http_req_duration" && name != "vus" && name != e.receivedBytesSource &&
-		(name == "" || (name != e.llmResponseSource && name != e.ttftSource)) {
+		(name == "" || (name != e.llmResponseSource && name != e.ttftSource && name != e.tpsSource && name != e.interTokenSource)) {
 		return nil
 	}
 	value, err := strconv.ParseFloat(record[e.valueIndex], 64)
@@ -323,6 +348,20 @@ func (e *Exporter) point(record []string) error {
 	case LLMTimeToFirstTokenMetric:
 		metric.Label, metric.Latency = metricschema.TTFTLabel, value
 		if err := e.recorder.ObserveLatency(metric); err != nil {
+			return err
+		}
+	case LLMInterTokenDurationMetric:
+		metric.Label, metric.Latency = llmTPSLabel, value
+		if err := e.recorder.ObserveLatency(metric); err != nil {
+			return err
+		}
+	case LLMTokenEventsMetric:
+		if value != 1 {
+			return fmt.Errorf("invalid %s sample %q: expected exactly one received token", name, record[e.valueIndex])
+		}
+		// 200 classifies a successful token receipt, not a per-token HTTP response.
+		metric.Label, metric.Status = llmTPSLabel, "200"
+		if err := e.recorder.RecordStatus(metric); err != nil {
 			return err
 		}
 	case "vus":
