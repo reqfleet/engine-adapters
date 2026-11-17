@@ -13,6 +13,9 @@ const ttft = new Trend('llm_time_to_first_token', true);
 const tokens = new Counter('llm_token_events');
 const interTokenDuration = new Trend('llm_inter_token_duration', true);
 const responseDuration = new Trend('llm_response_duration', true);
+const receivedBytes = new Counter('request_received_bytes');
+const receivedByteTags = { url };
+const utf8 = new TextEncoder();
 
 export const options = {
   ext: {
@@ -21,6 +24,7 @@ export const options = {
       tps: 'llm_token_events',
       interToken: 'llm_inter_token_duration',
       llmResponse: 'llm_response_duration',
+      receivedBytes: 'request_received_bytes',
     },
   },
   thresholds: { checks: ['rate==1'] },
@@ -53,6 +57,12 @@ export default function () {
   };
 
   socket.onmessage = (event) => {
+    const now = exec.instance.currentTestRunDuration;
+    // Count all received text payloads, including non-token/control messages.
+    // This excludes WebSocket/TLS overhead and replaces native data_received.
+    if (typeof event.data === 'string') {
+      receivedBytes.add(utf8.encode(event.data).byteLength, receivedByteTags);
+    }
     if (failure) return;
     try {
       if (!isToken(event.data)) return;
@@ -62,7 +72,6 @@ export default function () {
       return;
     }
 
-    const now = exec.instance.currentTestRunDuration;
     if (received === 0) ttft.add(now - started);
     else interTokenDuration.add(now - previousTokenTime);
     previousTokenTime = now;
