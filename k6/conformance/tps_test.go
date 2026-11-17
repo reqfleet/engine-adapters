@@ -19,6 +19,7 @@ import (
 
 	"github.com/reqfleet/engine-adapters/k6/metrics"
 	"github.com/reqfleet/engine-sdk/conformance"
+	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -239,11 +240,11 @@ func assertTPSCSV(t *testing.T, runtime *conformance.Runtime, emit bool) {
 	for _, row := range rows[1:] {
 		name := row[columns["metric_name"]]
 		switch name {
-		case metrics.LLMTokenEventsMetric, metrics.LLMInterTokenDurationMetric, llmTTFTSource, metrics.RequestReceivedBytesMetric, metrics.DataReceivedMetric:
+		case metricschema.LLMTokenEventsMetric, metricschema.LLMInterTokenDurationMetric, metricschema.LLMTimeToFirstTokenMetric, metrics.RequestReceivedBytesMetric, metrics.DataReceivedMetric:
 			value, err := strconv.ParseFloat(row[columns["metric_value"]], 64)
 			require.NoError(t, err)
 			values[name] = append(values[name], value)
-			if name == metrics.LLMTokenEventsMetric {
+			if name == metricschema.LLMTokenEventsMetric {
 				urls[row[columns["url"]]] = true
 			}
 		}
@@ -251,9 +252,9 @@ func assertTPSCSV(t *testing.T, runtime *conformance.Runtime, emit bool) {
 	require.NotEmpty(t, values[metrics.DataReceivedMetric], "independent native wire traffic must actually exist")
 	require.Equal(t, []float64{9876}, values[metrics.RequestReceivedBytesMetric], "the competing URL-attributed byte source exists too")
 	if !emit {
-		require.Empty(t, values[metrics.LLMTokenEventsMetric])
-		require.Empty(t, values[metrics.LLMInterTokenDurationMetric])
-		require.Empty(t, values[llmTTFTSource])
+		require.Empty(t, values[metricschema.LLMTokenEventsMetric])
+		require.Empty(t, values[metricschema.LLMInterTokenDurationMetric])
+		require.Empty(t, values[metricschema.LLMTimeToFirstTokenMetric])
 		return
 	}
 	want := []float64{}
@@ -263,10 +264,10 @@ func assertTPSCSV(t *testing.T, runtime *conformance.Runtime, emit bool) {
 			want = append(want, 1)
 		}
 	}
-	require.Equal(t, want, values[metrics.LLMTokenEventsMetric], "include every first token, exclude envelopes, empty content, controls and completion totals")
-	require.Len(t, values[metrics.LLMInterTokenDurationMetric], 5, "three streams contribute 2+1+2 gaps, never first-token or control intervals")
-	require.Len(t, values[llmTTFTSource], 3, "each stream resets its previous-token timestamp, including interrupted generation and teardown")
-	for _, gap := range values[metrics.LLMInterTokenDurationMetric] {
+	require.Equal(t, want, values[metricschema.LLMTokenEventsMetric], "include every first token, exclude envelopes, empty content, controls and completion totals")
+	require.Len(t, values[metricschema.LLMInterTokenDurationMetric], 5, "three streams contribute 2+1+2 gaps, never first-token or control intervals")
+	require.Len(t, values[metricschema.LLMTimeToFirstTokenMetric], 3, "each stream resets its previous-token timestamp, including interrupted generation and teardown")
+	for _, gap := range values[metricschema.LLMInterTokenDurationMetric] {
 		require.GreaterOrEqual(t, gap, float64(0), "source milliseconds may legitimately be zero")
 	}
 	require.Equal(t, map[string]bool{"": true, "not-tps": true}, urls, "both absent and misleading tags must map to reserved tps")
@@ -341,7 +342,7 @@ func runTPSScenarios(t *testing.T, runtime *conformance.Runtime) {
 	for selectedIndex, selected := range []bool{true, false} {
 		for index, invalid := range []float64{-1, 0, 2, 0.5} {
 			t.Run(fmt.Sprintf("tps-invalid/%t/%d", selected, index), func(t *testing.T) {
-				source := metrics.LLMTokenEventsMetric
+				source := metricschema.LLMTokenEventsMetric
 				id := strconv.Itoa(1850 + selectedIndex*10 + index)
 				file := fmt.Sprintf("tps-invalid-%t-%d.js", selected, index)
 				runtime.Start(t, id, conformance.Fixture{File: file, Settings: settings})
@@ -399,7 +400,7 @@ func runTPSScenarios(t *testing.T, runtime *conformance.Runtime) {
 			runtime.Start(t, id, conformance.Fixture{File: fmt.Sprintf("tps-gap-invalid-%t.js", selected), Settings: settings})
 			if selected {
 				status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
-				require.Contains(t, status.ErrorMessage, "invalid "+metrics.LLMInterTokenDurationMetric+" sample")
+				require.Contains(t, status.ErrorMessage, "invalid "+metricschema.LLMInterTokenDurationMetric+" sample")
 				return
 			}
 			runtime.Running(t, id)
@@ -411,7 +412,7 @@ func runTPSScenarios(t *testing.T, runtime *conformance.Runtime) {
 			require.NotContains(t, snapshot.Requests, "tps")
 			output, err := os.ReadFile(csvPath)
 			require.NoError(t, err)
-			require.Contains(t, string(output), metrics.LLMInterTokenDurationMetric, "unselected invalid source must actually be emitted")
+			require.Contains(t, string(output), metricschema.LLMInterTokenDurationMetric, "unselected invalid source must actually be emitted")
 		})
 	}
 	for index := range 2 {

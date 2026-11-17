@@ -289,7 +289,7 @@ func TestConfigureReceivedBytesRejectsUnknownAndUnpreparedRuns(t *testing.T) {
 	exporter, err := New(1, agent.NewMetricsRegistry())
 	require.NoError(t, err)
 	require.ErrorContains(t, exporter.ConfigureReceivedBytes(agent.RunContext{}, ""), "active run")
-	for _, source := range []string{DataReceivedMetric, strings.ToUpper(DataReceivedMetric), " " + RequestReceivedBytesMetric, "custom_counter", "llm_streamed_bytes", LLMTokenEventsMetric} {
+	for _, source := range []string{DataReceivedMetric, strings.ToUpper(DataReceivedMetric), " " + RequestReceivedBytesMetric, "custom_counter", "llm_streamed_bytes", metricschema.LLMTokenEventsMetric} {
 		t.Run(source, func(t *testing.T) {
 			e, run := fixture(t, 1)
 			require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
