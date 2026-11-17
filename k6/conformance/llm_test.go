@@ -23,10 +23,8 @@ import (
 )
 
 const (
-	llmResponseSource = "llm_response_duration"
-	llmTTFTSource     = "llm_time_to_first_token"
-	llmFinalResponse  = 23456.75
-	llmFinalTTFT      = 12.25
+	llmFinalResponse = 23456.75
+	llmFinalTTFT     = 12.25
 )
 
 type llmTimingSelection struct {
@@ -106,7 +104,7 @@ export function teardown(){
   // These observations are emitted only after Stop, testing final draining.
   if(%t){responseDuration.add(%g);firstToken.add(%g);}
 }
-`, selectors, llmResponseSource, llmTTFTSource, conformance.TargetURL,
+`, selectors, metricschema.LLMResponseDurationMetric, metricschema.LLMTimeToFirstTokenMetric, conformance.TargetURL,
 		emit, responseValues, ttftValues, conformance.TargetURL, emit,
 		conformance.TargetURL, emit, conformance.TargetURL, conformance.TargetURL,
 		emit, llmFinalResponse, llmFinalTTFT)
@@ -158,7 +156,7 @@ func assertLLMTimingCSV(t *testing.T, runtime *conformance.Runtime, emit bool) {
 		}
 		require.NoError(t, err)
 		name := row[columns["metric_name"]]
-		if name != llmResponseSource && name != llmTTFTSource {
+		if name != metricschema.LLMResponseDurationMetric && name != metricschema.LLMTimeToFirstTokenMetric {
 			continue
 		}
 		require.Empty(t, row[columns["url"]], "custom timings deliberately carry no HTTP URL")
@@ -175,8 +173,8 @@ func assertLLMTimingCSV(t *testing.T, runtime *conformance.Runtime, emit bool) {
 		bounds []float64
 		final  float64
 	}{
-		{llmResponseSource, metricschema.LLMResponseLatencyBuckets(), llmFinalResponse},
-		{llmTTFTSource, metricschema.RequestLatencyBuckets(), llmFinalTTFT},
+		{metricschema.LLMResponseDurationMetric, metricschema.LLMResponseLatencyBuckets(), llmFinalResponse},
+		{metricschema.LLMTimeToFirstTokenMetric, metricschema.RequestLatencyBuckets(), llmFinalTTFT},
 	} {
 		boundary := llmBoundaryValues(timing.bounds)
 		samples := values[timing.name]

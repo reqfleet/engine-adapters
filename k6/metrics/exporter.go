@@ -30,14 +30,6 @@ const (
 	DataReceivedMetric = "data_received"
 	// RequestReceivedBytesMetric is the opt-in URL-attributed byte counter.
 	RequestReceivedBytesMetric = "request_received_bytes"
-	// LLMResponseDurationMetric supplies opt-in complete LLM response timings.
-	LLMResponseDurationMetric = "llm_response_duration"
-	// LLMTimeToFirstTokenMetric supplies opt-in first generated token timings.
-	LLMTimeToFirstTokenMetric = "llm_time_to_first_token"
-	// LLMTokenEventsMetric supplies one point per received generated token.
-	LLMTokenEventsMetric = "llm_token_events"
-	// LLMInterTokenDurationMetric supplies gaps from the second generated token onward.
-	LLMInterTokenDurationMetric = "llm_inter_token_duration"
 )
 
 // Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
@@ -123,7 +115,7 @@ func (e *Exporter) ConfigureTPS(run agent.RunContext, source string) error {
 	if !e.matchesRun(run) {
 		return errors.New("TPS configuration does not match the active run")
 	}
-	if source != "" && source != LLMTokenEventsMetric {
+	if source != "" && source != metricschema.LLMTokenEventsMetric {
 		return fmt.Errorf("unsupported TPS source %q", source)
 	}
 	e.tpsSource = source
@@ -138,13 +130,13 @@ func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft, int
 	if !e.matchesRun(run) {
 		return errors.New("LLM timing configuration does not match the active run")
 	}
-	if response != "" && response != LLMResponseDurationMetric {
+	if response != "" && response != metricschema.LLMResponseDurationMetric {
 		return fmt.Errorf("unsupported LLM response source %q", response)
 	}
-	if ttft != "" && ttft != LLMTimeToFirstTokenMetric {
+	if ttft != "" && ttft != metricschema.LLMTimeToFirstTokenMetric {
 		return fmt.Errorf("unsupported TTFT source %q", ttft)
 	}
-	if interToken != "" && interToken != LLMInterTokenDurationMetric {
+	if interToken != "" && interToken != metricschema.LLMInterTokenDurationMetric {
 		return fmt.Errorf("unsupported inter-token source %q", interToken)
 	}
 	e.llmResponseSource, e.ttftSource, e.interTokenSource = response, ttft, interToken
@@ -338,19 +330,19 @@ func (e *Exporter) point(record []string) error {
 			// admitting its name, marking readiness, or failing the run.
 			return nil
 		}
-	case LLMResponseDurationMetric:
+	case metricschema.LLMResponseDurationMetric:
 		if err := e.recorder.ObserveLLMResponse(value); err != nil {
 			return err
 		}
-	case LLMTimeToFirstTokenMetric:
+	case metricschema.LLMTimeToFirstTokenMetric:
 		if err := e.recorder.ObserveTTFT(value); err != nil {
 			return err
 		}
-	case LLMInterTokenDurationMetric:
+	case metricschema.LLMInterTokenDurationMetric:
 		if err := e.recorder.ObserveInterTokenLatency(value); err != nil {
 			return err
 		}
-	case LLMTokenEventsMetric:
+	case metricschema.LLMTokenEventsMetric:
 		if value != 1 {
 			return fmt.Errorf("invalid %s sample %q: expected exactly one received token", name, record[e.valueIndex])
 		}

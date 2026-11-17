@@ -506,7 +506,7 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 		value, e := strconv.ParseFloat(row[columns["metric_value"]], 64)
 		require.NoError(t, e)
 		switch row[columns["metric_name"]] {
-		case metrics.LLMTokenEventsMetric:
+		case metricschema.LLMTokenEventsMetric:
 			if !timings.tps {
 				continue
 			}
@@ -520,20 +520,20 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 			// per-token HTTP response. Generation errors add no token points.
 			expected.requests[label].status["200"]++
 			tokenCounts[label]++
-		case metrics.LLMInterTokenDurationMetric:
+		case metricschema.LLMInterTokenDurationMetric:
 			if timings.interToken {
 				require.False(t, value < 0 || math.IsNaN(value) || math.IsInf(value, 0), "selected inter-token samples must be valid")
 				label, valid := admit("tps")
 				require.True(t, valid)
 				durations[label] = append(durations[label], value)
 			}
-		case llmResponseSource, llmTTFTSource:
-			if row[columns["metric_name"]] == llmResponseSource && timings.response {
+		case metricschema.LLMResponseDurationMetric, metricschema.LLMTimeToFirstTokenMetric:
+			if row[columns["metric_name"]] == metricschema.LLMResponseDurationMetric && timings.response {
 				label, valid := admit(metricschema.LLMResponseLabel)
 				require.True(t, valid)
 				responseDurations[label] = append(responseDurations[label], value)
 			}
-			if row[columns["metric_name"]] == llmTTFTSource && timings.ttft {
+			if row[columns["metric_name"]] == metricschema.LLMTimeToFirstTokenMetric && timings.ttft {
 				label, valid := admit(metricschema.TTFTLabel)
 				require.True(t, valid)
 				durations[label] = append(durations[label], value)

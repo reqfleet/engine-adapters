@@ -33,8 +33,8 @@ func assertStatusSamples(t *testing.T, all map[string]*dto.MetricFamily, want ma
 
 func TestTPSTokenPointsAndRetention(t *testing.T) {
 	e, run := fixture(t, 10)
-	require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
-	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
+	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
+	require.NoError(t, e.ConfigureLLMTimings(run, metricschema.LLMResponseDurationMetric, metricschema.LLMTimeToFirstTokenMetric, ""))
 	putCSV(t, run, "name,url,status,metric_value,metric_name\n")
 	require.Empty(t, collectAndGather(t, e))
 	state, err := e.Observe(context.Background(), run)
@@ -42,7 +42,7 @@ func TestTPSTokenPointsAndRetention(t *testing.T) {
 	require.Equal(t, protocol.ObservationPending, state)
 
 	// The first received token counts, without waiting for a second or completion.
-	appendCSV(t, run, "unrelated,,,1,"+LLMTokenEventsMetric+"\n")
+	appendCSV(t, run, "unrelated,,,1,"+metricschema.LLMTokenEventsMetric+"\n")
 	all := collectAndGather(t, e)
 	assertStatusSamples(t, all, map[string]map[string]float64{"tps": {"200": 1}})
 	require.Len(t, all, 1, "tokens create only status counts")
@@ -51,15 +51,15 @@ func TestTPSTokenPointsAndRetention(t *testing.T) {
 	require.Equal(t, protocol.ObservationReady, state)
 
 	// CSV name, URL and status tags cannot replace the reserved classification.
-	appendCSV(t, run, "unrelated,"+strings.Repeat("界", 1024)+",not-http,1,"+LLMTokenEventsMetric+"\n"+
-		"unrelated,other,500,1,"+LLMTokenEventsMetric+"\n")
+	appendCSV(t, run, "unrelated,"+strings.Repeat("界", 1024)+",not-http,1,"+metricschema.LLMTokenEventsMetric+"\n"+
+		"unrelated,other,500,1,"+metricschema.LLMTokenEventsMetric+"\n")
 	all = collectAndGather(t, e)
 	assertStatusSamples(t, all, map[string]map[string]float64{"tps": {"200": 3}})
 	require.Len(t, all, 1)
 
 	appendCSV(t, run, "http,http,200,4,http_req_duration\nhttp,http,500,6,http_req_duration\n"+
 		"vus,,,3,vus\nbytes,,,999,data_received\n"+
-		"response,,,15000,"+LLMResponseDurationMetric+"\nfirst,,,5,"+LLMTimeToFirstTokenMetric+"\n")
+		"response,,,15000,"+metricschema.LLMResponseDurationMetric+"\nfirst,,,5,"+metricschema.LLMTimeToFirstTokenMetric+"\n")
 	all = collectAndGather(t, e)
 	assertStatusSamples(t, all, map[string]map[string]float64{"tps": {"200": 3}, "http": {"200": 1, "500": 1}})
 	assertReceivedBytes(t, all, map[string]float64{"k6": 999})
@@ -71,7 +71,7 @@ func TestTPSTokenPointsAndRetention(t *testing.T) {
 	}
 
 	// Final draining commits a partial token row once, with no completion count.
-	appendCSV(t, run, "final,,,1,"+LLMTokenEventsMetric)
+	appendCSV(t, run, "final,,,1,"+metricschema.LLMTokenEventsMetric)
 	require.Equal(t, all, collectAndGather(t, e))
 	appendCSV(t, run, "\n")
 	require.NoError(t, e.Collect(context.Background(), run))
@@ -88,8 +88,8 @@ func TestTPSSharedAdmission(t *testing.T) {
 		for _, tokensFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%d/tokens-first=%t", budget, tokensFirst), func(t *testing.T) {
 				e, run := fixture(t, budget)
-				require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
-				token := LLMTokenEventsMetric + ",1,,\n"
+				require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
+				token := metricschema.LLMTokenEventsMetric + ",1,,\n"
 				http := "http_req_duration,4,200,http\n"
 				rows := http + token
 				if tokensFirst {
@@ -124,18 +124,18 @@ func TestTPSSharedAdmission(t *testing.T) {
 }
 
 func TestTPSAdmissionIsSharedWithRequestBytesAndTimings(t *testing.T) {
-	for _, source := range []string{RequestReceivedBytesMetric, LLMTimeToFirstTokenMetric, LLMResponseDurationMetric} {
+	for _, source := range []string{RequestReceivedBytesMetric, metricschema.LLMTimeToFirstTokenMetric, metricschema.LLMResponseDurationMetric} {
 		for _, tokensFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/tokens-first=%t", source, tokensFirst), func(t *testing.T) {
 				e, run := fixture(t, 1)
-				require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
+				require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
 				require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
-				require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
-				token := LLMTokenEventsMetric + ",1,,\n"
+				require.NoError(t, e.ConfigureLLMTimings(run, metricschema.LLMResponseDurationMetric, metricschema.LLMTimeToFirstTokenMetric, ""))
+				token := metricschema.LLMTokenEventsMetric + ",1,,\n"
 				other := source + ",7,,request\n"
 				rows := other + token
 				tpsLabel := "others"
-				otherLabel := map[string]string{RequestReceivedBytesMetric: "request", LLMTimeToFirstTokenMetric: "ttft", LLMResponseDurationMetric: "llm_resp"}[source]
+				otherLabel := map[string]string{RequestReceivedBytesMetric: "request", metricschema.LLMTimeToFirstTokenMetric: "ttft", metricschema.LLMResponseDurationMetric: "llm_resp"}[source]
 				if tokensFirst {
 					rows = token + other
 					tpsLabel, otherLabel = "tps", "others"
@@ -146,9 +146,9 @@ func TestTPSAdmissionIsSharedWithRequestBytesAndTimings(t *testing.T) {
 				switch source {
 				case RequestReceivedBytesMetric:
 					assertReceivedBytes(t, all, map[string]float64{otherLabel: 7})
-				case LLMTimeToFirstTokenMetric:
+				case metricschema.LLMTimeToFirstTokenMetric:
 					assertTimingSamples(t, all, metricschema.RequestLatency, map[string][]float64{otherLabel: {7}})
-				case LLMResponseDurationMetric:
+				case metricschema.LLMResponseDurationMetric:
 					assertTimingSamples(t, all, metricschema.LLMResponseLatency, map[string][]float64{otherLabel: {7}})
 				}
 				require.Len(t, all, 2)
@@ -161,7 +161,7 @@ func TestTPSIndependentByteSelectionAndMissingObservations(t *testing.T) {
 	for _, source := range []string{"", RequestReceivedBytesMetric} {
 		t.Run(source, func(t *testing.T) {
 			e, run := fixture(t, 10)
-			require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
+			require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
 			require.NoError(t, e.ConfigureReceivedBytes(run, source))
 			// Neither missing token points nor unrelated totals imply a zero or fallback TPS.
 			putCSV(t, run, csvHeader+"llm_streamed_bytes,999,,\nhttp_reqs,1,,\n"+
@@ -178,7 +178,7 @@ func TestTPSIndependentByteSelectionAndMissingObservations(t *testing.T) {
 			}
 			assertReceivedBytes(t, all, want)
 			assertStatusSamples(t, all, nil)
-			appendCSV(t, run, RequestReceivedBytesMetric+",7,,request\n"+LLMTokenEventsMetric+",1,,\n")
+			appendCSV(t, run, RequestReceivedBytesMetric+",7,,request\n"+metricschema.LLMTokenEventsMetric+",1,,\n")
 			if source != "" {
 				want["request"] = 7
 			}
@@ -189,7 +189,7 @@ func TestTPSIndependentByteSelectionAndMissingObservations(t *testing.T) {
 			if source != "" {
 				unselected = DataReceivedMetric
 			}
-			appendCSV(t, run, unselected+",NaN,,\n"+LLMTokenEventsMetric+",1,,\n")
+			appendCSV(t, run, unselected+",NaN,,\n"+metricschema.LLMTokenEventsMetric+",1,,\n")
 			all = collectAndGather(t, e)
 			assertReceivedBytes(t, all, want)
 			assertStatusSamples(t, all, map[string]map[string]float64{"tps": {"200": 2}})
@@ -204,12 +204,12 @@ func TestTPSRejectsInvalidAndNonUnitSelectedPoints(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/selected=%t", value, selected), func(t *testing.T) {
 				e, run := fixture(t, 0)
 				if selected {
-					require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
+					require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
 				}
-				putCSV(t, run, csvHeader+LLMTokenEventsMetric+","+value+",,\n")
+				putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+","+value+",,\n")
 				if selected {
 					err := e.Collect(context.Background(), run)
-					require.ErrorContains(t, err, "invalid "+LLMTokenEventsMetric+" sample")
+					require.ErrorContains(t, err, "invalid "+metricschema.LLMTokenEventsMetric+" sample")
 					require.Equal(t, err, e.Collect(context.Background(), run), "invalid points remain a collection failure")
 					state, observeErr := e.Observe(context.Background(), run)
 					require.Equal(t, err, observeErr)
@@ -229,29 +229,29 @@ func TestTPSRejectsInvalidAndNonUnitSelectedPoints(t *testing.T) {
 func TestTPSConfigurationAndDisable(t *testing.T) {
 	exporter, err := New(1, agent.NewMetricsRegistry())
 	require.NoError(t, err)
-	require.ErrorContains(t, exporter.ConfigureTPS(agent.RunContext{}, LLMTokenEventsMetric), "active run")
+	require.ErrorContains(t, exporter.ConfigureTPS(agent.RunContext{}, metricschema.LLMTokenEventsMetric), "active run")
 	e, run := fixture(t, 1)
-	require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
-	for _, source := range []string{"tps", "llm_streamed_bytes", DataReceivedMetric, " " + LLMTokenEventsMetric, strings.ToUpper(LLMTokenEventsMetric)} {
+	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
+	for _, source := range []string{"tps", "llm_streamed_bytes", DataReceivedMetric, " " + metricschema.LLMTokenEventsMetric, strings.ToUpper(metricschema.LLMTokenEventsMetric)} {
 		require.ErrorContains(t, e.ConfigureTPS(run, source), "unsupported TPS source")
 	}
 	require.ErrorContains(t, e.ConfigureTPS(agent.RunContext{RunID: "stale"}, ""), "active run")
-	putCSV(t, run, csvHeader+LLMTokenEventsMetric+",1,,\n")
+	putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+",1,,\n")
 	assertStatusSamples(t, collectAndGather(t, e), map[string]map[string]float64{"tps": {"200": 1}})
 	e.Reset(run)
-	require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
+	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
 	require.NoError(t, e.ConfigureTPS(run, ""))
-	putCSV(t, run, csvHeader+LLMTokenEventsMetric+",1,,\n"+LLMTokenEventsMetric+",NaN,,\n")
+	putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+",1,,\n"+metricschema.LLMTokenEventsMetric+",NaN,,\n")
 	require.Empty(t, collectAndGather(t, e))
 }
 
 func TestTPSResetClearsSelectionIdentityAndAdmission(t *testing.T) {
 	e, run := fixture(t, 3)
-	require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
+	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
 	require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
-	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
-	putCSV(t, run, csvHeader+LLMTokenEventsMetric+",1,,\n"+
-		LLMResponseDurationMetric+",15000,,\n"+LLMTimeToFirstTokenMetric+",3,,\n")
+	require.NoError(t, e.ConfigureLLMTimings(run, metricschema.LLMResponseDurationMetric, metricschema.LLMTimeToFirstTokenMetric, ""))
+	putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+",1,,\n"+
+		metricschema.LLMResponseDurationMetric+",15000,,\n"+metricschema.LLMTimeToFirstTokenMetric+",3,,\n")
 	all := collectAndGather(t, e)
 	assertStatusSamples(t, all, map[string]map[string]float64{"tps": {"200": 1}})
 	assertTimingSamples(t, all, metricschema.RequestLatency, map[string][]float64{"ttft": {3}})
@@ -260,12 +260,12 @@ func TestTPSResetClearsSelectionIdentityAndAdmission(t *testing.T) {
 	run.RunID, run.CollectionID, run.PlanID, run.AgentID, run.Zone = "next", "next-collection", "next-plan", "next-agent", "next-zone"
 	e.Reset(run)
 	require.Empty(t, scrape(e).Body.String())
-	require.Error(t, e.ConfigureTPS(previous, LLMTokenEventsMetric))
+	require.Error(t, e.ConfigureTPS(previous, metricschema.LLMTokenEventsMetric))
 	require.Error(t, e.ConfigureReceivedBytes(previous, RequestReceivedBytesMetric))
-	require.Error(t, e.ConfigureLLMTimings(previous, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
+	require.Error(t, e.ConfigureLLMTimings(previous, metricschema.LLMResponseDurationMetric, metricschema.LLMTimeToFirstTokenMetric, ""))
 	require.Error(t, e.Collect(context.Background(), previous))
-	putCSV(t, run, csvHeader+LLMTokenEventsMetric+",NaN,,\n"+
-		LLMResponseDurationMetric+",NaN,,\n"+LLMTimeToFirstTokenMetric+",NaN,,\n"+
+	putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+",NaN,,\n"+
+		metricschema.LLMResponseDurationMetric+",NaN,,\n"+metricschema.LLMTimeToFirstTokenMetric+",NaN,,\n"+
 		RequestReceivedBytesMetric+",NaN,,\n")
 	require.Empty(t, collectAndGather(t, e))
 	state, err := e.Observe(context.Background(), run)
@@ -289,8 +289,8 @@ func TestTPSResetClearsSelectionIdentityAndAdmission(t *testing.T) {
 	// Re-enabling in a fresh run starts at one, never at the previous token total.
 	run.RunID = "tokens-again"
 	e.Reset(run)
-	require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
-	putCSV(t, run, csvHeader+LLMTokenEventsMetric+",1,,\n")
+	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
+	putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+",1,,\n")
 	all = collectAndGather(t, e)
 	assertStatusSamples(t, all, map[string]map[string]float64{"tps": {"200": 1}})
 	require.Len(t, all, 1)
