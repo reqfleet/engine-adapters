@@ -38,9 +38,6 @@ const (
 	LLMTokenEventsMetric = "llm_token_events"
 	// LLMInterTokenDurationMetric supplies gaps from the second generated token onward.
 	LLMInterTokenDurationMetric = "llm_inter_token_duration"
-
-	// TPS counts received tokens under the shared contract's lowercase label.
-	llmTPSLabel = "tps"
 )
 
 // Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
@@ -346,22 +343,18 @@ func (e *Exporter) point(record []string) error {
 			return err
 		}
 	case LLMTimeToFirstTokenMetric:
-		metric.Label, metric.Latency = metricschema.TTFTLabel, value
-		if err := e.recorder.ObserveLatency(metric); err != nil {
+		if err := e.recorder.ObserveTTFT(value); err != nil {
 			return err
 		}
 	case LLMInterTokenDurationMetric:
-		metric.Label, metric.Latency = llmTPSLabel, value
-		if err := e.recorder.ObserveLatency(metric); err != nil {
+		if err := e.recorder.ObserveInterTokenLatency(value); err != nil {
 			return err
 		}
 	case LLMTokenEventsMetric:
 		if value != 1 {
 			return fmt.Errorf("invalid %s sample %q: expected exactly one received token", name, record[e.valueIndex])
 		}
-		// 200 classifies a successful token receipt, not a per-token HTTP response.
-		metric.Label, metric.Status = llmTPSLabel, "200"
-		if err := e.recorder.RecordStatus(metric); err != nil {
+		if err := e.recorder.RecordReceivedToken(); err != nil {
 			return err
 		}
 	case "vus":
