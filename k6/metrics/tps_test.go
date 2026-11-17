@@ -34,7 +34,7 @@ func assertStatusSamples(t *testing.T, all map[string]*dto.MetricFamily, want ma
 func TestTPSTokenPointsAndRetention(t *testing.T) {
 	e, run := fixture(t, 10)
 	require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
-	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric))
+	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
 	putCSV(t, run, "name,url,status,metric_value,metric_name\n")
 	require.Empty(t, collectAndGather(t, e))
 	state, err := e.Observe(context.Background(), run)
@@ -130,7 +130,7 @@ func TestTPSAdmissionIsSharedWithRequestBytesAndTimings(t *testing.T) {
 				e, run := fixture(t, 1)
 				require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
 				require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
-				require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric))
+				require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
 				token := LLMTokenEventsMetric + ",1,,\n"
 				other := source + ",7,,request\n"
 				rows := other + token
@@ -249,7 +249,7 @@ func TestTPSResetClearsSelectionIdentityAndAdmission(t *testing.T) {
 	e, run := fixture(t, 3)
 	require.NoError(t, e.ConfigureTPS(run, LLMTokenEventsMetric))
 	require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
-	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric))
+	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
 	putCSV(t, run, csvHeader+LLMTokenEventsMetric+",1,,\n"+
 		LLMResponseDurationMetric+",15000,,\n"+LLMTimeToFirstTokenMetric+",3,,\n")
 	all := collectAndGather(t, e)
@@ -262,7 +262,7 @@ func TestTPSResetClearsSelectionIdentityAndAdmission(t *testing.T) {
 	require.Empty(t, scrape(e).Body.String())
 	require.Error(t, e.ConfigureTPS(previous, LLMTokenEventsMetric))
 	require.Error(t, e.ConfigureReceivedBytes(previous, RequestReceivedBytesMetric))
-	require.Error(t, e.ConfigureLLMTimings(previous, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric))
+	require.Error(t, e.ConfigureLLMTimings(previous, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
 	require.Error(t, e.Collect(context.Background(), previous))
 	putCSV(t, run, csvHeader+LLMTokenEventsMetric+",NaN,,\n"+
 		LLMResponseDurationMetric+",NaN,,\n"+LLMTimeToFirstTokenMetric+",NaN,,\n"+

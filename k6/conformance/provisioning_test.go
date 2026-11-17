@@ -158,7 +158,7 @@ func (provisioningReporter) Reset(agent.RunContext) {}
 func (provisioningReporter) ConfigureReceivedBytes(agent.RunContext, string) error {
 	return nil
 }
-func (provisioningReporter) ConfigureLLMTimings(agent.RunContext, string, string) error {
+func (provisioningReporter) ConfigureLLMTimings(agent.RunContext, string, string, string) error {
 	return nil
 }
 func (provisioningReporter) ConfigureTPS(agent.RunContext, string) error {

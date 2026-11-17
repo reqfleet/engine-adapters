@@ -136,7 +136,7 @@ export default function(){
 			AssertMetrics: func(t *testing.T, runtime *conformance.Runtime, run string) conformance.MetricsSnapshot {
 				for _, scenario := range tpsCases {
 					if strings.HasSuffix(t.Name(), "/labels/"+scenario.Name) {
-						_, snapshot := compareCSVSnapshotSelection(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.DataReceivedMetric, llmTimingSelection{tps: true})
+						_, snapshot := compareCSVSnapshotSelection(t, runtime.Client, filepath.Join(runtime.Root, "test-result", "k6.csv"), run, runtime.LabelLimit, metrics.DataReceivedMetric, llmTimingSelection{tps: true, interToken: true, ttft: true})
 						assertTPSCSV(t, runtime, true)
 						require.NotNil(t, snapshot.Requests["others"].Latency)
 						return snapshot
@@ -520,6 +520,13 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 			// per-token HTTP response. Generation errors add no token points.
 			expected.requests[label].status["200"]++
 			tokenCounts[label]++
+		case metrics.LLMInterTokenDurationMetric:
+			if timings.interToken {
+				require.False(t, value < 0 || math.IsNaN(value) || math.IsInf(value, 0), "selected inter-token samples must be valid")
+				label, valid := admit("tps")
+				require.True(t, valid)
+				durations[label] = append(durations[label], value)
+			}
 		case llmResponseSource, llmTTFTSource:
 			if row[columns["metric_name"]] == llmResponseSource && timings.response {
 				label, valid := admit(metricschema.LLMResponseLabel)

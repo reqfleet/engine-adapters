@@ -76,7 +76,7 @@ The entry point creates one `agent.MetricsRegistry`, passes it to the exporter a
 
 | Metric | Attribution |
 |---|---|
-| `shibuya_latency_label_milliseconds` | Request URL/grouping name; latency histogram in milliseconds |
+| `shibuya_latency_label_milliseconds` | Request URL/grouping name, `ttft`, or `tps`; latency histogram in milliseconds |
 | `shibuya_status_counter` | Request URL/grouping name and outcome; successful received-token counts under `tps` when selected |
 | `shibuya_egress_bytes_counter` | Agent aggregate by default; request URL/grouping name with the explicit custom-counter mode below |
 | `shibuya_threads_gauge` | Latest k6 `vus` sample for the agent; no request label |
@@ -130,6 +130,7 @@ Built-in `data_received` samples lack request URL attribution. By default they r
 | `llm_response_duration` | Only when selected by `llmResponse`, observe milliseconds in `shibuya_latency_llm_resp_milliseconds` under `llm_resp` (or `others` after admission overflow) |
 | `llm_time_to_first_token` | Only when selected by `ttft`, observe milliseconds in the ordinary histogram under `ttft` (or `others` after admission overflow) |
 | `llm_token_events` | Only when selected by `tps`, count each unit-valued token observation in `shibuya_status_counter` under `tps`, status `200` (or `others` after admission overflow); no latency, bytes or concurrency update |
+| `llm_inter_token_duration` | Only when selected by `interToken`, observe measured milliseconds between successive tokens in the ordinary histogram under `tps` (or `others` after admission overflow); no status, bytes or concurrency update |
 | `http_reqs`, `data_sent`, other names | Ignore; no double counting and no synthetic request observations |
 
 #### Opt-in request-byte counter
@@ -180,26 +181,30 @@ The SDK's existing byte-length check and shared request-name budget apply to cus
 
 The SDK's [engine-neutral LLM streaming contract](https://github.com/reqfleet/engine-sdk/blob/main/agent/metrics.md#llm-streaming-metrics) defines measurement boundaries, normalized families, units, labels and failure semantics for all engines. The following is k6's source mapping and opt-in instrumentation, not a separate LLM specification. The link follows the SDK development contract; it does not change the pinned runtime version listed above.
 
-Select either or both fixed custom [Trend](https://grafana.com/docs/k6/latest/javascript-api/k6-metrics/trend/) sources in `options.ext.reqfleet`:
+Select any of these fixed custom [Trend](https://grafana.com/docs/k6/latest/javascript-api/k6-metrics/trend/) sources independently in `options.ext.reqfleet`:
 
 ```js
 import { Trend } from 'k6/metrics';
 
 const responseDuration = new Trend('llm_response_duration', true);
 const timeToFirstToken = new Trend('llm_time_to_first_token', true);
+const interTokenDuration = new Trend('llm_inter_token_duration', true);
 export const options = {
   ext: {
     reqfleet: {
       llmResponse: 'llm_response_duration',
       ttft: 'llm_time_to_first_token',
+      interToken: 'llm_inter_token_duration',
     },
   },
 };
 ```
 
-Add one **measured elapsed time in milliseconds** per completed LLM response to `responseDuration`, and one per observed first generated token to `timeToFirstToken`. These are individual observations, not cumulative values, averages or percentiles. The `true` argument identifies timing Trends; it does not convert seconds to milliseconds. CSV does not encode custom metric types, so declaring these reserved sources as Counters, Gauges or Rates is outside the contract.
+Add one **measured elapsed time in milliseconds** per completed LLM response to `responseDuration`, one per observed first generated token to `timeToFirstToken`, and one gap between successive individually observed tokens to `interTokenDuration`. These are individual observations, not cumulative values, averages or percentiles. The `true` argument identifies timing Trends; it does not convert seconds to milliseconds. CSV does not encode custom metric types, so declaring these reserved sources as Counters, Gauges or Rates is outside the contract.
 
-Instrument the request-start, first generated payload and protocol-completion boundaries defined by the SDK contract. Stock k6's buffered HTTP response does not expose streaming token arrival: `response.timings.waiting` is not TTFT, and a multi-token buffered response cannot recover it. Use a client with actual token callbacks when streaming TTFT is required. Automatic extension resolution remains disabled; selecting these Trends does not add an LLM or streaming client.
+Keep the previous-token timestamp local to each generation. The first token has no inter-token gap; each later token records the elapsed time since the previous token. Ignore greetings, empty/control events and completion markers without moving that timestamp. A stream with N individually observed tokens supplies N-1 gaps, independently of its N TPS observations. Retain measured gaps on interruption, but never invent timings within a batched payload or carry the timestamp into another stream. Measured zero and fractional milliseconds are valid; missing instrumentation leaves the histogram absent.
+
+Instrument the request-start, generated-token arrival and protocol-completion boundaries defined by the SDK contract. Stock k6's buffered HTTP response does not expose streaming token arrival: `response.timings.waiting` is not TTFT, and a multi-token buffered response cannot recover TTFT or inter-token gaps. Use a client with actual token callbacks for these measurements. Automatic extension resolution remains disabled; selecting these Trends does not add an LLM or streaming client.
 
 For a non-streaming endpoint, a complete runnable response-duration example is:
 
@@ -226,9 +231,9 @@ export default function () {
 
 This non-streaming example intentionally reports only completed-response duration. Adapt its completion/error detection to the endpoint protocol and follow the SDK contract for unavailable measurements and interrupted generations.
 
-Omitting a selector or setting it to `""` disables that measurement. The only accepted nonempty values are the exact names shown above; other strings and non-string values (including `null`) fail preparation. Merely declaring a Trend does not opt in. Inspection fixes both selections before launch; reset disables both before inspecting the next plan. Unselected points are ignored, including invalid numeric values. Selected negative, nonnumeric or nonfinite observations fail ingestion.
+Omitting a selector or setting it to `""` disables that measurement. The only accepted nonempty values are the exact names shown above; other strings and non-string values (including `null`) fail preparation. Merely declaring a Trend does not opt in. Inspection fixes all timing selections before launch; reset disables them before inspecting the next plan. Unselected points are ignored, including invalid numeric values. Selected negative, nonnumeric or nonfinite observations fail ingestion.
 
-Timing points need no `url`, `name` or `status` values. Their CSV tags do not change the reserved labels. The exporter calls SDK `ObserveLLMResponse` for response duration and `ObserveLatency` under `ttft` for first-token timing, sharing admission with HTTP and custom bytes. SDK overflow and histogram-family rules apply unchanged. HTTP groups named `ttft` share that ordinary label; HTTP groups named `llm_resp` still use the ordinary histogram. Avoid those grouping names when distinct reporting is needed.
+Timing points need no `url`, `name` or `status` values. Their CSV tags do not change the reserved labels. The exporter calls SDK `ObserveLLMResponse` for response duration and `ObserveLatency` under `ttft` for first-token timing or `tps` for inter-token timing, sharing admission with HTTP, token counts and custom bytes. SDK overflow and histogram-family rules apply unchanged. HTTP groups named `ttft` or `tps` share those ordinary labels; HTTP groups named `llm_resp` still use the ordinary histogram. Avoid those grouping names when distinct reporting is needed.
 
 Timing observations never increment status counters, add received bytes, or change VUs. HTTP latency/outcomes and the selected byte source remain independent. Identity binding, final drain, retained scrapes and reset use the same SDK-owned lifecycle as other samples.
 
@@ -252,12 +257,34 @@ export const options = {
 - Each CSV point must have value **exactly `1`**. Batched `add(n)`, cumulative totals, rates, zero, negative, fractional and nonfinite values fail ingestion when selected. Emit no sample when no token arrives. CSV does not encode the custom metric type; Gauge, Rate and Trend declarations are outside this Counter contract.
 - The exporter calls SDK `RecordStatus` with `label="tps"` and `status="200"` once per point. Here `200` denotes a successful token receipt, not another HTTP response. CSV `url`, `name` and `status` tags cannot override that attribution. Stream/request failures belong to their own outcome reporting, not extra `tps` observations.
 - Omit `tps` or set it to an empty string to disable ingestion. Any other selector value or non-string selector fails preparation. Selection is fixed by inspection before launch; declaring the Counter alone does not opt in. Unselected points are ignored, and reset disables TPS before the next plan's inspection.
-- Token observations create no latency, byte or concurrency samples. Existing `llmResponse`, `ttft`, native HTTP metrics and `receivedBytes` selection remain independent. Missing token observations stay unavailable, without byte-derived estimates or fabricated zero series.
+- Token observations create no latency, byte or concurrency samples. The `llmResponse`, `ttft`, `interToken`, native HTTP metrics and `receivedBytes` selections remain independent. Missing token observations stay unavailable, without byte-derived estimates or fabricated zero series.
 - Counts use SDK-owned identity, shared admission, retention and final drain. Repeated scrapes do not recount tokens; cancellation retains tokens already received. Overflow folds `tps` into `others`, which may also contain HTTP outcomes and must not be presented as isolated token throughput. Avoid HTTP grouping names that collide with `tps`.
 
-The existing TPS chart derives the rate from `shibuya_status_counter{label="tps"}`. An inter-token-duration metric is not required; bandwidth remains a separate byte-counter measurement.
+The existing TPS chart derives the rate from `shibuya_status_counter{label="tps"}`. The separate Inter-token Latency chart reads `shibuya_latency_label_milliseconds{label="tps"}` when `interToken` is selected and measured. Gaps are not the TPS denominator, and timing observations never increment the token counter. Either measurement can be selected alone; bandwidth remains a separate byte-counter measurement.
 
 Use a client with actual streaming callbacks. The stock k6 image supports WebSocket callbacks, used by conformance, but this selector does not add an SSE client or extension. Buffered `k6/http` responses cannot recover live token arrivals; unsupported extension imports remain rejected by the pinned-engine policy.
+
+##### Complete four-metric WebSocket plan
+
+[`testdata/llm-websocket.js`](testdata/llm-websocket.js) is an uploadable plan for the Reqfleet mock `/websocket` endpoint using stock `k6/websockets`. It ignores the `websocket connected` greeting, records TTFT on the first generated token, counts every token including the first, records inter-token gaps from the second token onward, and records `llm_resp` only after a normal WebSocket close (code `1000`). Transport errors, invalid payloads and the three-minute client deadline fail the stream check without inventing completion latency; already received tokens, TTFT and gaps remain recorded. Each iteration starts with no previous-token timestamp.
+
+The plan measures callback timings with `exec.instance.currentTestRunDuration` from [`k6/execution`](https://grafana.com/docs/k6/latest/javascript-api/k6-execution/#instance), in fractional milliseconds. In k6 v2.3.0 this clock is wall-time-based rather than monotonic, excludes pauses, and is unavailable in `teardown()`. Local clock adjustments and callback scheduling can affect observed arrival gaps.
+
+The deployed mock server must include the normal-close behavior in `testserver/testhttp/websocket.go`. Older servers that simply drop TCP will fail this plan's completion check. Updating a checkout does not update the public mock service.
+
+Upload the file with a TPS-capable adapter and configure VUs/duration through the collection settings. The mock emits 100–10,000 tokens per stream; at 60 tokens/second, allow at least three minutes for an initial stream to finish. A scheduled stop may interrupt a later stream. To run one iteration directly from the repository root:
+
+```sh
+k6 run --vus 1 --iterations 1 \
+  -e LLM_WS_URL='ws://127.0.0.1:8080/websocket?tokens_per_second=60&ttft_ms=200' \
+  k6/testdata/llm-websocket.js
+```
+
+The file defaults to `wss://sgra.reqfleet.io/websocket` with the same rate and TTFT query parameters. For another endpoint, change the URL, the `isToken` parser and the completion condition to match its protocol; keep the metric recording independent of the transport.
+
+Failed-stream logs include the native k6 error, connection phase, close code/reason, received-token count and elapsed milliseconds. The first parser or deadline failure is preserved rather than overwritten by a secondary transport error. `phase=handshake` means no WebSocket connection opened; `close=1006` identifies an abnormal disconnect, not successful completion. These details are diagnostic logs, not metric labels.
+
+TPS status counts (`shibuya_status_counter{label="tps",status="200"}`), first-token latency (`shibuya_latency_label_milliseconds` with `label="ttft"`) and inter-token latency (the same family with `label="tps"`, from the second token) should appear while a stream is still open. Only `llm_resp` waits for successful completion. If k6's CSV or summary contains these custom measurements but the normalized series are absent, check the **deployed adapter runtime image**, not just the plan or k6 version. Older adapters ignore selectors they do not support. `make -C k6 test-conformance` builds a separate test image; it does not update the runtime image. Build the runtime with `make -C k6 image`, load it into the local cluster when applicable, then Purge/Launch the collection to replace its agents. Trigger alone reuses the existing adapter binary.
 
 #### Transport failures
 

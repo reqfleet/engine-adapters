@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/reqfleet/engine-adapters/k6/metrics"
 	"github.com/reqfleet/engine-sdk/agent"
 	"github.com/reqfleet/engine-sdk/protocol"
 	"github.com/stretchr/testify/require"
@@ -23,7 +24,7 @@ func (r *reporter) Reset(run agent.RunContext) {
 func (*reporter) ConfigureReceivedBytes(agent.RunContext, string) error {
 	return nil
 }
-func (*reporter) ConfigureLLMTimings(agent.RunContext, string, string) error {
+func (*reporter) ConfigureLLMTimings(agent.RunContext, string, string, string) error {
 	return nil
 }
 func (*reporter) ConfigureTPS(agent.RunContext, string) error {
@@ -146,5 +147,50 @@ func TestInspectionStderrBoundaries(t *testing.T) {
 				require.Equal(t, size > inspectionStderrLimit, output.truncated)
 			})
 		}
+	}
+}
+
+func TestInterTokenInspectionSelection(t *testing.T) {
+	for _, option := range []string{`{}`, `{"interToken":""}`, `{"interToken":"llm_inter_token_duration"}`, `{"interToken":"wrong"}`, `{"interToken":null}`, `{"interToken":1}`, `{"interToken":true}`, `{"interToken":[]}`, `{"interToken":{}}`} {
+		t.Run(option, func(t *testing.T) {
+			run := fixture(t)
+			registry := agent.NewMetricsRegistry()
+			exporter, err := metrics.New(10, registry)
+			require.NoError(t, err)
+			a := New(exporter)
+			a.executable = filepath.Join(t.TempDir(), "k6")
+			inspect := func(options string) {
+				t.Helper()
+				script := "#!/bin/sh\nif [ \"$1\" = inspect ]; then\nprintf '%s\\n' '{\"ext\":{\"reqfleet\":" + options + "}}'\nelse\nprintf '%s\\n' '{\"customBuildRequired\":false}'\nfi\n"
+				require.NoError(t, os.WriteFile(a.executable, []byte(script), 0700))
+			}
+			inspect(`{"interToken":"llm_inter_token_duration"}`)
+			require.NoError(t, a.BeforeStart(context.Background(), run))
+			inspect(option)
+			err = a.BeforeStart(context.Background(), run)
+			valid := option == `{}` || option == `{"interToken":""}` || option == `{"interToken":"llm_inter_token_duration"}`
+			if !valid {
+				require.Error(t, err)
+				_, err = a.BuildCommand(context.Background(), run)
+				require.Error(t, err, "failed reconfiguration invalidates the prepared command")
+				return
+			}
+			require.NoError(t, err)
+			// Mutating inspection output after preparation cannot change selection.
+			inspect(`{"interToken":"wrong"}`)
+			_, err = a.BuildCommand(context.Background(), run)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(run.ResultFile, []byte("metric_name,metric_value,status,url\nllm_inter_token_duration,2.5,,\n"), 0600))
+			require.NoError(t, exporter.Collect(context.Background(), run))
+			all, err := registry.Gather()
+			require.NoError(t, err)
+			if option == `{"interToken":"llm_inter_token_duration"}` {
+				require.Len(t, all, 1)
+				require.Equal(t, uint64(1), all[0].Metric[0].GetHistogram().GetSampleCount())
+				require.Equal(t, 2.5, all[0].Metric[0].GetHistogram().GetSampleSum())
+			} else {
+				require.Empty(t, all)
+			}
+		})
 	}
 }

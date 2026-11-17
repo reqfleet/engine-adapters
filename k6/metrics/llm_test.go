@@ -54,7 +54,7 @@ func assertTimingSamples(t *testing.T, all map[string]*dto.MetricFamily, family 
 
 func TestLLMTimingsAreIndependentAndRetained(t *testing.T) {
 	e, run := fixture(t, 10)
-	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric))
+	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
 	// Custom timing attribution is reserved, not the CSV name, status or URL.
 	putCSV(t, run, "name,url,status,metric_value,metric_name\n"+
 		"unrelated,,,0,"+LLMResponseDurationMetric+"\n"+
@@ -90,7 +90,7 @@ func TestLLMTimingsShareAdmissionWithoutChangingHistogramFamily(t *testing.T) {
 	for _, budget := range []int{0, 1, 2, 3} {
 		t.Run(fmt.Sprint(budget), func(t *testing.T) {
 			e, run := fixture(t, budget)
-			require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric))
+			require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
 			require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
 			putCSV(t, run, csvHeader+"http_req_duration,4,200,http\n"+
 				LLMResponseDurationMetric+",20000,,\n"+LLMTimeToFirstTokenMetric+",5,,\n"+
@@ -128,9 +128,9 @@ func TestLLMSourceSelectionAndReset(t *testing.T) {
 		run.RunID = fmt.Sprintf("run-%d", index)
 		run.CollectionID = fmt.Sprintf("collection-%d", index)
 		e.Reset(run)
-		require.ErrorContains(t, e.ConfigureLLMTimings(previous, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric), "active run")
+		require.ErrorContains(t, e.ConfigureLLMTimings(previous, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""), "active run")
 		if sources != [2]string{} {
-			require.NoError(t, e.ConfigureLLMTimings(agent.RunContext{RunID: run.RunID}, sources[0], sources[1]))
+			require.NoError(t, e.ConfigureLLMTimings(agent.RunContext{RunID: run.RunID}, sources[0], sources[1], ""))
 		}
 		putCSV(t, run, csvHeader)
 		if sources[0] == "" {
@@ -173,7 +173,7 @@ func TestInvalidLLMTimingSamplesFailIngestion(t *testing.T) {
 		for _, value := range []string{"", "no", "-1", "NaN", "+Inf", "-Inf", "1e999"} {
 			t.Run(source+"/"+value, func(t *testing.T) {
 				e, run := fixture(t, 0)
-				require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric))
+				require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
 				putCSV(t, run, csvHeader+source+","+value+",,\n")
 				err := e.Collect(context.Background(), run)
 				require.ErrorContains(t, err, "invalid "+source+" sample")
@@ -187,9 +187,9 @@ func TestInvalidLLMTimingSamplesFailIngestion(t *testing.T) {
 
 func TestInvalidLLMSourceDoesNotReplaceSelection(t *testing.T) {
 	e, run := fixture(t, 2)
-	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric))
+	require.NoError(t, e.ConfigureLLMTimings(run, LLMResponseDurationMetric, LLMTimeToFirstTokenMetric, ""))
 	for _, sources := range [][2]string{{"http_req_duration", ""}, {"", "ttft"}, {LLMResponseDurationMetric, "invalid"}, {" LLM_RESPONSE_DURATION", LLMTimeToFirstTokenMetric}} {
-		require.Error(t, e.ConfigureLLMTimings(run, sources[0], sources[1]))
+		require.Error(t, e.ConfigureLLMTimings(run, sources[0], sources[1], ""))
 	}
 	putCSV(t, run, csvHeader+LLMResponseDurationMetric+",7,,\n"+LLMTimeToFirstTokenMetric+",2,,\n")
 	all := collectAndGather(t, e)

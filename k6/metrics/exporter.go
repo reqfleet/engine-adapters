@@ -36,6 +36,8 @@ const (
 	LLMTimeToFirstTokenMetric = "llm_time_to_first_token"
 	// LLMTokenEventsMetric supplies one point per received generated token.
 	LLMTokenEventsMetric = "llm_token_events"
+	// LLMInterTokenDurationMetric supplies gaps from the second generated token onward.
+	LLMInterTokenDurationMetric = "llm_inter_token_duration"
 
 	// TPS counts received tokens under the shared contract's lowercase label.
 	llmTPSLabel = "tps"
@@ -44,21 +46,21 @@ const (
 // Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
 // No reader or goroutine survives Collect; callbacks share the same state lock.
 type Exporter struct {
-	mu                                           sync.Mutex
-	byteLabel                                    string
-	receivedBytesSource                          string
-	llmResponseSource, ttftSource, tpsSource     string
-	recorder                                     *agent.MetricsRecorder
-	runID, resultFile                            string
-	active                                       bool
-	offset                                       int64
-	observedSize                                 int64
-	fileInfo                                     os.FileInfo
-	columns                                      int
-	nameIndex, valueIndex, statusIndex, urlIndex int
-	errorCodeIndex                               int
-	ready                                        bool
-	failure                                      error
+	mu                                                         sync.Mutex
+	byteLabel                                                  string
+	receivedBytesSource                                        string
+	llmResponseSource, ttftSource, tpsSource, interTokenSource string
+	recorder                                                   *agent.MetricsRecorder
+	runID, resultFile                                          string
+	active                                                     bool
+	offset                                                     int64
+	observedSize                                               int64
+	fileInfo                                                   os.FileInfo
+	columns                                                    int
+	nameIndex, valueIndex, statusIndex, urlIndex               int
+	errorCodeIndex                                             int
+	ready                                                      bool
+	failure                                                    error
 }
 
 // New validates the per-run URL label budget and uses the SDK's collectors.
@@ -88,7 +90,7 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.runID, e.resultFile = run.RunID, run.ResultFile
 	e.active = true
 	e.receivedBytesSource = DataReceivedMetric
-	e.llmResponseSource, e.ttftSource, e.tpsSource = "", "", ""
+	e.llmResponseSource, e.ttftSource, e.tpsSource, e.interTokenSource = "", "", "", ""
 	e.offset, e.observedSize, e.columns = 0, 0, 0
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
@@ -133,7 +135,7 @@ func (e *Exporter) ConfigureTPS(run agent.RunContext, source string) error {
 
 // ConfigureLLMTimings selects independent timing sources before launch.
 // Empty selectors disable the corresponding measurement for this run.
-func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft string) error {
+func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft, interToken string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.matchesRun(run) {
@@ -145,7 +147,10 @@ func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft stri
 	if ttft != "" && ttft != LLMTimeToFirstTokenMetric {
 		return fmt.Errorf("unsupported TTFT source %q", ttft)
 	}
-	e.llmResponseSource, e.ttftSource = response, ttft
+	if interToken != "" && interToken != LLMInterTokenDurationMetric {
+		return fmt.Errorf("unsupported inter-token source %q", interToken)
+	}
+	e.llmResponseSource, e.ttftSource, e.interTokenSource = response, ttft, interToken
 	return nil
 }
 
@@ -296,7 +301,7 @@ func (e *Exporter) header(record []string) error {
 func (e *Exporter) point(record []string) error {
 	name := record[e.nameIndex]
 	if name != "http_req_duration" && name != "vus" && name != e.receivedBytesSource &&
-		(name == "" || (name != e.llmResponseSource && name != e.ttftSource && name != e.tpsSource)) {
+		(name == "" || (name != e.llmResponseSource && name != e.ttftSource && name != e.tpsSource && name != e.interTokenSource)) {
 		return nil
 	}
 	value, err := strconv.ParseFloat(record[e.valueIndex], 64)
@@ -342,6 +347,11 @@ func (e *Exporter) point(record []string) error {
 		}
 	case LLMTimeToFirstTokenMetric:
 		metric.Label, metric.Latency = metricschema.TTFTLabel, value
+		if err := e.recorder.ObserveLatency(metric); err != nil {
+			return err
+		}
+	case LLMInterTokenDurationMetric:
+		metric.Label, metric.Latency = llmTPSLabel, value
 		if err := e.recorder.ObserveLatency(metric); err != nil {
 			return err
 		}
