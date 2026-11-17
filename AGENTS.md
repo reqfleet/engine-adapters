@@ -121,12 +121,12 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261117064210-9b09e146d464`, a pinned SDK snapshot providing shared LLM instrumentation source names and SDK-owned LLM response, TTFT, inter-token timing and token-receipt recording, recorder-bound assigned identity and a coordinated reset of all run-local reporting state, alongside canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining, ingestion-failure propagation and the conformance toolkit. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261117072031-251738777c81`, a pinned SDK main snapshot providing shared LLM instrumentation source names and SDK-owned LLM response, TTFT, inter-token timing and token-receipt recording, recorder-bound assigned identity and a coordinated reset of all run-local reporting state, alongside canonical collectors, `CustomIngestMetrics` scheduling, final post-exit draining, ingestion-failure propagation and the conformance toolkit. This argument selects the SDK compiled into the adapter and conformance executables, the bundled `SDK_THIRD_PARTY_NOTICES`, and the runtime image description. It is not a metadata-only override.
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261117064210-9b09e146d464 \
-  -t k6-adapter:sdk-9b09e14 .
+  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261117072031-251738777c81 \
+  -t k6-adapter:sdk-2517387 .
 ```
 
 Use an exact Go release version or pseudo-version. The build resolves the requested dependency after copying the source, then checks that its resolved version matches the argument; mutable aliases such as `main` and `latest` are rejected. An SDK that lacks the APIs used by this adapter will fail compilation rather than silently falling back.
