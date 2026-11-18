@@ -125,9 +125,14 @@ func TestLLMSourceSelectionAndReset(t *testing.T) {
 	e, run := fixture(t, 1)
 	previous := run
 	for index, sources := range [][2]string{{metricschema.LLMResponseDurationMetric, ""}, {"", metricschema.LLMTimeToFirstTokenMetric}, {"", ""}} {
+		oldRegistry := previous.Metrics.Registry()
+		oldMetrics := scrapeRegistry(oldRegistry).Body.String()
 		run.RunID = fmt.Sprintf("run-%d", index)
 		run.CollectionID = fmt.Sprintf("collection-%d", index)
+		run.Metrics = nil
 		e.Reset(run)
+		require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
+		e.launch(t, &run)
 		require.ErrorContains(t, e.ConfigureLLMTimings(previous, metricschema.LLMResponseDurationMetric, metricschema.LLMTimeToFirstTokenMetric, ""), "active run")
 		if sources != [2]string{} {
 			require.NoError(t, e.ConfigureLLMTimings(agent.RunContext{RunID: run.RunID}, sources[0], sources[1], ""))
@@ -164,6 +169,7 @@ func TestLLMSourceSelectionAndReset(t *testing.T) {
 				require.Equal(t, run.CollectionID, metricLabels(metric)["collection_id"])
 			}
 		}
+		require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
 		previous = run
 	}
 }

@@ -237,20 +237,25 @@ func TestCustomReceivedBytesInvalidSamplesFailWithoutMeasurements(t *testing.T) 
 	}
 }
 
-func TestReceivedBytesResetRestoresDefaultAndClearsRunState(t *testing.T) {
+func TestReceivedBytesResetRestoresDefaultForNewRun(t *testing.T) {
 	e, run := fixture(t, 1)
 	for index, custom := range []bool{true, false, true} {
 		previous := run
+		oldRegistry := previous.Metrics.Registry()
+		oldMetrics := scrapeRegistry(oldRegistry).Body.String()
 		run.RunID = fmt.Sprintf("run-%d", index)
 		run.CollectionID = fmt.Sprintf("collection-%d", index)
 		run.PlanID = fmt.Sprintf("plan-%d", index)
 		run.AgentID = fmt.Sprintf("agent-%d", index)
 		run.Zone = fmt.Sprintf("zone-%d", index)
+		run.Metrics = nil
 		e.Reset(run)
+		require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
+		e.launch(t, &run)
 		label := fmt.Sprintf("https://example.test/run-%d", index)
 		byteLabel := "k6"
 		if custom {
-			// Only callback run ID is required; identity is bound at Reset.
+			// Only callback run ID is required; the SDK binds identity at launch.
 			require.NoError(t, e.ConfigureReceivedBytes(agent.RunContext{RunID: run.RunID}, RequestReceivedBytesMetric))
 			byteLabel = label
 		}
@@ -282,12 +287,12 @@ func TestReceivedBytesResetRestoresDefaultAndClearsRunState(t *testing.T) {
 				assert.Equal(t, run.Zone, labels["zone"])
 			}
 		}
+		require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
 	}
 }
 
 func TestConfigureReceivedBytesRejectsUnknownAndUnpreparedRuns(t *testing.T) {
-	exporter, err := New(1, agent.NewMetricsRegistry())
-	require.NoError(t, err)
+	exporter := &Exporter{}
 	require.ErrorContains(t, exporter.ConfigureReceivedBytes(agent.RunContext{}, ""), "active run")
 	for _, source := range []string{DataReceivedMetric, strings.ToUpper(DataReceivedMetric), " " + RequestReceivedBytesMetric, "custom_counter", "llm_streamed_bytes", metricschema.LLMTokenEventsMetric} {
 		t.Run(source, func(t *testing.T) {

@@ -14,11 +14,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	options.MetricsRegistry = agent.NewMetricsRegistry()
-	exporter, err := metrics.New(options.LabelsUsageLimit, options.MetricsRegistry)
-	if err != nil {
-		log.Fatal(err)
-	}
+	exporter := &metrics.Exporter{}
 	options.CustomIngestMetrics = exporter.Collect
 	options = adapter.New(exporter).Options(options)
 	if err := agent.NewAgentServer(options).Run(); err != nil {

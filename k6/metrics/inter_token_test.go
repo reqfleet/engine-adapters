@@ -86,14 +86,20 @@ func TestInterTokenSelectionValidationAndReset(t *testing.T) {
 	require.Equal(t, all, collectAndGather(t, e))
 	require.NoError(t, e.ConfigureLLMTimings(run, "", "", metricschema.LLMInterTokenDurationMetric))
 	previous := run
+	oldRegistry := previous.Metrics.Registry()
+	oldMetrics := scrapeRegistry(oldRegistry).Body.String()
 	run.RunID = "next"
+	run.Metrics = nil
 	e.Reset(run)
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
+	e.launch(t, &run)
 	require.Error(t, e.ConfigureLLMTimings(previous, "", "", metricschema.LLMInterTokenDurationMetric))
 	require.Error(t, e.Collect(context.Background(), previous))
 	putCSV(t, run, csvHeader+metricschema.LLMInterTokenDurationMetric+",NaN,,\nhttp_req_duration,4,200,new\n")
 	all = collectAndGather(t, e)
 	assertTimingSamples(t, all, metricschema.RequestLatency, map[string][]float64{"new": {4}})
 	require.Equal(t, "next", metricLabels(single(t, all, metricschema.RequestLatency))["run_id"])
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
 }
 
 func TestInterTokenRejectsInvalidSelectedValues(t *testing.T) {

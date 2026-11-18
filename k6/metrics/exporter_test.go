@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
@@ -28,18 +29,27 @@ const csvHeader = "metric_name,metric_value,status,url\n"
 
 type exporterFixture struct {
 	*Exporter
-	registry *agent.MetricsRegistry
+	run    agent.RunContext
+	budget int
 }
 
 func fixture(t *testing.T, budget int) (*exporterFixture, agent.RunContext) {
 	t.Helper()
-	registry := agent.NewMetricsRegistry()
-	exporter, err := New(budget, registry)
-	require.NoError(t, err)
-	e := &exporterFixture{Exporter: exporter, registry: registry}
+	e := &exporterFixture{Exporter: &Exporter{}, budget: budget}
 	run := agent.RunContext{RunID: "run-one", CollectionID: "collection", PlanID: "plan", AgentID: "agent-2", Zone: "zone-a", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
 	e.Reset(run)
+	e.launch(t, &run)
 	return e, run
+}
+
+// launch simulates the SDK assigning one fresh recorder after preparation.
+func (e *exporterFixture) launch(t *testing.T, run *agent.RunContext) {
+	t.Helper()
+	require.Nil(t, run.Metrics, "prelaunch contexts must not carry a recorder")
+	recorder, err := agent.NewMetricsRecorder(*run, e.budget)
+	require.NoError(t, err)
+	run.Metrics = recorder
+	e.run = *run
 }
 
 func putCSV(t *testing.T, run agent.RunContext, text string) {
@@ -57,14 +67,18 @@ func appendCSV(t *testing.T, run agent.RunContext, text string) {
 }
 
 func scrape(e *exporterFixture) *httptest.ResponseRecorder {
+	return scrapeRegistry(e.run.Metrics.Registry())
+}
+
+func scrapeRegistry(registry *agent.MetricsRegistry) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
-	promhttp.HandlerFor(e.registry, promhttp.HandlerOpts{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	promhttp.HandlerFor(registry, promhttp.HandlerOpts{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	return recorder
 }
 
 func collectAndGather(t *testing.T, e *exporterFixture) map[string]*dto.MetricFamily {
 	t.Helper()
-	require.NoError(t, e.Collect(context.Background(), agent.RunContext{RunID: e.runID}))
+	require.NoError(t, e.Collect(context.Background(), agent.RunContext{RunID: e.run.RunID, Metrics: e.run.Metrics}))
 	recorder := scrape(e)
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	parser := expfmt.NewTextParser(model.LegacyValidation)
@@ -226,13 +240,16 @@ func TestTransportErrorMetadataResetsWithRun(t *testing.T) {
 	// Missing error metadata cannot identify a cause, but must not suppress
 	// the failed request or reuse the previous run's column position.
 	putCSV(t, run, csvHeader+"http_req_duration,0,0,http://127.0.0.1:1/\n")
+	run.RunID = "next"
+	run.Metrics = nil
 	e.Reset(run)
+	e.launch(t, &run)
 	assertRequestMetrics(t, collectAndGather(t, e), map[string]requestMetrics{
 		"http://127.0.0.1:1/": {count: 1, sum: 0, statuses: map[string]float64{"Transport error (cause unavailable)": 1}},
 	})
 }
 
-func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
+func TestURLBudgetKeepsAdmittedURLsAndNewRunGetsFreshSlots(t *testing.T) {
 	e, run := fixture(t, 2)
 	putCSV(t, run, csvHeader+
 		"data_received,10,,https://example.test/bytes\n"+
@@ -264,12 +281,18 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, float64(25), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
 
-	// Reset must release slots even when the run identity is unchanged.
+	// A new SDK run releases admission slots without mutating the old registry.
+	oldRegistry := run.Metrics.Registry()
+	oldMetrics := scrapeRegistry(oldRegistry).Body.String()
+	run.RunID = "next"
+	run.Metrics = nil
 	putCSV(t, run, csvHeader+
 		"http_req_duration,4,200,https://example.test/c\n"+
 		"http_req_duration,6,201,https://example.test/d\n"+
 		"http_req_duration,8,500,https://example.test/a\n")
 	e.Reset(run)
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
+	e.launch(t, &run)
 	all = collectAndGather(t, e)
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"https://example.test/c": {count: 1, sum: 4, statuses: map[string]float64{"200": 1}},
@@ -277,6 +300,7 @@ func TestURLBudgetKeepsAdmittedURLsAndResetsSlots(t *testing.T) {
 		"others":                 {count: 1, sum: 8, statuses: map[string]float64{"500": 1}},
 	})
 	assert.NotContains(t, all, metricschema.EgressBytesCounter)
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
 }
 
 func TestZeroURLBudgetAggregatesRequestsAndBytesSeparately(t *testing.T) {
@@ -292,7 +316,7 @@ func TestZeroURLBudgetAggregatesRequestsAndBytesSeparately(t *testing.T) {
 	assertRequestMetrics(t, all, map[string]requestMetrics{
 		"others": {count: 4, sum: 100, statuses: map[string]float64{"200": 3, "500": 1}},
 	})
-	assert.Equal(t, "others", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
+	assert.Equal(t, "k6", metricLabels(single(t, all, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, float64(20), single(t, all, metricschema.EgressBytesCounter).GetCounter().GetValue())
 	appendCSV(t, run, "http_req_duration,5,200,\n")
 	err := e.Collect(context.Background(), run)
@@ -310,7 +334,7 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/budget=%d", encoding.name, budget), func(t *testing.T) {
 				e, run := fixture(t, budget)
 				for _, revision := range []string{"first", "second"} {
-					// A different boundary URL must claim the slot after reset.
+					// A different boundary URL must claim the slot in the next run.
 					prefix := "https://example.test/" + revision + "/"
 					padding := 1023 - len(prefix)
 					valid := prefix + strings.Repeat(encoding.character, padding/len(encoding.character)) +
@@ -318,7 +342,9 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 					atLimit, overLimit := valid+"b", valid+"bc"
 					// Oversized values must not merge into their valid prefix.
 					run.RunID = revision
+					run.Metrics = nil
 					e.Reset(run)
+					e.launch(t, &run)
 					putCSV(t, run, csvHeader+fmt.Sprintf(
 						"http_req_duration,1,200,%s\n"+
 							"http_req_duration,2,500,%s\n",
@@ -346,12 +372,10 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 						valid:    {Statuses: map[string]uint64{"201": 1, "500": 1}, LatenciesMS: []float64{3, 7}},
 						"others": {Statuses: map[string]uint64{"200": 2}, LatenciesMS: []float64{4, 8}},
 					}
-					byteLabel := "k6"
 					if budget == 0 {
 						requests = map[string]conformance.RequestExpectation{
 							"others": {Statuses: map[string]uint64{"200": 2, "201": 1, "500": 1}, LatenciesMS: []float64{3, 4, 7, 8}},
 						}
-						byteLabel = "others"
 					}
 					concurrency := float64(2)
 					expected := conformance.MetricsExpectation{
@@ -359,7 +383,7 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 							CollectionID: run.CollectionID, PlanID: run.PlanID, RunID: run.RunID,
 							EngineNo: run.AgentID, Zone: run.Zone,
 						},
-						Requests: requests, Bytes: map[string]float64{byteLabel: 15}, Concurrency: &concurrency,
+						Requests: requests, Bytes: map[string]float64{"k6": 15}, Concurrency: &concurrency,
 						Resources: conformance.ResourceExpectation{CPU: conformance.MeasurementAbsent, Memory: conformance.MeasurementAbsent},
 					}
 					for range 2 {
@@ -513,7 +537,10 @@ func TestInvalidCompleteCSVIsStickyUntilReset(t *testing.T) {
 			_, err = e.Observe(context.Background(), run)
 			require.ErrorIs(t, err, first)
 			putCSV(t, run, csvHeader+"http_req_duration,1,200,https://example.test/\n")
+			run.RunID = "recovered"
+			run.Metrics = nil
 			e.Reset(run)
+			e.launch(t, &run)
 			assert.Equal(t, uint64(1), single(t, collectAndGather(t, e), metricschema.RequestLatency).GetHistogram().GetSampleCount())
 		})
 	}
@@ -549,24 +576,34 @@ func TestFileLossTruncationAndReplacementFail(t *testing.T) {
 	}
 }
 
-func TestResetClearsIdentityCountersAndCursor(t *testing.T) {
+func TestNewRunIsolatesIdentityCountersAndCursor(t *testing.T) {
 	e, run := fixture(t, 0)
 	putCSV(t, run, csvHeader+"http_req_duration,12.5,0,https://example.test/old\ndata_received,120,,\nvus,3,,\n")
 	old := collectAndGather(t, e)
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.RequestLatency))["label"])
-	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.EgressBytesCounter))["label"])
+	assert.Equal(t, "k6", metricLabels(single(t, old, metricschema.EgressBytesCounter))["label"])
 	assert.Equal(t, "others", metricLabels(single(t, old, metricschema.StatusCounter))["label"])
 	assert.Equal(t, "Transport error (cause unavailable)", metricLabels(single(t, old, metricschema.StatusCounter))["status"])
+	oldRegistry := run.Metrics.Registry()
+	oldMetrics := scrapeRegistry(oldRegistry).Body.String()
 	next := run
 	next.RunID, next.CollectionID, next.PlanID, next.AgentID, next.Zone = "new-run", "new-collection", "new-plan", "new-agent", "new-zone"
+	next.Metrics = nil
 	putCSV(t, next, csvHeader+"http_req_duration,30,500,https://example.test/new\n")
 	e.Reset(next)
-	_, err := e.Observe(context.Background(), run)
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String(), "adapter Reset must not mutate SDK metrics")
+	state, err := e.Observe(context.Background(), next)
+	require.NoError(t, err)
+	require.Equal(t, protocol.ObservationPending, state)
+	e.launch(t, &next)
+	require.NotSame(t, oldRegistry, next.Metrics.Registry())
+	require.Empty(t, scrape(e).Body.String())
+	_, err = e.Observe(context.Background(), run)
 	require.ErrorContains(t, err, "active run")
 	require.ErrorContains(t, e.Collect(context.Background(), run), "active run")
 	all := collectAndGather(t, e)
-	// Callback routing needs only the run ID; Reset already supplied the CSV path.
-	state, err := e.Observe(context.Background(), agent.RunContext{RunID: next.RunID})
+	// Observe needs only the run ID; Collect also receives the launched recorder.
+	state, err = e.Observe(context.Background(), agent.RunContext{RunID: next.RunID})
 	require.NoError(t, err)
 	assert.Equal(t, protocol.ObservationReady, state)
 	hist := single(t, all, metricschema.RequestLatency)
@@ -591,18 +628,56 @@ func TestResetClearsIdentityCountersAndCursor(t *testing.T) {
 			assert.Equal(t, "new-zone", labels["zone"])
 		}
 	}
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String(), "new samples must not change the retained old registry")
 }
 
-func TestLabelBudgetValidationAndUnpreparedExporter(t *testing.T) {
-	_, err := New(-1, agent.NewMetricsRegistry())
-	require.Error(t, err)
-	_, err = New(10, nil)
-	require.Error(t, err)
-	e, err := New(10, agent.NewMetricsRegistry())
-	require.NoError(t, err)
+func TestUnpreparedExporter(t *testing.T) {
+	e := &Exporter{}
 	require.Error(t, e.Collect(context.Background(), agent.RunContext{}))
-	_, err = e.Observe(context.Background(), agent.RunContext{})
+	_, err := e.Observe(context.Background(), agent.RunContext{})
 	require.Error(t, err)
+}
+
+func TestPrelaunchResetAndMissingRecorderDoNotConsumeCSV(t *testing.T) {
+	e := &exporterFixture{Exporter: &Exporter{}, budget: 1}
+	run := agent.RunContext{RunID: "prelaunch", ResultFile: filepath.Join(t.TempDir(), "k6.csv")}
+	putCSV(t, run, csvHeader+"http_req_duration,7,200,request\n"+RequestReceivedBytesMetric+",11,,request\n")
+	e.Reset(run)
+	require.Nil(t, run.Metrics)
+	require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
+	state, err := e.Observe(context.Background(), run)
+	require.NoError(t, err)
+	require.Equal(t, protocol.ObservationPending, state)
+	for range 2 {
+		require.ErrorContains(t, e.Collect(context.Background(), run), "recorder")
+		require.Zero(t, e.offset, "missing recorder must not consume even the CSV header")
+		state, err = e.Observe(context.Background(), run)
+		require.NoError(t, err, "missing recorder must not become a sticky CSV failure")
+		require.Equal(t, protocol.ObservationPending, state)
+	}
+	e.launch(t, &run)
+	all := collectAndGather(t, e)
+	assertRequestMetrics(t, all, map[string]requestMetrics{
+		"request": {count: 1, sum: 7, statuses: map[string]float64{"200": 1}},
+	})
+	assertReceivedBytes(t, all, map[string]float64{"request": 11})
+	require.Equal(t, all, collectAndGather(t, e), "launch must drain the untouched CSV exactly once")
+	state, err = e.Observe(context.Background(), run)
+	require.NoError(t, err)
+	require.Equal(t, protocol.ObservationReady, state)
+}
+
+func TestResetDoesNotMutateSuppliedRecorder(t *testing.T) {
+	e, run := fixture(t, 1)
+	putCSV(t, run, csvHeader+"http_req_duration,7,200,request\ndata_received,11,,\nvus,2,,\n")
+	collectAndGather(t, e)
+	registry := run.Metrics.Registry()
+	before := scrapeRegistry(registry).Body.String()
+	e.Reset(run)
+	require.Equal(t, before, scrapeRegistry(registry).Body.String())
+	state, err := e.Observe(context.Background(), run)
+	require.NoError(t, err)
+	require.Equal(t, protocol.ObservationPending, state, "Reset clears adapter readiness only")
 }
 
 func TestCanceledObservationDoesNotPoisonRun(t *testing.T) {
@@ -624,15 +699,21 @@ func TestConcurrentObservationAndScrapeDoNotDoubleCount(t *testing.T) {
 	e, run := fixture(t, 10)
 	putCSV(t, run, csvHeader+strings.Repeat("http_req_duration,12.5,200,https://example.test/concurrent\n", 100))
 	var group sync.WaitGroup
-	errorsSeen := make(chan error, 20)
+	errorsSeen := make(chan error, 21)
+	start := make(chan struct{})
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		<-start
+		errorsSeen <- e.Collect(context.Background(), run)
+	}()
 	for index := range 20 {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			switch index % 3 {
+			<-start
+			switch index % 2 {
 			case 0:
-				errorsSeen <- e.Collect(context.Background(), run)
-			case 1:
 				_, err := e.Observe(context.Background(), run)
 				errorsSeen <- err
 			default:
@@ -645,6 +726,7 @@ func TestConcurrentObservationAndScrapeDoNotDoubleCount(t *testing.T) {
 			}
 		}()
 	}
+	close(start)
 	group.Wait()
 	close(errorsSeen)
 	for err := range errorsSeen {
@@ -653,4 +735,86 @@ func TestConcurrentObservationAndScrapeDoNotDoubleCount(t *testing.T) {
 	hist := single(t, collectAndGather(t, e), metricschema.RequestLatency).GetHistogram()
 	assert.Equal(t, uint64(100), hist.GetSampleCount())
 	assert.Equal(t, float64(1250), hist.GetSampleSum())
+}
+
+type collectionGateContext struct {
+	context.Context
+	gate func()
+}
+
+func (c collectionGateContext) Err() error {
+	if err := c.Context.Err(); err != nil {
+		return err
+	}
+	c.gate()
+	return c.Context.Err()
+}
+
+func TestObservationDoesNotWaitForCollection(t *testing.T) {
+	e, run := fixture(t, 1)
+	putCSV(t, run, csvHeader+"http_req_duration,12.5,200,request\nvus,invalid,,\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	entered, release := make(chan struct{}), make(chan struct{})
+	paused := false
+	collectionContext := collectionGateContext{Context: ctx, gate: func() {
+		if paused {
+			return
+		}
+		families, err := run.Metrics.Registry().Gather()
+		if err != nil {
+			t.Errorf("gather before pausing collection: %v", err)
+			return
+		}
+		for _, family := range families {
+			if family.GetName() != metricschema.RequestLatency {
+				continue
+			}
+			paused = true
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return
+		}
+	}}
+	collectionResult := make(chan error, 1)
+	collectionDone, observationDone := make(chan struct{}), make(chan struct{})
+	type observationResult struct {
+		state protocol.Observation
+		err   error
+	}
+	observed := make(chan observationResult, 1)
+	t.Cleanup(func() {
+		cancel()
+		<-collectionDone
+		<-observationDone
+	})
+	go func() {
+		defer close(collectionDone)
+		collectionResult <- e.Collect(collectionContext, run)
+	}()
+	go func() {
+		defer close(observationDone)
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			return
+		}
+		state, err := e.Observe(context.Background(), run)
+		observed <- observationResult{state: state, err: err}
+	}()
+	select {
+	case result := <-observed:
+		require.NoError(t, result.err)
+		require.Equal(t, protocol.ObservationReady, result.state, "readiness must be visible before the drain finishes")
+	case <-time.After(5 * time.Second):
+		t.Fatal("observation waited for the paused CSV collection")
+	}
+	close(release)
+	collectionErr := <-collectionResult
+	require.ErrorContains(t, collectionErr, "invalid vus sample")
+	state, err := e.Observe(context.Background(), run)
+	require.ErrorIs(t, err, collectionErr, "a later parsing failure must supersede readiness")
+	require.Equal(t, protocol.ObservationPending, state)
 }

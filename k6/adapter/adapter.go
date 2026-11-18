@@ -19,8 +19,8 @@ import (
 	"github.com/reqfleet/engine-sdk/protocol"
 )
 
-// Reporter coordinates run resets with readiness. The metrics exporter also
-// synchronizes these methods with its SDK-scheduled collection callback.
+// Reporter configures run-local ingestion before launch and exposes readiness.
+// Reset and configuration require quiesced callbacks; Observe may overlap collection.
 type Reporter interface {
 	Reset(agent.RunContext)
 	ConfigureReceivedBytes(agent.RunContext, string) error

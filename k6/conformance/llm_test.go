@@ -129,7 +129,7 @@ func llmTimingFixtures(artifacts map[string]string) []conformance.BudgetScenario
 		{Name: "llm-overflow", LabelLimit: 1, Fixture: fixture, MinimumRequests: 5,
 			RequestLabels: []string{conformance.TargetURL + "/llm/seed", "others"}, ByteLabels: []string{"k6"}},
 		{Name: "llm-zero", LabelLimit: 0, Fixture: fixture, MinimumRequests: 5,
-			RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
+			RequestLabels: []string{"others"}, ByteLabels: []string{"k6"}},
 	}
 }
 
@@ -247,7 +247,7 @@ func runLLMTimingScenarios(t *testing.T, runtime *conformance.Runtime) {
 				status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
 				require.Equal(t, protocol.FailureStartup, status.FailurePhase)
 				body := scrape(t, runtime.Client)
-				require.NotContains(t, body, `run_id="1706"`, "failed preparation must clear prior measurements")
+				require.NotContains(t, body, `run_id="1706"`, "accepting a new run clears prior measurements even if preparation fails")
 				require.NotContains(t, body, `run_id="`+id+`"`, "invalid selection must not launch or report samples")
 			})
 		}

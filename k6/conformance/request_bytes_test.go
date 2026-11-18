@@ -236,7 +236,7 @@ func runRequestByteScenarios(t *testing.T, runtime *conformance.Runtime) {
 		status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
 		require.Equal(t, protocol.FailureStartup, status.FailurePhase)
 		require.Contains(t, status.ErrorMessage, "receivedBytes")
-		require.NotContains(t, scrape(t, runtime.Client), `run_id="1605"`, "failed preparation clears the preceding run's measurements")
+		require.NotContains(t, scrape(t, runtime.Client), `run_id="1605"`, "accepting a new run clears prior measurements even if preparation fails")
 	}
 	for index, failure := range []struct{ name, diagnostic string }{
 		{"missing-url", "missing received bytes request URL"},
