@@ -37,6 +37,15 @@ RUN case "$TARGETARCH" in amd64|arm64) ;; *) exit 1 ;; esac && \
 # Distribute corresponding upstream source (including its licenses) alongside k6.
 RUN curl -fsSL "https://github.com/grafana/k6/archive/refs/tags/${K6_VERSION}.tar.gz" -o "k6-${K6_VERSION}-source.tar.gz" && \
     curl -fsSL "https://raw.githubusercontent.com/grafana/k6/${K6_VERSION}/LICENSE.md" -o K6_LICENSE
+# k6 vendors generated dashboard assets, not their original UI/report sources.
+# Resolve the matching upstream source from the selected engine's vendor manifest.
+RUN dashboard_version="$(tar -xzOf "k6-${K6_VERSION}-source.tar.gz" "k6-${K6_VERSION#v}/vendor/modules.txt" | \
+      awk '$1 == "#" && $2 == "github.com/grafana/xk6-dashboard-assets" { print $3 }')" && \
+    test -n "$dashboard_version" && \
+    curl -fsSL "https://github.com/grafana/xk6-dashboard-assets/archive/refs/tags/${dashboard_version}.tar.gz" \
+      -o "xk6-dashboard-assets-${dashboard_version}-source.tar.gz" && \
+    tar -xzOf "xk6-dashboard-assets-${dashboard_version}-source.tar.gz" \
+      "xk6-dashboard-assets-${dashboard_version#v}/LICENSE" > XK6_DASHBOARD_ASSETS_LICENSE
 
 FROM debian:bookworm-slim AS base
 ARG K6_VERSION
@@ -45,6 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     chown -R 65532:65532 /test-data /shibuya-agent
 COPY --from=engine /usr/local/bin/k6 /usr/local/bin/k6
 COPY --from=engine /download/k6-${K6_VERSION}-source.tar.gz /download/K6_LICENSE /usr/share/licenses/engine-adapters/
+COPY --from=engine /download/xk6-dashboard-assets-*-source.tar.gz /download/XK6_DASHBOARD_ASSETS_LICENSE /usr/share/licenses/engine-adapters/
 COPY --from=build /out/k6-adapter /usr/local/bin/k6-adapter
 COPY --from=build /out/SDK_THIRD_PARTY_NOTICES /usr/share/licenses/engine-adapters/
 COPY LICENSE NOTICE /usr/share/licenses/engine-adapters/

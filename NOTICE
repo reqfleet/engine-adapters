@@ -22,4 +22,9 @@ Copyright Grafana Labs and k6 contributors; retain upstream source notices.
 Upstream: https://github.com/grafana/k6
 The image includes K6_LICENSE and the selected release's versioned source archive under
 /usr/share/licenses/engine-adapters/, alongside SDK_THIRD_PARTY_NOTICES.
+The embedded Grafana xk6-dashboard-assets are also licensed under AGPLv3.
+Their matching versioned upstream source archive and XK6_DASHBOARD_ASSETS_LICENSE
+are included in the same directory, preserving the original UI/report sources
+and build inputs omitted from k6's vendored generated assets.
+Upstream: https://github.com/grafana/xk6-dashboard-assets
 No k6 source is linked into the adapter executable.
