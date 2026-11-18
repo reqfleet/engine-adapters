@@ -166,11 +166,11 @@ export default function(){
 			{Name: "overflow", LabelLimit: 4, Fixture: fixture, MinimumRequests: 14,
 				RequestLabels: []string{conformance.TargetURL + "/200", conformance.TargetURL + "/200?item=a", conformance.TargetURL + "/200?item=b", conformance.TargetURL + "/500", "others"}, ByteLabels: []string{"k6"}},
 			{Name: "zero", LabelLimit: 0, Fixture: fixture, MinimumRequests: 14,
-				RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
+				RequestLabels: []string{"others"}, ByteLabels: []string{"k6"}},
 			{Name: "byte-limit", LabelLimit: 3, Fixture: longLabels, MinimumRequests: 14,
 				RequestLabels: []string{boundaryURL, conformance.TargetURL + "/500", groupedPrefix}, ByteLabels: []string{"k6"}},
 			{Name: "byte-limit-zero", LabelLimit: 0, Fixture: longLabels, MinimumRequests: 14,
-				RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
+				RequestLabels: []string{"others"}, ByteLabels: []string{"k6"}},
 		}, append(append(byteCases, llmCases...), tpsCases...)...),
 		Scenarios: func(t *testing.T, runtime *conformance.Runtime) {
 			runK6Scenarios(t, runtime, requests, inflight, inflightEnded, firstSource)
@@ -248,6 +248,7 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 	terminal("1999", protocol.RunCanceled, proofWait)
 	require.Equal(t, before, runtime.Downloads())
 	require.Len(t, requests.snapshot(), requestCount, "duplicate start must not execute")
+	require.Equal(t, firstTotals, compareCSV(t, client, csvPath, "1001"), "duplicate starts and stale stops must retain the published run")
 
 	start("1002", "second.js", "1", "")
 	running("1002")
@@ -266,16 +267,20 @@ func runK6Scenarios(t *testing.T, runtime *conformance.Runtime, requests *proofR
 		require.Equal(t, "second", request.Plan)
 	}
 
-	start("1003", "first.js", "invalid", "")
-	status := terminal("1003", protocol.RunFailed, proofWait)
+	start("1003", runtime.BlockedFile(), "1", "")
+	runtime.AwaitDownload(t)
+	body = scrape(t, client)
+	require.NotContains(t, body, `run_id="1002"`, "accepting a new run clears prior metrics before artifact staging finishes")
+	require.NotContains(t, body, `run_id="1003"`, "staging must not publish a prelaunch recorder")
+	stop("1003")
+	terminal("1003", protocol.RunCanceled, proofWait)
+	runtime.AwaitDownloadCancellation(t)
+	start("1004", "first.js", "invalid", "")
+	status := terminal("1004", protocol.RunFailed, proofWait)
 	require.Equal(t, protocol.FailureStartup, status.FailurePhase)
 	require.Contains(t, status.ErrorMessage, "concurrency")
+	require.NotContains(t, scrape(t, client), `run_id="1004"`, "failed preparation must not publish measurements")
 	require.NoFileExists(t, filepath.Join(root, "run-tmp", "entry.js"))
-	start("1004", runtime.BlockedFile(), "1", "")
-	runtime.AwaitDownload(t)
-	stop("1004")
-	terminal("1004", protocol.RunCanceled, proofWait)
-	runtime.AwaitDownloadCancellation(t)
 	start("1005", "inflight.js", "1", "")
 	awaitProofEvent(t, inflight, "in-flight request")
 	stop("1005")
@@ -478,11 +483,7 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 	bytes := map[string]float64{}
 	tokenCounts := map[string]uint64{}
 	if source == metrics.DataReceivedMetric {
-		label := "k6"
-		if labelLimit == 0 {
-			label = "others"
-		}
-		bytes[label] = 0
+		bytes["k6"] = 0
 	}
 	admit := func(label string) (string, bool) {
 		if label == "" || len(label) >= 1024 {
@@ -582,8 +583,6 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 				if !valid {
 					continue
 				}
-			} else if labelLimit == 0 {
-				label = "others"
 			}
 			bytes[label] += value
 			expected.bytes += value

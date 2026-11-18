@@ -227,8 +227,7 @@ func TestTPSRejectsInvalidAndNonUnitSelectedPoints(t *testing.T) {
 }
 
 func TestTPSConfigurationAndDisable(t *testing.T) {
-	exporter, err := New(1, agent.NewMetricsRegistry())
-	require.NoError(t, err)
+	exporter := &Exporter{}
 	require.ErrorContains(t, exporter.ConfigureTPS(agent.RunContext{}, metricschema.LLMTokenEventsMetric), "active run")
 	e, run := fixture(t, 1)
 	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
@@ -238,14 +237,17 @@ func TestTPSConfigurationAndDisable(t *testing.T) {
 	require.ErrorContains(t, e.ConfigureTPS(agent.RunContext{RunID: "stale"}, ""), "active run")
 	putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+",1,,\n")
 	assertStatusSamples(t, collectAndGather(t, e), map[string]map[string]float64{"tps": {"200": 1}})
+	run.RunID = "disabled"
+	run.Metrics = nil
 	e.Reset(run)
+	e.launch(t, &run)
 	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
 	require.NoError(t, e.ConfigureTPS(run, ""))
 	putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+",1,,\n"+metricschema.LLMTokenEventsMetric+",NaN,,\n")
 	require.Empty(t, collectAndGather(t, e))
 }
 
-func TestTPSResetClearsSelectionIdentityAndAdmission(t *testing.T) {
+func TestTPSNewRunResetsSelectionIdentityAndAdmission(t *testing.T) {
 	e, run := fixture(t, 3)
 	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
 	require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
@@ -257,8 +259,13 @@ func TestTPSResetClearsSelectionIdentityAndAdmission(t *testing.T) {
 	assertTimingSamples(t, all, metricschema.RequestLatency, map[string][]float64{"ttft": {3}})
 	assertTimingSamples(t, all, metricschema.LLMResponseLatency, map[string][]float64{"llm_resp": {15000}})
 	previous := run
+	oldRegistry := previous.Metrics.Registry()
+	oldMetrics := scrapeRegistry(oldRegistry).Body.String()
 	run.RunID, run.CollectionID, run.PlanID, run.AgentID, run.Zone = "next", "next-collection", "next-plan", "next-agent", "next-zone"
+	run.Metrics = nil
 	e.Reset(run)
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
+	e.launch(t, &run)
 	require.Empty(t, scrape(e).Body.String())
 	require.Error(t, e.ConfigureTPS(previous, metricschema.LLMTokenEventsMetric))
 	require.Error(t, e.ConfigureReceivedBytes(previous, RequestReceivedBytesMetric))
@@ -286,13 +293,17 @@ func TestTPSResetClearsSelectionIdentityAndAdmission(t *testing.T) {
 			require.Equal(t, run.Zone, labels["zone"])
 		}
 	}
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
 	// Re-enabling in a fresh run starts at one, never at the previous token total.
 	run.RunID = "tokens-again"
+	run.Metrics = nil
 	e.Reset(run)
+	e.launch(t, &run)
 	require.NoError(t, e.ConfigureTPS(run, metricschema.LLMTokenEventsMetric))
 	putCSV(t, run, csvHeader+metricschema.LLMTokenEventsMetric+",1,,\n")
 	all = collectAndGather(t, e)
 	assertStatusSamples(t, all, map[string]map[string]float64{"tps": {"200": 1}})
 	require.Len(t, all, 1)
 	require.Equal(t, run.RunID, metricLabels(single(t, all, metricschema.StatusCounter))["run_id"])
+	require.Equal(t, oldMetrics, scrapeRegistry(oldRegistry).Body.String())
 }

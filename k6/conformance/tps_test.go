@@ -216,7 +216,7 @@ export default function(){if(__ITER>0){sleep(0.1);return;}value.add(%g);http.get
 		{Name: "tps-overflow", LabelLimit: 1, Fixture: fixture, MinimumRequests: 8,
 			RequestLabels: []string{conformance.TargetURL + "/tps/seed", "others"}, ByteLabels: []string{"k6"}},
 		{Name: "tps-zero", LabelLimit: 0, Fixture: fixture, MinimumRequests: 8,
-			RequestLabels: []string{"others"}, ByteLabels: []string{"others"}},
+			RequestLabels: []string{"others"}, ByteLabels: []string{"k6"}},
 	}
 }
 
@@ -390,7 +390,7 @@ func runTPSScenarios(t *testing.T, runtime *conformance.Runtime) {
 			status := runtime.Terminal(t, id, protocol.RunFailed, proofWait)
 			require.Contains(t, status.ErrorMessage, "tps")
 			body := scrape(t, runtime.Client)
-			require.NotContains(t, body, `run_id="1863"`, "failed preparation must clear preceding run measurements")
+			require.NotContains(t, body, `run_id="1863"`, "accepting a new run clears prior measurements even if preparation fails")
 			require.NotContains(t, body, `run_id="`+id+`"`, "invalid selection must not launch or report samples")
 		})
 	}
@@ -421,7 +421,7 @@ func runTPSScenarios(t *testing.T, runtime *conformance.Runtime) {
 			runtime.Start(t, id, conformance.Fixture{File: fmt.Sprintf("tps-gap-selector-%d.js", index), Settings: settings})
 			runtime.Terminal(t, id, protocol.RunFailed, proofWait)
 			body := scrape(t, runtime.Client)
-			require.NotContains(t, body, `run_id="1893"`, "failed preparation must clear previous measurements")
+			require.NotContains(t, body, `run_id="1893"`, "accepting a new run clears prior measurements even if preparation fails")
 			require.NotContains(t, body, `run_id="`+id+`"`)
 		})
 	}

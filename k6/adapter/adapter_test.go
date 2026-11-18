@@ -154,9 +154,7 @@ func TestInterTokenInspectionSelection(t *testing.T) {
 	for _, option := range []string{`{}`, `{"interToken":""}`, `{"interToken":"llm_inter_token_duration"}`, `{"interToken":"wrong"}`, `{"interToken":null}`, `{"interToken":1}`, `{"interToken":true}`, `{"interToken":[]}`, `{"interToken":{}}`} {
 		t.Run(option, func(t *testing.T) {
 			run := fixture(t)
-			registry := agent.NewMetricsRegistry()
-			exporter, err := metrics.New(10, registry)
-			require.NoError(t, err)
+			exporter := &metrics.Exporter{}
 			a := New(exporter)
 			a.executable = filepath.Join(t.TempDir(), "k6")
 			inspect := func(options string) {
@@ -167,7 +165,7 @@ func TestInterTokenInspectionSelection(t *testing.T) {
 			inspect(`{"interToken":"llm_inter_token_duration"}`)
 			require.NoError(t, a.BeforeStart(context.Background(), run))
 			inspect(option)
-			err = a.BeforeStart(context.Background(), run)
+			err := a.BeforeStart(context.Background(), run)
 			valid := option == `{}` || option == `{"interToken":""}` || option == `{"interToken":"llm_inter_token_duration"}`
 			if !valid {
 				require.Error(t, err)
@@ -180,9 +178,12 @@ func TestInterTokenInspectionSelection(t *testing.T) {
 			inspect(`{"interToken":"wrong"}`)
 			_, err = a.BuildCommand(context.Background(), run)
 			require.NoError(t, err)
+			require.Nil(t, run.Metrics, "prelaunch hooks must not need a recorder")
+			run.Metrics, err = agent.NewMetricsRecorder(run, 10)
+			require.NoError(t, err)
 			require.NoError(t, os.WriteFile(run.ResultFile, []byte("metric_name,metric_value,status,url\nllm_inter_token_duration,2.5,,\n"), 0600))
 			require.NoError(t, exporter.Collect(context.Background(), run))
-			all, err := registry.Gather()
+			all, err := run.Metrics.Registry().Gather()
 			require.NoError(t, err)
 			if option == `{"interToken":"llm_inter_token_duration"}` {
 				require.Len(t, all, 1)

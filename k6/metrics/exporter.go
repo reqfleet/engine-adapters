@@ -32,14 +32,14 @@ const (
 	RequestReceivedBytesMetric = "request_received_bytes"
 )
 
-// Exporter owns CSV ingestion state and a run-scoped SDK metrics recorder.
-// No reader or goroutine survives Collect; callbacks share the same state lock.
+// Exporter owns CSV ingestion state; the SDK supplies each run's recorder.
+// Call Reset on the zero value before configuring or collecting a run.
+// The SDK serializes collection and joins callbacks before resetting for reuse.
+// Only readiness and errors are shared with Observe. No reader or goroutine
+// survives Collect.
 type Exporter struct {
-	mu                                                         sync.Mutex
-	byteLabel                                                  string
 	receivedBytesSource                                        string
 	llmResponseSource, ttftSource, tpsSource, interTokenSource string
-	recorder                                                   *agent.MetricsRecorder
 	runID, resultFile                                          string
 	active                                                     bool
 	offset                                                     int64
@@ -48,34 +48,18 @@ type Exporter struct {
 	columns                                                    int
 	nameIndex, valueIndex, statusIndex, urlIndex               int
 	errorCodeIndex                                             int
-	ready                                                      bool
-	failure                                                    error
+
+	// Collect is the only status writer after launch and can read its own values.
+	// statusMu publishes transitions to concurrent Observe calls.
+	statusMu sync.Mutex
+	ready    bool
+	failure  error
 }
 
-// New validates the per-run URL label budget and uses the SDK's collectors.
-// Additional URLs use the reserved overflow label, including request-attributed bytes.
-func New(labelLimit int, registry *agent.MetricsRegistry) (*Exporter, error) {
-	recorder, err := agent.NewMetricsRecorder(registry, labelLimit)
-	if err != nil {
-		return nil, err
-	}
-	e := &Exporter{
-		byteLabel:           "k6",
-		recorder:            recorder,
-		receivedBytesSource: DataReceivedMetric,
-	}
-	if labelLimit == 0 {
-		e.byteLabel = metricschema.OverflowRequestName
-	}
-	return e, nil
-}
-
-// Reset binds the assigned run identity and clears SDK reporting and CSV state.
-// The SDK must finish prior-run collection before calling it in BeforeStart.
-// Call even when later adapter settings validation fails, to retire old metrics.
+// Reset prepares CSV state for the assigned run without changing SDK metrics.
+// The SDK finishes prior-run collection before BeforeStart, where no recorder
+// is available yet.
 func (e *Exporter) Reset(run agent.RunContext) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.runID, e.resultFile = run.RunID, run.ResultFile
 	e.active = true
 	e.receivedBytesSource = DataReceivedMetric
@@ -84,15 +68,14 @@ func (e *Exporter) Reset(run agent.RunContext) {
 	e.fileInfo = nil
 	e.nameIndex, e.valueIndex, e.statusIndex, e.urlIndex = 0, 0, 0, 0
 	e.errorCodeIndex = -1
+	e.statusMu.Lock()
 	e.ready, e.failure = false, nil
-	e.recorder.Reset(run)
+	e.statusMu.Unlock()
 }
 
 // ConfigureReceivedBytes selects the run's only byte counter before launch.
 // Empty retains aggregate bytes; the custom source uses explicit URL attribution.
 func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if !e.matchesRun(run) {
 		return errors.New("received bytes configuration does not match the active run")
 	}
@@ -110,8 +93,6 @@ func (e *Exporter) ConfigureReceivedBytes(run agent.RunContext, source string) e
 // ConfigureTPS selects independent received-token observations before launch.
 // Empty disables TPS; each selected point must represent exactly one token.
 func (e *Exporter) ConfigureTPS(run agent.RunContext, source string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if !e.matchesRun(run) {
 		return errors.New("TPS configuration does not match the active run")
 	}
@@ -125,8 +106,6 @@ func (e *Exporter) ConfigureTPS(run agent.RunContext, source string) error {
 // ConfigureLLMTimings selects independent timing sources before launch.
 // Empty selectors disable the corresponding measurement for this run.
 func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft, interToken string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if !e.matchesRun(run) {
 		return errors.New("LLM timing configuration does not match the active run")
 	}
@@ -145,14 +124,14 @@ func (e *Exporter) ConfigureLLMTimings(run agent.RunContext, response, ttft, int
 
 // Observe reads cached readiness without collecting or changing the active run.
 func (e *Exporter) Observe(ctx context.Context, run agent.RunContext) (protocol.Observation, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return protocol.ObservationPending, err
 	}
 	if !e.matchesRun(run) {
 		return protocol.ObservationPending, errors.New("metrics observation does not match the active run")
 	}
+	e.statusMu.Lock()
+	defer e.statusMu.Unlock()
 	if e.failure != nil {
 		return protocol.ObservationPending, e.failure
 	}
@@ -162,15 +141,18 @@ func (e *Exporter) Observe(ctx context.Context, run agent.RunContext) (protocol.
 	return protocol.ObservationReady, nil
 }
 
-// Collect drains complete CSV records into the SDK registry. The SDK joins live
-// calls before the final post-exit call and retains the metrics until Reset.
+// Collect drains complete CSV records into the supplied run's SDK recorder.
+// The SDK joins live calls before the final post-exit call and retains completed
+// metrics until a new run ID is accepted.
+// Calls must be serialized; reset and source configuration must not overlap callbacks.
 func (e *Exporter) Collect(ctx context.Context, run agent.RunContext) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if !e.matchesRun(run) {
 		return errors.New("metrics collection does not match the active run")
 	}
-	return e.drain(ctx)
+	if run.Metrics == nil {
+		return errors.New("metrics collection requires a launched run recorder")
+	}
+	return e.drain(ctx, run.Metrics)
 }
 
 // matchesRun guards the CSV cursor against callbacks for another run.
@@ -180,7 +162,9 @@ func (e *Exporter) matchesRun(run agent.RunContext) bool {
 }
 
 func (e *Exporter) fail(err error) error {
+	e.statusMu.Lock()
 	e.failure = err
+	e.statusMu.Unlock()
 	return err
 }
 
@@ -201,7 +185,7 @@ func (r growingCSV) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (e *Exporter) drain(ctx context.Context) error {
+func (e *Exporter) drain(ctx context.Context, recorder *agent.MetricsRecorder) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -255,7 +239,7 @@ func (e *Exporter) drain(ctx context.Context) error {
 			if err := e.header(record); err != nil {
 				return e.fail(err)
 			}
-		} else if err := e.point(record); err != nil {
+		} else if err := e.point(record, recorder); err != nil {
 			return e.fail(fmt.Errorf("k6 CSV at offset %d: %w", e.offset, err))
 		}
 		e.offset = base + reader.InputOffset()
@@ -287,7 +271,7 @@ func (e *Exporter) header(record []string) error {
 	return nil
 }
 
-func (e *Exporter) point(record []string) error {
+func (e *Exporter) point(record []string, recorder *agent.MetricsRecorder) error {
 	name := record[e.nameIndex]
 	if name != "http_req_duration" && name != "vus" && name != e.receivedBytesSource &&
 		(name == "" || (name != e.llmResponseSource && name != e.ttftSource && name != e.tpsSource && name != e.interTokenSource)) {
@@ -325,28 +309,28 @@ func (e *Exporter) point(record []string) error {
 			}
 		}
 		metric.Label, metric.Status, metric.Latency = url, status, value
-		if err := e.recorder.ObserveRequest(metric); err != nil {
+		if err := recorder.ObserveRequest(metric); err != nil {
 			// Recorder label rejection drops the whole sample without
 			// admitting its name, marking readiness, or failing the run.
 			return nil
 		}
 	case metricschema.LLMResponseDurationMetric:
-		if err := e.recorder.ObserveLLMResponse(value); err != nil {
+		if err := recorder.ObserveLLMResponse(value); err != nil {
 			return err
 		}
 	case metricschema.LLMTimeToFirstTokenMetric:
-		if err := e.recorder.ObserveTTFT(value); err != nil {
+		if err := recorder.ObserveTTFT(value); err != nil {
 			return err
 		}
 	case metricschema.LLMInterTokenDurationMetric:
-		if err := e.recorder.ObserveInterTokenLatency(value); err != nil {
+		if err := recorder.ObserveInterTokenLatency(value); err != nil {
 			return err
 		}
 	case metricschema.LLMTokenEventsMetric:
 		if value != 1 {
 			return fmt.Errorf("invalid %s sample %q: expected exactly one received token", name, record[e.valueIndex])
 		}
-		if err := e.recorder.RecordReceivedToken(); err != nil {
+		if err := recorder.RecordReceivedToken(); err != nil {
 			return err
 		}
 	case "vus":
@@ -354,10 +338,10 @@ func (e *Exporter) point(record []string) error {
 			return fmt.Errorf("invalid fractional vus sample %q", record[e.valueIndex])
 		}
 		metric.Threads = value
-		e.recorder.SetConcurrency(metric)
+		recorder.SetConcurrency(metric)
 	case DataReceivedMetric:
-		metric.Label, metric.EgressBytes = e.byteLabel, value
-		if err := e.recorder.AddAggregateReceivedBytes(metric); err != nil {
+		metric.Label, metric.EgressBytes = "k6", value
+		if err := recorder.AddAggregateReceivedBytes(metric); err != nil {
 			return err
 		}
 	case RequestReceivedBytesMetric:
@@ -366,12 +350,16 @@ func (e *Exporter) point(record []string) error {
 			return errors.New("missing received bytes request URL")
 		}
 		metric.Label, metric.EgressBytes = url, value
-		if err := e.recorder.AddReceivedBytes(metric); err != nil {
+		if err := recorder.AddReceivedBytes(metric); err != nil {
 			// Match request sample rejection: no admission, readiness or failure.
 			return nil
 		}
 	}
-	e.ready = true
+	if !e.ready {
+		e.statusMu.Lock()
+		e.ready = true
+		e.statusMu.Unlock()
+	}
 	return nil
 }
 
