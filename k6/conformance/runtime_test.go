@@ -105,8 +105,8 @@ export default function(){http.get('http://127.0.0.1:18080/timeout',{timeout:'10
 export default function(){http.get('http://127.0.0.1:18080/200',{tags:{name:'others'}});for(const path of ['/200','/200','/200?item=a','/200?item=b','/500','/overflow','/overflow?item=c'])http.get('http://127.0.0.1:18080'+path);sleep(0.2);}`)
 	// Oversized URLs and custom names must not merge into their valid prefixes.
 	boundaryPrefix := conformance.TargetURL + "/200?padding="
-	boundaryURL := boundaryPrefix + strings.Repeat("a", 255-len(boundaryPrefix))
-	groupedPrefix := "group/" + strings.Repeat("界", 82) + "ab"
+	boundaryURL := boundaryPrefix + strings.Repeat("a", metricschema.MaxRequestLabelBytes-len(boundaryPrefix))
+	groupedPrefix := "group/" + strings.Repeat("界", (metricschema.MaxRequestLabelBytes-len("group/ab"))/len("界")) + "ab"
 	add("long-labels.js", fmt.Sprintf(`import http from 'k6/http'; import {sleep} from 'k6';
 const urls=[%q,%q,%q,%q,%q];
 const names=[%q,%q,%q];
@@ -486,7 +486,7 @@ func compareCSVSnapshotSelection(t *testing.T, client *http.Client, filename, ru
 		bytes["k6"] = 0
 	}
 	admit := func(label string) (string, bool) {
-		if label == "" || len(label) > 255 {
+		if label == "" || len(label) > metricschema.MaxRequestLabelBytes {
 			return "", false
 		}
 		if label != "others" && !admitted[label] {
