@@ -336,7 +336,7 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 				for _, revision := range []string{"first", "second"} {
 					// A different boundary URL must claim the slot in the next run.
 					prefix := "https://example.test/" + revision + "/"
-					padding := 1023 - len(prefix)
+					padding := 255 - len(prefix)
 					valid := prefix + strings.Repeat(encoding.character, padding/len(encoding.character)) +
 						strings.Repeat("a", padding%len(encoding.character))
 					atLimit, overLimit := valid+"b", valid+"bc"
@@ -399,8 +399,8 @@ func TestURLByteLimitRejectsOversizedSamplesBeforeAdmission(t *testing.T) {
 
 func TestURLByteLimitPreservesUTF8GroupingNames(t *testing.T) {
 	e, run := fixture(t, 2)
-	// Reject 1024- and 1025-byte names rather than trimming their final rune.
-	first := strings.Repeat("界", 340) + "a"
+	// Reject 256- and 257-byte names rather than trimming their final rune.
+	first := strings.Repeat("界", 84) + "a"
 	second := first + "a"
 	putCSV(t, run, csvHeader+fmt.Sprintf(
 		"http_req_duration,1,200,%s界\n"+

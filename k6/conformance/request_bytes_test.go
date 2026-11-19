@@ -33,8 +33,8 @@ type requestByteCase struct {
 
 func requestByteCases() []requestByteCase {
 	base := conformance.TargetURL + "/request-bytes"
-	boundary := "boundary/" + strings.Repeat("a", 1023-len("boundary/"))
-	multibyte := strings.Repeat("界", 341)
+	boundary := "boundary/" + strings.Repeat("a", 255-len("boundary/"))
+	multibyte := strings.Repeat("界", 85)
 	return []requestByteCase{
 		{base + "/binary", "others", len(requestByteBinary)},
 		{base + "/binary", base + "/binary", len(requestByteBinary)},
@@ -153,7 +153,7 @@ func assertRequestByteBodies(t *testing.T, runtime *conformance.Runtime, run str
 	var expectedRequests uint64 = 1 // The uninstrumented completion request.
 	for _, item := range requestByteCases() {
 		wantSamples[item.Label] = append(wantSamples[item.Label], float64(item.Size))
-		if len(item.Label) < 1024 {
+		if len(item.Label) <= 255 {
 			expectedTotal += float64(item.Size)
 			expectedRequests++
 		}
