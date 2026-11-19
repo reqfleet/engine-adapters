@@ -1,6 +1,6 @@
 # External engine adapters
 
-Independent, operator-managed engine adapters for Reqfleet Shibuya, built with the public [engine-sdk](https://github.com/reqfleet/engine-sdk). Each adapter translates assigned workload settings into engine-native configuration and maps engine output into Reqfleet metrics. The SDK handles coordinator communication, input downloads and process lifecycle.
+Independent, operator-managed engine adapters for Reqfleet Shibuya, built with the public [engine-sdk](https://github.com/reqfleet/engine-sdk). Each adapter translates assigned workload settings into engine-native configuration and maps engine output into Reqfleet metrics. The SDK handles coordinator communication, input downloads and process lifecycle; SDK-registry integrations also delegate collectors, request-name admission, resource sampling and metrics serving to it.
 
 ```mermaid
 flowchart TD
@@ -29,13 +29,13 @@ Build and test targets live in each adapter directory; Docker builds use the rep
 
 See [AGENTS.md](AGENTS.md) for detailed development, onboarding and release instructions, and the [k6 guide](k6/README.md) for supported plans, settings and metrics.
 
-New adapters reuse the [container conformance suite](AGENTS.md#reusable-adapter-conformance), supplying engine-native fixtures and expected metrics. Run it alongside adapter unit tests for either SDK metrics approach.
+New adapters reuse the [container conformance suite](AGENTS.md#reusable-adapter-conformance), supplying engine-native fixtures and expected metrics. Run it alongside adapter unit tests for the selected metrics integration.
 
 ### Add an engine with the skill
 
 Open this checkout in an agent that supports repository skills and invoke `develop-new-engine`. If it is not discovered automatically, ask the agent to read and follow [`.agents/skills/develop-new-engine/SKILL.md`](.agents/skills/develop-new-engine/SKILL.md):
 
-> Use develop-new-engine to add an adapter for my engine. Resolve the latest stable engine-sdk release, inspect the engine's output, and discuss request-event parsing versus normalized metrics with me before implementing reporting.
+> Use develop-new-engine to add an adapter for my engine. Resolve the latest stable engine-sdk release, inspect the engine's output, and discuss complete-request event parsing, independent samples through the SDK recorder, or normalized native metrics with me before implementing reporting.
 
 Bring the engine/version, a sample plan and the reports you need. The skill guides SDK integration, metric semantics, verification and Shibuya onboarding.
 
