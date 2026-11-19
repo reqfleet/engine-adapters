@@ -142,7 +142,8 @@ func TestCustomReceivedBytesRejectOversizedLabelsBeforeAdmission(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/budget=%d", character, budget), func(t *testing.T) {
 				e, run := fixture(t, budget)
 				require.NoError(t, e.ConfigureReceivedBytes(run, RequestReceivedBytesMetric))
-				valid := strings.Repeat(character, 255/len(character))
+				valid := strings.Repeat(character, metricschema.MaxRequestLabelBytes/len(character)) +
+					strings.Repeat("a", metricschema.MaxRequestLabelBytes%len(character))
 				atLimit, overLimit := valid+"b", valid+"界"
 				putCSV(t, run, csvHeader+fmt.Sprintf(
 					RequestReceivedBytesMetric+",100,,%s\n"+RequestReceivedBytesMetric+",200,,%s\n", atLimit, overLimit))
