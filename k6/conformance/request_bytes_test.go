@@ -17,6 +17,7 @@ import (
 
 	"github.com/reqfleet/engine-adapters/k6/metrics"
 	"github.com/reqfleet/engine-sdk/conformance"
+	"github.com/reqfleet/engine-sdk/metricschema"
 	"github.com/reqfleet/engine-sdk/protocol"
 	"github.com/stretchr/testify/require"
 )
@@ -33,8 +34,8 @@ type requestByteCase struct {
 
 func requestByteCases() []requestByteCase {
 	base := conformance.TargetURL + "/request-bytes"
-	boundary := "boundary/" + strings.Repeat("a", 1023-len("boundary/"))
-	multibyte := strings.Repeat("界", 341)
+	boundary := "boundary/" + strings.Repeat("a", metricschema.MaxRequestLabelBytes-len("boundary/"))
+	multibyte := strings.Repeat("界", metricschema.MaxRequestLabelBytes/len("界"))
 	return []requestByteCase{
 		{base + "/binary", "others", len(requestByteBinary)},
 		{base + "/binary", base + "/binary", len(requestByteBinary)},
@@ -153,7 +154,7 @@ func assertRequestByteBodies(t *testing.T, runtime *conformance.Runtime, run str
 	var expectedRequests uint64 = 1 // The uninstrumented completion request.
 	for _, item := range requestByteCases() {
 		wantSamples[item.Label] = append(wantSamples[item.Label], float64(item.Size))
-		if len(item.Label) < 1024 {
+		if len(item.Label) <= metricschema.MaxRequestLabelBytes {
 			expectedTotal += float64(item.Size)
 			expectedRequests++
 		}

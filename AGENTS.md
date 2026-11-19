@@ -52,7 +52,7 @@ k6 CSV rows contain independent metric samples:
 - Adapters using the SDK registry MUST NOT define duplicate collectors, instantiate a resource sampler, or maintain CPU baselines. The SDK owns the canonical metrics and resource collection; `resources` owns sampling policy and `containerstats` owns raw cgroup reads.
 - The SDK samples resources after launch, every five seconds and once after live monitors finish, then retains completed values without further reads. Baseline-only attempts omit both CPU and memory; complete samples publish both. Resource read failures warn and skip the update, retaining last-good values without failing HTTP or the workload.
 - CPU is average cores over the actual monotonic interval. Memory is cgroup-accounted bytes, including cache. Both measure every process in the container's cgroup, including the engine PID. Never add host/process fallbacks or fabricate zero usage.
-- Standalone native exporters remain responsible for their complete exposition and may use `resources.Sampler` directly. Native handler/URL modes do not also collect unused SDK resources. See the selected SDK's [resource reporting contract](https://github.com/reqfleet/engine-sdk/blob/6f58d2664c2651723a1afe05c5d6f867de6919aa/agent/metrics.md#runtime-resource-metrics).
+- Standalone native exporters remain responsible for their complete exposition and may use `resources.Sampler` directly. Native handler/URL modes do not also collect unused SDK resources. See the selected SDK's [resource reporting contract](https://github.com/reqfleet/engine-sdk/blob/v0.6.0/agent/metrics.md#runtime-resource-metrics).
 
 ## Use SDK-owned configuration and HTTP serving
 
@@ -144,10 +144,9 @@ The suite verifies adapter behavior through the public SDK protocol and `/metric
 
 ### Configuring the engine SDK version
 
-`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.5.1-0.20261118014957-6f58d2664c26`.
-This merged-main pin tracks unreleased SDK changes.
+`k6/Dockerfile` defaults to `ENGINE_SDK_VERSION=v0.6.0`, matching the released SDK in `go.mod`.
 It includes PR #47's run-scoped `RunContext.Metrics` and accepted-ID clearing.
-The snapshot also provides shared LLM source names, response/TTFT/inter-token timing, and token-receipt recording.
+The release also provides shared LLM source names, response/TTFT/inter-token timing, and token-receipt recording.
 It supplies assigned identity, canonical collectors, `CustomIngestMetrics` scheduling,
 final post-exit draining, ingestion-failure propagation, and the conformance toolkit.
 
@@ -155,8 +154,8 @@ The argument selects the SDK compiled into the adapter and conformance executabl
 
 ```sh
 docker build -f k6/Dockerfile --target runtime \
-  --build-arg ENGINE_SDK_VERSION=v0.5.1-0.20261118014957-6f58d2664c26 \
-  -t k6-adapter:sdk-6f58d26 .
+  --build-arg ENGINE_SDK_VERSION=v0.6.0 \
+  -t k6-adapter:sdk-v0.6.0 .
 ```
 
 Use an exact Go release version or pseudo-version.
@@ -166,7 +165,7 @@ Missing required SDK APIs fail compilation.
 
 The override changes module files only inside the Docker build. The checkout's `go.mod` and `go.sum`, ordinary Go commands and host CI still use the repository pin. Keep the Dockerfile default, module files and documentation aligned when upgrading the repository's SDK. Before publishing an overridden image, build and run the `conformance` target with the same SDK argument and verify the executable's SDK version, image metadata and notices.
 
-Runtime behavior follows the selected dependency. Read its contract at that version. The current pin has `metricschema.MaxRequestLabelBytes = 1023`; the newer [SDK development contract](https://github.com/reqfleet/engine-sdk/blob/main/agent/metrics.md#request-label-validation) reduces it to 255 bytes. An upgrade containing that change drops source samples with 256–1023-byte labels that this pin accepts. Review native URL/grouping values and update boundary fixtures and adapter documentation with the dependency. Do not truncate labels or route invalid samples to overflow. The current k6 fixtures still exercise the pinned 1023/1024/1025-byte boundaries. Compatibility requires updated fixtures and verification beyond an image-only SDK override.
+Runtime behavior follows the selected dependency. Read its contract at that version. SDK v0.6.0 has `metricschema.MaxRequestLabelBytes = 255`; see its [request-label contract](https://github.com/reqfleet/engine-sdk/blob/v0.6.0/agent/metrics.md#request-label-validation). This drops source samples with 256–1023-byte labels that the previous pin accepted. Review native URL/grouping values and use bounded request/group names in plans with longer URLs. Do not truncate labels or route invalid samples to overflow. The current k6 fixtures exercise the pinned 255/256/257-byte boundaries. Keep boundary fixtures and adapter documentation aligned with dependency upgrades; compatibility requires verification beyond an image-only SDK override.
 
 Review the selected SDK's package and metrics contracts as part of an upgrade, including callback cancellation, run acceptance/publication, final-drain errors and native-mode ownership. Honor callback contexts even when already canceled; callback-owned subprocesses and rollback must finish before returning. A module upgrade does not negotiate the unversioned coordinator protocol or establish deployment compatibility. Coordinators must remain backward-compatible with existing engine images; do not require an engine rebuild merely because the coordinator changes.
 
