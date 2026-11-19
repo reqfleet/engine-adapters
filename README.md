@@ -1,6 +1,6 @@
 # External engine adapters
 
-Independent, operator-managed engine adapters for Reqfleet Shibuya, built with the public [engine-sdk](https://github.com/reqfleet/engine-sdk). Each adapter translates assigned workload settings into engine-native configuration and maps engine output into Reqfleet metrics. The SDK handles coordinator communication, input downloads and process lifecycle; SDK-registry integrations also delegate collectors, request-name admission, resource sampling and metrics serving to it.
+Independent, operator-managed engine adapters for Reqfleet Shibuya, built with the public [engine-sdk](https://github.com/reqfleet/engine-sdk). Each adapter translates assigned workload settings into engine-native configuration and maps engine output into Reqfleet metrics. The SDK handles coordinator communication, input downloads and process lifecycle. SDK-registry integrations also delegate collectors, request-name admission, resource sampling and metrics serving to it.
 
 ```mermaid
 flowchart TD
@@ -25,7 +25,7 @@ flowchart TD
 - Docker with **Linux containers** for image builds and container-only conformance tests.
 - Public HTTPS access to Go modules, OS packages and the selected engine's release artifacts.
 
-Build and test targets live in each adapter directory; Docker builds use the repository root as their context. See the adapter's README for commands. Run integration binaries only inside their conformance containers, not on the host.
+Build and test targets live in each adapter directory. Docker builds use the repository root as their context. See the adapter's README for commands. Run integration binaries only inside their conformance containers.
 
 See [AGENTS.md](AGENTS.md) for detailed development, onboarding and release instructions, and the [k6 guide](k6/README.md) for supported plans, settings and metrics.
 
@@ -45,7 +45,7 @@ See [contribution instructions](AGENTS.md#commit-and-open-a-pull-request) for th
 
 This repository uses [release-please](https://github.com/googleapis/release-please) to manage per-adapter versions, release PRs and changelogs. Adapter images are independently versioned under `ghcr.io/reqfleet/engine-adapters/<adapter>`. See [releases](https://github.com/reqfleet/engine-adapters/releases). Deploy an approved immutable digest with a compatible Shibuya release.
 
-Releasing a new engine kind also requires changes to the Reqfleet control plane (Shibuya), with help from the Reqfleet team. Coordinate admission, UI and deployment configuration changes with them before rollout (a lightweight and fast process); publishing the adapter image alone does not make the engine available.
+Releasing a new engine kind also requires Reqfleet control-plane (Shibuya) changes. Coordinate admission, UI and deployment configuration with the Reqfleet team before rollout. This is a lightweight, fast process. Engine availability requires these changes as well as a published adapter image.
 
 ## Licensing
 
